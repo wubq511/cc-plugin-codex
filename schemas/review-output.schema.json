@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Claude Code Review Output",
+  "description": "Structured output schema for code review results from cc_review. Matches codex-plugin-cc review-output.schema.json format.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "findings", "next_steps"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["approve", "needs-attention", "request_changes", "reject"],
+      "description": "Overall review verdict. approve = no significant issues. needs-attention = material risk worth blocking on. request_changes = issues that should be fixed. reject = fundamental problems."
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Terse ship/no-ship assessment, not a neutral recap"
+    },
+    "findings": {
+      "type": "array",
+      "description": "List of specific findings from the review, ordered by severity (critical first)",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "title", "body", "file", "line_start", "line_end", "confidence", "recommendation"],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["critical", "high", "medium", "low"],
+            "description": "Finding severity level"
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Short title describing the finding"
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Detailed description of the finding"
+          },
+          "file": {
+            "type": "string",
+            "minLength": 1,
+            "description": "File path where the finding was identified"
+          },
+          "line_start": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Start line number in the file"
+          },
+          "line_end": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "End line number in the file"
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Confidence score from 0 to 1"
+          },
+          "recommendation": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Concrete change that would reduce the risk"
+          }
+        }
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "description": "Assumptions identified in the implementation (adversarial mode)",
+      "items": {
+        "type": "object",
+        "required": ["assumption", "risk"],
+        "properties": {
+          "assumption": { "type": "string" },
+          "risk": { "type": "string", "description": "What happens if this assumption is wrong" },
+          "valid": { "type": "boolean" }
+        }
+      }
+    },
+    "next_steps": {
+      "type": "array",
+      "description": "Recommended next actions as strings",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "residual_risk": {
+      "type": "string",
+      "description": "Any remaining risk after addressing the findings"
+    }
+  }
+}
