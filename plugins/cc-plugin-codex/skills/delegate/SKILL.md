@@ -31,7 +31,7 @@ Send a coding task to Claude Code for execution. Claude Code runs in a separate 
 3. **Present results** to the user when the task completes.
 
 4. **Suggest review**: After a completed task, tell the user:
-   > "Task completed. Run `/cc-companion:review` to review the changes, or `/cc-companion:review --adversarial` for a deeper review."
+   > "Task completed. Run `/claude:review` to review the changes, or `/claude:review --adversarial` for a deeper review."
 
 ## Resume
 
@@ -60,6 +60,6 @@ When the user wants to continue a previous Claude Code session:
 ## Notes
 
 - `cc_delegate` defaults to foreground mode — it waits for Claude Code to finish and returns results immediately.
-- For long-running tasks, use `background=true` and check progress with `/cc-companion:status`.
+- For long-running tasks, use `background=true` and check progress with `/claude:status`.
 - The task prompt is passed directly to `claude -p`. Be specific about what you want done.
 - Job ID supports prefix matching: "cc-abc" matches "cc-abc123def".

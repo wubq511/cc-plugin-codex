@@ -16,7 +16,7 @@ cc-companion.mjs (MCP server)
 claude CLI (claude -p --output-format json)
 ```
 
-- **MCP server** (`scripts/cc-companion.mjs`): Single entry point. Handles JSON-RPC on stdin/stdout, routes `tools/call` to 6 handlers. All state mutation goes through `updateJob()` (validates phase transitions) → `upsertJob()`.
+- **MCP server** (`scripts/cc-plugin-codex.mjs`): Single entry point. Handles JSON-RPC on stdin/stdout, routes `tools/call` to 6 handlers. All state mutation goes through `updateJob()` (validates phase transitions) → `upsertJob()`.
 - **Claude runner** (`scripts/lib/claude-runner.mjs`): Builds CLI args, runs `claude -p` sync or detached. Detached mode writes stdout to a `resultFile` via fd; caller reads it on `child.on("exit")`.
 - **Job state** (`scripts/lib/state.mjs`): Persisted to `${os.tmpdir()}/cc-companion/<slug-hash>/state.json`. Max 50 jobs, pruned on save. Job IDs use SHA-256 hash for collision resistance.
 - **Job logs** (`scripts/lib/job-log.mjs`): Per-job `[timestamp] message` log files in `<stateDir>/jobs/`. Phase tracking with validated transitions. `readLogTail` reads only last 8KB.
@@ -35,17 +35,17 @@ claude CLI (claude -p --output-format json)
 
 ```bash
 # Validate plugin manifest
-python3 .claude/skills/plugin-creator/scripts/validate_plugin.py plugins/cc-companion
+python3 .claude/skills/plugin-creator/scripts/validate_plugin.py plugins/cc-plugin-codex
 
 # Update cachebuster after changes
-python3 .claude/skills/plugin-creator/scripts/update_plugin_cachebuster.py plugins/cc-companion
+python3 .claude/skills/plugin-creator/scripts/update_plugin_cachebuster.py plugins/cc-plugin-codex
 
 # Reinstall in Codex (from this repo root as marketplace)
-codex plugin remove cc-companion
-codex plugin add cc-companion
+codex plugin remove cc-plugin-codex
+codex plugin add cc-plugin-codex
 
 # Quick MCP protocol smoke test
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}' | node plugins/cc-companion/scripts/cc-companion.mjs
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}' | node plugins/cc-plugin-codex/scripts/cc-companion.mjs
 ```
 
 ## Review Output Schema

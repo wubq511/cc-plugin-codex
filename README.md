@@ -34,13 +34,13 @@
 codex plugin marketplace add wubq511/cc-plugin-codex
 
 # 2. 安装插件
-codex plugin add cc-companion
+codex plugin add cc-plugin-codex
 ```
 
 验证安装：
 
 ```
-/cc-companion:setup
+/claude:setup
 ```
 
 ## 使用
@@ -48,7 +48,7 @@ codex plugin add cc-companion
 ### 分派任务
 
 ```
-/cc-companion:delegate
+/claude:delegate
 ```
 
 Codex 会根据任务复杂度自动选择模型：
@@ -65,15 +65,15 @@ Codex 会根据任务复杂度自动选择模型：
 ### 查看状态
 
 ```
-/cc-companion:status        # 最新任务
-/cc-companion:status --all  # 所有任务
+/claude:status        # 最新任务
+/claude:status --all  # 所有任务
 ```
 
 ### 审查产出
 
 ```
-/cc-companion:review              # 标准审查
-/cc-companion:review --adversarial  # 对抗审查
+/claude:review              # 标准审查
+/claude:review --adversarial  # 对抗审查
 ```
 
 **标准审查**：检查正确性、bug、安全、性能、可维护性。
@@ -83,13 +83,13 @@ Codex 会根据任务复杂度自动选择模型：
 ### 取消任务
 
 ```
-/cc-companion:cancel
+/claude:cancel
 ```
 
 ### 环境检查
 
 ```
-/cc-companion:setup
+/claude:setup
 ```
 
 ## MCP 工具
@@ -109,11 +109,11 @@ Codex 会根据任务复杂度自动选择模型：
 
 ```
 ├── marketplace.json               # Marketplace 清单（支持 Git URL 安装）
-└── plugins/cc-companion/
+└── plugins/cc-plugin-codex/
     ├── .codex-plugin/plugin.json  # Codex 插件清单
     ├── .mcp.json                  # MCP server 声明（stdio）
     ├── scripts/
-    │   ├── cc-companion.mjs       # MCP server 主进程
+    │   ├── cc-companion.mjs         # MCP server 主进程
     │   └── lib/
     │       ├── claude-runner.mjs  # claude CLI 调用封装
     │       ├── git.mjs            # Git 集成（diff、review context）

@@ -1,5 +1,5 @@
 {
-  "name": "cc-companion",
+  "name": "cc-plugin-codex",
   "version": "0.2.0",
   "description": "Delegate coding tasks to Claude Code from Codex, then review the results.",
   "author": {
@@ -16,7 +16,7 @@
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "CC Companion",
+    "displayName": "Claude",
     "shortDescription": "Delegate coding tasks to Claude Code and review results",
     "longDescription": "Use Claude Code as a coding companion from within Codex. Delegate implementation tasks, check execution status, review changes with adversarial mode, and manage running jobs.",
     "developerName": "Robert Wu",
