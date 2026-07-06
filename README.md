@@ -29,14 +29,15 @@
 
 ### 安装
 
-1. 将插件目录放到 `~/plugins/claude-code/`
-2. 在 Codex 中安装：
-
 ```bash
-codex plugin add claude-code@personal
+# 1. 添加本仓库作为 marketplace
+codex plugin marketplace add wubq511/cc-plugin-codex
+
+# 2. 安装插件
+codex plugin add claude-code
 ```
 
-3. 验证安装：
+验证安装：
 
 ```
 /claude-code:setup
@@ -107,25 +108,27 @@ Codex 会根据任务复杂度自动选择模型：
 ## 项目结构
 
 ```
-├── .codex-plugin/plugin.json    # Codex 插件清单
-├── .mcp.json                    # MCP server 声明（stdio）
-├── scripts/
-│   ├── cc-companion.mjs         # MCP server 主进程
-│   └── lib/
-│       ├── claude-runner.mjs    # claude CLI 调用封装
-│       ├── git.mjs              # Git 集成（diff、review context）
-│       ├── job-log.mjs          # Job 日志和阶段追踪
-│       ├── process.mjs          # 进程管理
-│       ├── state.mjs            # Job 状态持久化
-│       └── workspace.mjs        # 工作区解析
-├── skills/                      # Codex skill 定义
-│   ├── delegate/SKILL.md
-│   ├── status/SKILL.md
-│   ├── review/SKILL.md
-│   ├── cancel/SKILL.md
-│   └── setup/SKILL.md
-└── schemas/
-    └── review-output.schema.json  # 审查输出 JSON Schema
+├── marketplace.json               # Marketplace 清单（支持 Git URL 安装）
+└── plugins/claude-code/
+    ├── .codex-plugin/plugin.json  # Codex 插件清单
+    ├── .mcp.json                  # MCP server 声明（stdio）
+    ├── scripts/
+    │   ├── cc-companion.mjs       # MCP server 主进程
+    │   └── lib/
+    │       ├── claude-runner.mjs  # claude CLI 调用封装
+    │       ├── git.mjs            # Git 集成（diff、review context）
+    │       ├── job-log.mjs        # Job 日志和阶段追踪
+    │       ├── process.mjs        # 进程管理
+    │       ├── state.mjs          # Job 状态持久化
+    │       └── workspace.mjs      # 工作区解析
+    ├── skills/                    # Codex skill 定义
+    │   ├── delegate/SKILL.md
+    │   ├── status/SKILL.md
+    │   ├── review/SKILL.md
+    │   ├── cancel/SKILL.md
+    │   └── setup/SKILL.md
+    └── schemas/
+        └── review-output.schema.json  # 审查输出 JSON Schema
 ```
 
 ## 审查输出格式
