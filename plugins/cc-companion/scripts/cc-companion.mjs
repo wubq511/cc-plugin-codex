@@ -376,7 +376,7 @@ function handleDelegate(params) {
     return {
       content: [{
         type: "text",
-        text: `## Task Completed\n\n**Job ID:** ${jobId}\n**Duration:** ${formatDuration(result.duration ? result.duration * 1000 : null)}\n**Cost:** ${formatCost(result.cost)}\n**Model:** ${result.model || model || "default"}\n\n### Result\n${result.result}\n\n${filesSection}\n\n---\n💡 Run \`/claude-code:review\` to review the changes, or \`/claude-code:review --adversarial\` for an adversarial review.`
+        text: `## Task Completed\n\n**Job ID:** ${jobId}\n**Duration:** ${formatDuration(result.duration ? result.duration * 1000 : null)}\n**Cost:** ${formatCost(result.cost)}\n**Model:** ${result.model || model || "default"}\n\n### Result\n${result.result}\n\n${filesSection}\n\n---\n💡 Run \`/cc-companion:review\` to review the changes, or \`/cc-companion:review --adversarial\` for an adversarial review.`
       }]
     };
   } else {
@@ -393,7 +393,7 @@ function handleDelegate(params) {
     return {
       content: [{
         type: "text",
-        text: `## Task Failed\n\n**Job ID:** ${jobId}\n**Error:** ${result.error}\n\nCheck \`/claude-code:status\` for details.`
+        text: `## Task Failed\n\n**Job ID:** ${jobId}\n**Error:** ${result.error}\n\nCheck \`/cc-companion:status\` for details.`
       }],
       isError: true
     };
@@ -784,7 +784,7 @@ function handleSetup() {
 
   if (claudeStatus.available && nodeStatus.available) {
     lines.push("\n✅ Plugin ready\n");
-    lines.push("No issues found. Use `/claude-code:delegate` to start delegating tasks.");
+    lines.push("No issues found. Use `/cc-companion:delegate` to start delegating tasks.");
   } else {
     lines.push("\n❌ Setup incomplete");
     if (!claudeStatus.available) {

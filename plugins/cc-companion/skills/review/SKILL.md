@@ -37,7 +37,7 @@ Both modes produce **structured JSON output** with verdict, findings (severity-r
    - For adversarial: assumptions identified and their validity
 
 5. If issues are found, suggest next steps:
-   - Delegate fixes back to Claude Code: `/claude-code:delegate`
+   - Delegate fixes back to Claude Code: `/cc-companion:delegate`
    - Fix directly in Codex
 
 ## Review Output Schema

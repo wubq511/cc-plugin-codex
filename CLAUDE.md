@@ -35,17 +35,17 @@ claude CLI (claude -p --output-format json)
 
 ```bash
 # Validate plugin manifest
-python3 .claude/skills/plugin-creator/scripts/validate_plugin.py plugins/claude-code
+python3 .claude/skills/plugin-creator/scripts/validate_plugin.py plugins/cc-companion
 
 # Update cachebuster after changes
-python3 .claude/skills/plugin-creator/scripts/update_plugin_cachebuster.py plugins/claude-code
+python3 .claude/skills/plugin-creator/scripts/update_plugin_cachebuster.py plugins/cc-companion
 
 # Reinstall in Codex (from this repo root as marketplace)
-codex plugin remove claude-code
-codex plugin add claude-code
+codex plugin remove cc-companion
+codex plugin add cc-companion
 
 # Quick MCP protocol smoke test
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}' | node plugins/claude-code/scripts/cc-companion.mjs
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}' | node plugins/cc-companion/scripts/cc-companion.mjs
 ```
 
 ## Review Output Schema

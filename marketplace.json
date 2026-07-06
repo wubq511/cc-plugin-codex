@@ -1,14 +1,14 @@
 {
   "name": "cc-plugin-codex",
   "interface": {
-    "displayName": "Claude Code Companion"
+    "displayName": "CC Companion"
   },
   "plugins": [
     {
-      "name": "claude-code",
+      "name": "cc-companion",
       "source": {
         "source": "local",
-        "path": "./plugins/claude-code"
+        "path": "./plugins/cc-companion"
       },
       "policy": {
         "installation": "AVAILABLE",

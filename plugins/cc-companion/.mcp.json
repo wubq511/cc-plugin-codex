@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "claude-code": {
+    "cc-companion": {
       "type": "stdio",
       "command": "node",
       "args": ["${PLUGIN_DIR}/scripts/cc-companion.mjs"]
