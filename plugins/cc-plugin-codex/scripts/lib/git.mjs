@@ -389,17 +389,16 @@ export function getMergeBase(cwd, defaultBranch) {
 /**
  * Get content of untracked files (for review context).
  * Legacy API kept for backward compat; prefer collectWorkingTreeContext.
+ * Uses Node.js fs instead of `head` command for cross-platform support.
  */
 export function getUntrackedContent(cwd, filePaths, maxLines = 100) {
   const contents = {};
   for (const filePath of filePaths.slice(0, 20)) {
     try {
-      const result = spawnSync("head", ["-" + maxLines, filePath], {
-        cwd, encoding: "utf8", timeout: 3000
-      });
-      if (result.status === 0) {
-        contents[filePath] = result.stdout;
-      }
+      const absolutePath = path.resolve(cwd, filePath);
+      const data = fs.readFileSync(absolutePath, "utf8");
+      const lines = data.split("\n");
+      contents[filePath] = lines.slice(0, maxLines).join("\n");
     } catch { /* skip */ }
   }
   return contents;

@@ -23,7 +23,6 @@
  * - Resume capability (--resume-last, --resume <sessionId>)
  */
 
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
@@ -41,7 +40,6 @@ import {
 // ─── MCP Protocol ───────────────────────────────────────────────────────────
 
 const PROTOCOL_VERSION = "2025-03-26";
-let nextId = 1;
 
 function sendMessage(msg) {
   process.stdout.write(`${JSON.stringify(msg)}\n`);
@@ -53,10 +51,6 @@ function sendResponse(id, result) {
 
 function sendError(id, code, message) {
   sendMessage({ jsonrpc: "2.0", id, error: { code, message } });
-}
-
-function sendNotification(method, params = {}) {
-  sendMessage({ jsonrpc: "2.0", method, params });
 }
 
 function logError(msg) {
@@ -474,7 +468,14 @@ function handleCheck(params) {
         job = fresh;
         break;
       }
-      spawnSync("sleep", ["2"]);
+      // Cross-platform sleep (no `sleep` command on Windows)
+      try {
+        const buf = new Int32Array(new SharedArrayBuffer(4));
+        Atomics.wait(buf, 0, 0, 2000);
+      } catch {
+        const deadline = Date.now() + 2000;
+        while (Date.now() < deadline) { /* busy-wait */ }
+      }
     }
     if (job && (job.status === "running" || job.status === "queued")) {
       return { content: [{ type: "text", text: `Job ${job.id} is still running after 4 minutes. Use \`cc_check\` to check again later.` }] };
