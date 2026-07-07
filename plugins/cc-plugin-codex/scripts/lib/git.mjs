@@ -396,8 +396,9 @@ export function getUntrackedContent(cwd, filePaths, maxLines = 100) {
   for (const filePath of filePaths.slice(0, 20)) {
     try {
       const absolutePath = path.resolve(cwd, filePath);
-      const data = fs.readFileSync(absolutePath, "utf8");
-      const lines = data.split("\n");
+      const buffer = fs.readFileSync(absolutePath);
+      if (!isProbablyText(buffer)) continue; // skip binary files
+      const lines = buffer.toString("utf8").split("\n");
       contents[filePath] = lines.slice(0, maxLines).join("\n");
     } catch { /* skip */ }
   }

@@ -23,6 +23,7 @@
  * - Resume capability (--resume-last, --resume <sessionId>)
  */
 
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
@@ -60,6 +61,9 @@ function logError(msg) {
 // ─── Session ID ──────────────────────────────────────────────────────────────
 
 const SESSION_ID = `session-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+
+// Track most recent workspace root for graceful shutdown cleanup
+let lastWorkspaceRoot = null;
 
 // ─── Tool Definitions ───────────────────────────────────────────────────────
 
@@ -218,6 +222,7 @@ function handleDelegate(params) {
 
   const cwd = getCwd(params);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  lastWorkspaceRoot = workspaceRoot;
   const write = params.write !== false;
   const background = params.background === true;
   const model = params.model || null;
@@ -288,29 +293,34 @@ function handleDelegate(params) {
 
     child.on("exit", (code) => {
       const completedAt = new Date().toISOString();
-      if (code === 0 && fs.existsSync(resultFile)) {
-        try {
-          const parsed = JSON.parse(fs.readFileSync(resultFile, "utf8"));
+      try {
+        if (code === 0 && fs.existsSync(resultFile)) {
+          try {
+            const parsed = JSON.parse(fs.readFileSync(resultFile, "utf8"));
+            updateJob(workspaceRoot, {
+              id: jobId, status: "completed", phase: "completed", pid: null, completedAt,
+              result: parsed.result || "",
+              cost: parsed.total_cost_usd || 0,
+              duration: parsed.duration_ms ? parsed.duration_ms / 1000 : null,
+              model: (parsed.modelUsage && Object.keys(parsed.modelUsage).length > 0) ? Object.keys(parsed.modelUsage)[0] : model,
+              sessionId: parsed.session_id || null,
+              errorMessage: null
+            });
+            appendLogLine(workspaceRoot, jobId, "Background task completed.");
+          } catch {
+            updateJob(workspaceRoot, { id: jobId, status: "failed", phase: "failed", pid: null, completedAt, errorMessage: "Background task output was not parseable" });
+            appendLogLine(workspaceRoot, jobId, "Background task completed (output not parseable).");
+          }
+        } else {
           updateJob(workspaceRoot, {
-            id: jobId, status: "completed", phase: "completed", pid: null, completedAt,
-            result: parsed.result || "",
-            cost: parsed.total_cost_usd || 0,
-            duration: parsed.duration_ms ? parsed.duration_ms / 1000 : null,
-            model: (parsed.modelUsage && Object.keys(parsed.modelUsage).length > 0) ? Object.keys(parsed.modelUsage)[0] : model,
-            sessionId: parsed.session_id || null,
-            errorMessage: null
+            id: jobId, status: "failed", phase: "failed", pid: null, completedAt,
+            errorMessage: `Background process exited with code ${code}`
           });
-          appendLogLine(workspaceRoot, jobId, "Background task completed.");
-        } catch {
-          updateJob(workspaceRoot, { id: jobId, status: "failed", phase: "failed", pid: null, completedAt, errorMessage: "Background task output was not parseable" });
-          appendLogLine(workspaceRoot, jobId, "Background task completed (output not parseable).");
+          appendLogLine(workspaceRoot, jobId, `Background task failed with exit code ${code}.`);
         }
-      } else {
-        updateJob(workspaceRoot, {
-          id: jobId, status: "failed", phase: "failed", pid: null, completedAt,
-          errorMessage: `Background process exited with code ${code}`
-        });
-        appendLogLine(workspaceRoot, jobId, `Background task failed with exit code ${code}.`);
+      } finally {
+        // Clean up result file
+        try { if (resultFile) fs.unlinkSync(resultFile); } catch { /* ignore */ }
       }
     });
 
@@ -418,6 +428,7 @@ function handleListModels() {
 function handleCheck(params) {
   const cwd = getCwd(params);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  lastWorkspaceRoot = workspaceRoot;
   let jobs = listJobs(workspaceRoot);
 
   if (params.session === true) {
@@ -468,13 +479,15 @@ function handleCheck(params) {
         job = fresh;
         break;
       }
-      // Cross-platform sleep (no `sleep` command on Windows)
+      // Cross-platform sleep: prefer Atomics.wait on SharedArrayBuffer;
+      // fallback: spawn a short-lived node process to sleep without CPU burn
       try {
         const buf = new Int32Array(new SharedArrayBuffer(4));
         Atomics.wait(buf, 0, 0, 2000);
       } catch {
-        const deadline = Date.now() + 2000;
-        while (Date.now() < deadline) { /* busy-wait */ }
+        try {
+          spawnSync("node", ["-e", "setTimeout(()=>process.exit(0),2000)"], { timeout: 3000, stdio: "ignore", windowsHide: true });
+        } catch { /* last resort: accept brief CPU spin */ }
       }
     }
     if (job && (job.status === "running" || job.status === "queued")) {
@@ -514,6 +527,7 @@ function handleCheck(params) {
 function handleCancel(params) {
   const cwd = getCwd(params);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  lastWorkspaceRoot = workspaceRoot;
   const jobs = listJobs(workspaceRoot);
 
   const jobIdOrPrefix = params.job;
@@ -683,6 +697,7 @@ Before finalizing, check that each finding is:
 function handleReview(params) {
   const cwd = getCwd(params);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  lastWorkspaceRoot = workspaceRoot;
   const jobs = listJobs(workspaceRoot);
 
   const jobIdOrPrefix = params.job;
@@ -871,6 +886,35 @@ function handleMessage(msg) {
     }
   }
 }
+
+// ─── Graceful Shutdown ──────────────────────────────────────────────────────
+
+function gracefulShutdown(signal) {
+  if (lastWorkspaceRoot) {
+    try {
+      const jobs = listJobs(lastWorkspaceRoot);
+      for (const job of jobs) {
+        if (job.status === "running" || job.status === "queued") {
+          if (job.pid) {
+            try { terminateProcessTree(job.pid); } catch { /* ignore */ }
+          }
+          upsertJob(lastWorkspaceRoot, {
+            id: job.id,
+            status: "cancelled",
+            phase: "cancelled",
+            pid: null,
+            completedAt: new Date().toISOString(),
+            errorMessage: `Cancelled: server received ${signal}`
+          });
+        }
+      }
+    } catch { /* best effort */ }
+  }
+  process.exit(0);
+}
+
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
