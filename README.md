@@ -43,6 +43,16 @@ codex plugin add cc-plugin-codex
 /claude:setup
 ```
 
+### 更新
+
+```bash
+# 更新 marketplace 缓存（拉取最新代码）
+codex plugin marketplace update wubq511/cc-plugin-codex
+
+# 重新安装以应用更新
+codex plugin add cc-plugin-codex
+```
+
 ## 使用
 
 ### 分派任务
