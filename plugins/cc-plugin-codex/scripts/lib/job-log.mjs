@@ -17,32 +17,66 @@ function resolveLogFile(cwd, jobId) {
 }
 
 function ensureLogDir(cwd) {
-  fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
+  fs.mkdirSync(resolveJobsDir(cwd), { recursive: true, mode: 0o700 });
 }
 
 function nowIso() {
   return new Date().toISOString();
 }
 
+const MAX_LOG_BYTES = 1 * 1024 * 1024; // 1 MiB per job log
+
 /**
- * Append a single log line: [timestamp] message
+ * Check if a log file exceeds the size limit.
+ */
+export function checkLogSizeLimit(cwd, jobId) {
+  const logFile = resolveLogFile(cwd, jobId);
+  if (!fs.existsSync(logFile)) return false;
+  try {
+    const stat = fs.statSync(logFile);
+    return stat.size >= MAX_LOG_BYTES;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Append a single log line: [timestamp] message.
+ * Silently skips if log exceeds MAX_LOG_BYTES.
  */
 export function appendLogLine(cwd, jobId, message) {
   ensureLogDir(cwd);
   const logFile = resolveLogFile(cwd, jobId);
   const normalized = String(message ?? "").trim();
   if (!normalized) return;
-  fs.appendFileSync(logFile, `[${nowIso()}] ${normalized}\n`, "utf8");
+  appendBounded(logFile, `[${nowIso()}] ${normalized}\n`);
 }
 
 /**
- * Append a log block: [timestamp] Title\nBody
+ * Append a log block: [timestamp] Title\nBody.
+ * Silently skips if log exceeds MAX_LOG_BYTES.
  */
 export function appendLogBlock(cwd, jobId, title, body) {
   ensureLogDir(cwd);
   const logFile = resolveLogFile(cwd, jobId);
   if (!body) return;
-  fs.appendFileSync(logFile, `\n[${nowIso()}] ${title}\n${String(body).trimEnd()}\n`, "utf8");
+  appendBounded(logFile, `\n[${nowIso()}] ${title}\n${String(body).trimEnd()}\n`);
+}
+
+function appendBounded(logFile, text) {
+  let currentSize = 0;
+  try { currentSize = fs.statSync(logFile).size; } catch { /* new file */ }
+  const remaining = MAX_LOG_BYTES - currentSize;
+  if (remaining <= 0) return;
+  let output = text;
+  if (Buffer.byteLength(output, "utf8") > remaining) {
+    output = output.slice(0, remaining);
+    while (output.length > 0 && Buffer.byteLength(output, "utf8") > remaining) {
+      output = output.slice(0, -1);
+    }
+  }
+  fs.appendFileSync(logFile, output, { encoding: "utf8", mode: 0o600 });
+  try { fs.chmodSync(logFile, 0o600); } catch { /* best effort */ }
 }
 
 /**
@@ -52,7 +86,7 @@ export function appendLogBlock(cwd, jobId, title, body) {
 export function createJobLogFile(cwd, jobId, title) {
   ensureLogDir(cwd);
   const logFile = resolveLogFile(cwd, jobId);
-  fs.writeFileSync(logFile, "", "utf8");
+  fs.writeFileSync(logFile, "", { encoding: "utf8", mode: 0o600 });
   if (title) {
     appendLogLine(cwd, jobId, `Starting ${title}.`);
   }

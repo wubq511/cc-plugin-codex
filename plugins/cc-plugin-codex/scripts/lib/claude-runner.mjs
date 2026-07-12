@@ -1,138 +1,151 @@
-import { spawn, spawnSync } from "node:child_process";
-import fs from "node:fs";
+/**
+ * Claude runner — watchdog-based supervised execution.
+ *
+ * Spawns a small watchdog process that owns the Claude CLI.
+ * Communication channels:
+ *   watchdog stdin  — one-time JSON config (closed after write)
+ *   IPC channel     — long-lived control channel (cancel / companion-death detection)
+ *   watchdog stdout  — structured JSON result
+ *
+ * The watchdog writes the task to Claude's stdin (never argv) for privacy.
+ * When the companion disconnects the IPC channel, the watchdog kills Claude.
+ */
+
+import { spawn } from "node:child_process";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { binaryAvailable } from "./process.mjs";
 
-const VALID_MODELS = new Set(["fable", "opus", "sonnet", "haiku"]);
 const VALID_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+export const MAX_CAPTURE_BYTES = 8 * 1024 * 1024; // 8 MiB
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const WATCHDOG_PATH = path.join(here, "watchdog.mjs");
 
 /**
- * Build the claude CLI command args for a given task and options.
- */
-export function buildClaudeArgs(task, options = {}) {
-  const args = ["-p", task, "--output-format", "json"];
-
-  // Opt-in: only skip permissions when explicitly requested
-  if (options.dangerouslySkipPermissions === true) {
-    args.push("--dangerously-skip-permissions");
-  }
-
-  if (options.model && VALID_MODELS.has(options.model)) {
-    args.push("--model", options.model);
-  }
-
-  if (options.effort && VALID_EFFORTS.has(options.effort)) {
-    args.push("--effort", options.effort);
-  }
-
-  if (options.write === false) {
-    args.push("--allowedTools", "Read,Glob,Grep,Bash(git log*),Bash(git diff*),Bash(git show*),Bash(git status*),Bash(git branch --show-current)");
-  }
-
-  if (options.maxBudgetUsd) {
-    args.push("--max-budget-usd", String(options.maxBudgetUsd));
-  }
-
-  // Resume support
-  if (options.resumeSession) {
-    args.push("--resume", options.resumeSession);
-  } else if (options.resume) {
-    args.push("--resume-last");
-  }
-
-  return args;
-}
-
-/**
- * Run claude -p synchronously and return parsed JSON output.
- */
-export function runClaudeSync(task, options = {}) {
-  const args = buildClaudeArgs(task, options);
-  const cwd = options.cwd || process.cwd();
-
-  const result = spawnSync("claude", args, {
-    cwd,
-    env: process.env,
-    encoding: "utf8",
-    timeout: options.timeout || 15 * 60 * 1000,
-    stdio: "pipe",
-    maxBuffer: 50 * 1024 * 1024
-  });
-
-  if (result.error) {
-    return {
-      ok: false,
-      error: result.error.message || String(result.error),
-      exitCode: result.status ?? -1
-    };
-  }
-
-  if (result.status !== 0) {
-    return {
-      ok: false,
-      error: (result.stderr || "").trim() || `claude exited with code ${result.status}`,
-      exitCode: result.status
-    };
-  }
-
-  try {
-    const parsed = JSON.parse(result.stdout);
-    return {
-      ok: true,
-      result: parsed.result || "",
-      sessionId: parsed.session_id || null,
-      cost: parsed.total_cost_usd || 0,
-      duration: parsed.duration_ms ? parsed.duration_ms / 1000 : null,
-      model: (parsed.modelUsage && Object.keys(parsed.modelUsage).length > 0) ? Object.keys(parsed.modelUsage)[0] : null,
-      exitCode: 0
-    };
-  } catch (parseError) {
-    // JSON parse failed — treat as error, not silent success
-    return {
-      ok: false,
-      error: `Claude output was not valid JSON: ${parseError.message}`,
-      rawOutput: result.stdout,
-      exitCode: 0
-    };
-  }
-}
-
-/**
- * Spawn claude -p as a detached background process.
- * Returns the child process. The caller should listen for 'exit' to update job state.
+ * Run claude via the watchdog process.
  *
- * Unlike the previous version, this captures stdout so we can parse results on completion.
+ * Returns { child, pid, cancel, result }.
  */
-export function runClaudeDetached(task, options = {}) {
-  const args = buildClaudeArgs(task, options);
+export function runClaude(task, options = {}) {
   const cwd = options.cwd || process.cwd();
+  const timeoutMs = options.timeout ?? null;
+  const maxCaptureBytes = options.maxCaptureBytes ?? MAX_CAPTURE_BYTES;
+  const command = options.command || "claude";
 
-  // Write stdout to a result file so we can read it on completion
-  const resultFile = options.resultFile || null;
-  const outFd = resultFile
-    ? fs.openSync(resultFile, "w")
-    : null;
-
-  const stdioConfig = resultFile
-    ? ["ignore", outFd, "ignore"]
-    : ["ignore", "ignore", "ignore"];
-
-  const child = spawn("claude", args, {
+  const watchdogConfig = {
+    task,
     cwd,
-    env: process.env,
-    detached: true,
-    stdio: stdioConfig,
+    write: options.write !== false,
+    model: options.model || null,
+    effort: options.effort && VALID_EFFORTS.has(options.effort) ? options.effort : null,
+    dangerouslySkipPermissions: options.dangerouslySkipPermissions === true,
+    resume: options.resume === true,
+    resumeSession: options.resumeSession || null,
+    timeoutMs,
+    maxCaptureBytes,
+    command
+  };
+
+  // Spawn watchdog with IPC channel for control.
+  // stdio: [stdin(config), stdout(result), stderr, ipc(control)]
+  const child = spawn(process.execPath, [WATCHDOG_PATH], {
+    cwd,
+    env: options.env || process.env,
+    stdio: ["pipe", "pipe", "pipe", "ipc"],
     windowsHide: true
   });
-  child.unref();
 
-  // Close the fd in the parent so it doesn't leak
-  if (outFd !== null) {
-    try { fs.closeSync(outFd); } catch { /* ignore */ }
+  let settled = false;
+  let cancelRequested = false;
+  let stderr = "";
+
+  // Send config via stdin then close
+  try {
+    child.stdin.write(JSON.stringify(watchdogConfig));
+    child.stdin.end();
+  } catch {
+    // stdin write failed (watchdog may have exited)
   }
 
-  return child;
+  child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+
+  const result = new Promise((resolve, reject) => {
+    const stdoutChunks = [];
+
+    child.stdout.on("data", (chunk) => stdoutChunks.push(chunk));
+
+    child.once("error", (error) => {
+      if (settled) return;
+      settled = true;
+      try { child.disconnect(); } catch { /* */ }
+      resolve({ ok: false, error: error.message || String(error), exitCode: -1 });
+    });
+
+    // With an IPC stdio channel, `close` can be delayed by inherited pipe
+    // handles even after the watchdog process has exited. For cancellation,
+    // watchdog exit is the ownership boundary: it has already completed its
+    // bounded process-tree termination path, so settle without waiting for
+    // every inherited descriptor to close.
+    child.once("exit", (code) => {
+      if (settled || !cancelRequested) return;
+      settled = true;
+      resolve({ ok: false, cancelled: true, error: "Claude task was cancelled.", exitCode: code ?? -1 });
+    });
+
+    child.once("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+
+      const stdout = Buffer.concat(stdoutChunks).toString("utf8").trim();
+
+      // Parse watchdog result from stdout
+      if (stdout) {
+        try {
+          const parsed = JSON.parse(stdout);
+          resolve(parsed);
+          return;
+        } catch {
+          // stdout was not valid JSON — fall through to error
+        }
+      }
+
+      // No valid result from watchdog
+      if (code === 4) {
+        resolve({ ok: false, cancelled: true, error: "Claude task was cancelled or companion died.", exitCode: code });
+      } else if (code === 2) {
+        resolve({ ok: false, error: `Claude task timed out after ${timeoutMs}ms.`, exitCode: code });
+      } else if (code === 3) {
+        resolve({ ok: false, error: `Claude output exceeded the ${maxCaptureBytes}-byte capture limit.`, exitCode: code });
+      } else {
+        resolve({
+          ok: false,
+          error: stderr.trim() || `Watchdog exited with code ${code}${signal ? ` (${signal})` : ""}`,
+          exitCode: code ?? -1
+        });
+      }
+    });
+  });
+
+  return {
+    child,
+    pid: child.pid ?? null,
+    cancel: () => {
+      cancelRequested = true;
+      // Send cancel command via IPC channel
+      try { child.send("cancel"); } catch { /* channel may be closed */ }
+      // Disconnect IPC channel (signals companion is done)
+      try { child.disconnect(); } catch { /* already disconnected */ }
+      // Send SIGTERM to watchdog (which forwards to Claude)
+      try {
+        process.kill(child.pid, "SIGTERM");
+      } catch {
+        try { process.kill(-child.pid, "SIGTERM"); } catch { /* already dead */ }
+      }
+    },
+    result
+  };
 }
 
 /**
@@ -142,34 +155,5 @@ export function getClaudeAvailability(cwd) {
   return binaryAvailable("claude", ["--version"], { cwd });
 }
 
-/**
- * Get the list of known Claude models with metadata.
- */
-export function getKnownModels() {
-  return [
-    {
-      alias: "fable",
-      fullId: "claude-fable-5",
-      bestFor: "Complex architecture, multi-step reasoning",
-      recommendedEfforts: ["high", "xhigh", "max"]
-    },
-    {
-      alias: "opus",
-      fullId: "claude-opus-4-8",
-      bestFor: "Deep analysis, careful reasoning",
-      recommendedEfforts: ["high", "xhigh"]
-    },
-    {
-      alias: "sonnet",
-      fullId: "claude-sonnet-5",
-      bestFor: "Balanced speed and quality",
-      recommendedEfforts: ["medium", "high"]
-    },
-    {
-      alias: "haiku",
-      fullId: "claude-haiku-4-5-20251001",
-      bestFor: "Quick tasks, simple changes",
-      recommendedEfforts: ["low", "medium"]
-    }
-  ];
-}
+// Re-export for backward compat (tests may import MAX_CAPTURE_BYTES)
+export { MAX_CAPTURE_BYTES as MAX_CAPTURE };

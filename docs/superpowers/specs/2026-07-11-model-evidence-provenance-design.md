@@ -2,7 +2,7 @@
 
 ## 文档状态
 
-- 状态：已批准，待实施
+- 状态：已实施并验证
 - 日期：2026-07-11
 - 范围：`cc-plugin-codex` 的模型元数据采集、持久化、展示、兼容迁移与回归测试
 - 不包含：Provider 配置修改、模型自动选择、Provider 后台查询、任务执行逻辑重构
@@ -234,10 +234,10 @@ collectModelEvidence({
 2. 配置根目录优先使用运行 Claude 时相同环境中的 `CLAUDE_CONFIG_DIR`；未设置时使用 `~/.claude`。不得读取 `settings.json`。
 3. 只在 `<configRoot>/projects/` 下查找：枚举第一层 project 目录，并检查精确候选 `<project>/<sessionId>.jsonl`。不根据 cwd 猜测 Claude 的路径编码规则。
 4. 找到主 transcript 后，仅检查其相邻的 `<project>/<sessionId>/subagents/*.jsonl`。不得全盘搜索任意 JSONL。
-5. 对根目录、project 目录、主文件和 subagent 文件执行 `realpath` 边界检查；解析后的真实路径必须仍位于 `<configRoot>/projects`。拒绝逃逸边界的 symlink。
+5. 先分别解析真实 `configRoot` 与 `projects` 根，并确认真实 `projects` 仍是配置根的子目录；随后对 project 目录、主文件和 subagent 文件执行 `realpath` 边界检查。不得把已经逃逸的 `projects` symlink 当成新的可信边界。
 6. 使用异步流式逐行解析，不一次性读入内存。
 7. 只接受 `type === "assistant"`、`message.role === "assistant"` 且 `message.model` 为非空字符串的记录。
-8. 主文件最大读取 32 MiB；全部 subagent 合计最大 32 MiB；最多 100,000 行、256 个 subagent 文件、16 个唯一模型。
+8. 主文件最大读取 32 MiB；全部 subagent 合计最大 32 MiB；最多 100,000 行、256 个 subagent 文件、16 个唯一模型。单行最多 1 MiB；超限行进入丢弃状态直到下一个换行，并记录 `line-too-long`，防止一条异常 JSONL 绕过流式内存边界。
 9. collector 总预算默认 1,000 ms。到达预算时返回已有证据和 `partial + scan-deadline`，不得阻塞任务完成。
 10. Claude 子进程已经 close 后再采集。若主文件第一次未出现，可在总预算内重试两次，每次最多等待 100 ms；不得引入无界轮询。
 11. 单行 JSON 损坏时跳过该行并记录 `invalid-json-lines`；不能因为一个坏行丢弃全部已获得证据。
@@ -425,3 +425,11 @@ Claude transcript message.model: mimo-v2.5-pro
 - 不修改真实 Claude settings、Provider、token 或历史 transcript。
 - 不把真实 transcript fixture 复制进仓库；测试必须生成脱敏临时 JSONL。
 - 完成后必须报告真实验证结果和未覆盖项，不能把 skip/warning 写成 pass。
+
+## 十四、实施结果（2026-07-12）
+
+- watchdog 只输出完整、有界的 `usageModelKeys`；transcript collector 在 companion finalization 阶段采集 `message.model`。
+- schema v4 已区分 `requestedModel`、`requestMode`、`executedModels` 与 `usageModelKeys`，历史 `observedModel` 仅迁移为 usage key。
+- delegate、check、list、review 和 result artifact 使用统一模型证据 formatter/结构；review 不再退化为 compact 单字符串。
+- collector 已覆盖 config/projects 根 symlink、主/子 transcript symlink、权限拒绝、停滞 stream deadline、超长行、byte limit、257 个 subagent、模型数量和 UTF-8 截断回归。
+- 固定 MCP fixture 贯穿 `mimo-v2.5-pro` transcript 与 `mimo-v2.5` usage key，并校验 job、artifact 和全部展示表面。

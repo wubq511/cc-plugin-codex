@@ -21,6 +21,7 @@ Both modes produce **structured JSON output** with verdict, findings (severity-r
    - Default → standard review
 
 2. Call `cc_review` with:
+   - `cwd` (required): absolute path to the user's current workspace
    - `job` (optional): job ID or prefix to review (default: latest completed job)
    - `adversarial` (optional): set to `true` for adversarial mode
    - `focus` (optional): specific aspect to focus on (e.g., "security", "performance")
@@ -30,7 +31,7 @@ Both modes produce **structured JSON output** with verdict, findings (severity-r
 3. The tool returns the diff, git context, and review instructions. **You (Codex) execute the review** — apply the review criteria to the diff and produce a structured JSON result.
 
 4. Parse the review result JSON and present findings to the user:
-   - Overall verdict (approve / request_changes / reject)
+   - Overall verdict (approve / needs-attention / request_changes / reject)
    - Findings ordered by severity (critical → low)
    - Specific file and line references
    - Concrete recommendations for each finding
@@ -46,7 +47,7 @@ All reviews produce JSON matching this schema:
 
 ```json
 {
-  "verdict": "approve|needs-attention",
+  "verdict": "approve|needs-attention|request_changes|reject",
   "summary": "terse ship/no-ship assessment",
   "findings": [{ "severity": "critical|high|medium|low", "title": "...", "body": "...", "file": "...", "line_start": 1, "line_end": 1, "confidence": 0.8, "recommendation": "..." }],
   "next_steps": ["step 1", "step 2"]

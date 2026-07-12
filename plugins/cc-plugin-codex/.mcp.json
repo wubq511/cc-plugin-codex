@@ -3,7 +3,9 @@
     "cc-plugin-codex": {
       "type": "stdio",
       "command": "node",
-      "args": ["${PLUGIN_DIR}/scripts/cc-companion.mjs"]
+      "args": ["./scripts/cc-companion.mjs"],
+      "cwd": ".",
+      "tool_timeout_sec": 604800
     }
   }
 }

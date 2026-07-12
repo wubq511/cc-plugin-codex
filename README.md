@@ -12,9 +12,11 @@
 
 ## 功能
 
-- **分派任务** — 把编码任务交给 Claude Code，选择模型和推理强度
-- **前台/后台执行** — 前台模式等待完成立即返回，后台模式立即返回 job ID
-- **状态追踪** — 实时查看任务进度、阶段、耗时、成本
+- **分派任务** — 把编码任务交给 Claude Code，可选传入任意模型标识和推理强度
+- **Provider 无关** — 默认继承用户当前 Claude Code 配置的 Provider 和模型，无需手动选择
+- **自动等待完成** — 所有任务保持一次 pending 调用，完成后自动返回，不需要轮询
+- **任务隐私** — 任务通过 stdin 传递，不出现在任何进程命令行中
+- **状态追踪** — 实时查看任务进度、阶段、耗时、成本，区分请求模型、执行记录和用量 key
 - **代码审查** — 标准审查（找 bug）或对抗审查（质疑实现选择、攻击面分析）
 - **会话恢复** — 支持恢复上一次 Claude Code 会话继续工作
 - **Job 管理** — 前缀匹配、会话过滤、取消运行中的任务
@@ -61,16 +63,7 @@ codex plugin add cc-plugin-codex
 /claude:delegate
 ```
 
-Codex 会根据任务复杂度自动选择模型：
-
-| 任务类型 | 模型 | 推理强度 |
-|----------|------|----------|
-| 修 typo、简单 bug | haiku | low |
-| 功能实现 | sonnet | medium |
-| 复杂重构 | opus | high |
-| 跨模块重设计 | fable | xhigh |
-
-也可以手动指定模型和推理强度。
+默认继承当前 Claude Code 配置的 Provider 和模型，无需手动选择。也可以通过 `model` 参数传入任意模型标识进行单次覆盖，通过 `effort` 参数指定推理强度。
 
 ### 查看状态
 
@@ -78,6 +71,8 @@ Codex 会根据任务复杂度自动选择模型：
 /claude:status        # 最新任务
 /claude:status --all  # 所有任务
 ```
+
+默认 delegate 会一直等待 Claude Code 完成，期间 MCP server 仍可响应取消请求。等待时不应通过 `sleep`、重复状态查询或周期性“仍在运行”消息制造额外模型回合，也不得在工具缺失时用 shell/PTY 手工启动 companion 来模拟 delegation。`background=true` 已废弃并被拒绝。
 
 ### 审查产出
 
@@ -108,8 +103,8 @@ Codex 会根据任务复杂度自动选择模型：
 
 | 工具 | 说明 |
 |------|------|
-| `cc_delegate` | 分派编码任务给 Claude Code |
-| `cc_list_models` | 列出可用模型和推荐配置 |
+| `cc_delegate` | 分派编码任务给 Claude Code（默认继承 Provider 配置） |
+| `cc_list_models` | 报告模型解析行为和最近完成任务的模型证据信息 |
 | `cc_check` | 查看任务状态/结果 |
 | `cc_cancel` | 取消运行中的任务 |
 | `cc_review` | 审查代码变更 |
@@ -119,17 +114,24 @@ Codex 会根据任务复杂度自动选择模型：
 
 ```
 ├── marketplace.json               # Marketplace 清单（支持 Git URL 安装）
+├── package.json                   # 测试入口
 └── plugins/cc-plugin-codex/
     ├── .codex-plugin/plugin.json  # Codex 插件清单
     ├── .mcp.json                  # MCP server 声明（stdio）
     ├── scripts/
     │   ├── cc-companion.mjs         # MCP server 主进程
     │   └── lib/
-    │       ├── claude-runner.mjs  # claude CLI 调用封装
+    │       ├── claude-runner.mjs  # watchdog 调用封装
+    │       ├── watchdog.mjs       # Claude 监督运行器
     │       ├── git.mjs            # Git 集成（diff、review context）
     │       ├── job-log.mjs        # Job 日志和阶段追踪
     │       ├── process.mjs        # 进程管理
-    │       ├── state.mjs          # Job 状态持久化
+    │       ├── state.mjs          # Job 状态、writer lease 与保留策略
+    │       ├── model-evidence.mjs # 模型证据模块统一出口
+    │       ├── model-evidence-collector.mjs # 有界 transcript 采集
+    │       ├── model-evidence-formatter.mjs # 统一安全展示
+    │       ├── model-evidence-migration.mjs # v3 → v4 迁移
+    │       ├── model-evidence-shared.mjs # 常量与规范化
     │       └── workspace.mjs      # 工作区解析
     ├── skills/                    # Codex skill 定义
     │   ├── delegate/SKILL.md
@@ -137,6 +139,7 @@ Codex 会根据任务复杂度自动选择模型：
     │   ├── review/SKILL.md
     │   ├── cancel/SKILL.md
     │   └── setup/SKILL.md
+    ├── tests/                     # 测试套件
     └── schemas/
         └── review-output.schema.json  # 审查输出 JSON Schema
 ```
@@ -162,6 +165,15 @@ Codex 会根据任务复杂度自动选择模型：
   "next_steps": ["修复 X", "补充 Y 的测试"]
 }
 ```
+
+## 本地验证
+
+```bash
+npm test
+npm run verify:source
+```
+
+完整本地发布验证使用 `npm run verify`：它会检查源码、更新 cachebuster、重新安装插件、比对 source/cache 并运行 installed-cache tests。重新安装后需打开新的 Codex 任务加载新版本。
 
 ## 与 codex-plugin-cc 的对比
 

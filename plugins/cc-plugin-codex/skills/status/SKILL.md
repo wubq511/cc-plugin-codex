@@ -7,12 +7,13 @@ description: Use when you want to check the status of a Claude Code task — see
 
 ## Overview
 
-Check the status and results of Claude Code tasks. Shows phase tracking, recent log entries, and session info.
+Check the status and results of Claude Code tasks. Shows phase tracking, recent log entries, model evidence, and session info.
 
 ## Workflow
 
 1. Call `cc_check` with appropriate parameters:
-   - No arguments → latest job details (with phase and recent log)
+   - `cwd` (required): absolute path to the user's current workspace
+   - `cwd` only → latest job details (with phase and recent log)
    - `job="<id>"` → specific job details (accepts prefix matching, e.g. "cc-abc")
    - `all=true` → list all jobs in a summary table
    - `wait=true` → wait for a running job to complete (up to 4 minutes)
@@ -36,7 +37,7 @@ Jobs progress through phases:
 
 ## Examples
 
-- "Check Claude Code status" → `cc_check` (latest job)
+- "Check Claude Code status" → `cc_check` with the current workspace's absolute `cwd` (latest job)
 - "Show all Claude Code jobs" → `cc_check` with `all=true`
 - "Check job cc-abc" → `cc_check` with `job="cc-abc"` (prefix)
 - "Wait for Claude Code to finish" → `cc_check` with `wait=true`

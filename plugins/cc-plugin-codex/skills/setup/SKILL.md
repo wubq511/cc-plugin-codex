@@ -11,7 +11,7 @@ Verify that Claude Code is installed and the plugin is ready to use. Reports wor
 
 ## Workflow
 
-1. Call `cc_setup` (no parameters needed).
+1. Call `cc_setup` with `cwd` set to the absolute path of the user's current workspace.
 
 2. If everything is ready, inform the user they can start delegating tasks.
 
@@ -29,8 +29,9 @@ Verify that Claude Code is installed and the plugin is ready to use. Reports wor
 - Workspace root detection
 - Default branch detection (main/master)
 - Current session ID
+- State schema version (v4 with model evidence)
 
 ## Examples
 
-- "Check Claude Code setup" → `cc_setup`
-- "Is Claude Code ready?" → `cc_setup`
+- "Check Claude Code setup" → `cc_setup` with the current workspace's absolute `cwd`
+- "Is Claude Code ready?" → `cc_setup` with the current workspace's absolute `cwd`
