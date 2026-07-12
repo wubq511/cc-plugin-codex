@@ -1,6 +1,6 @@
 {
   "name": "cc-plugin-codex",
-  "version": "0.3.0+codex.20260712132911",
+  "version": "0.3.0+codex.20260712134317",
   "description": "Delegate coding tasks to Claude Code from Codex, then review the results.",
   "author": {
     "name": "Robert Wu"

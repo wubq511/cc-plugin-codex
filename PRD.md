@@ -115,6 +115,8 @@ cc-plugin-codex/
 | `effort` | string | ❌ | — | 推理努力度：`low`, `medium`, `high`, `xhigh`, `max` |
 | `timeoutSeconds` | integer | ❌ | — | 可选硬超时（秒，1..604800）。省略时任务运行直到完成、失败、取消或服务器关闭 |
 | `dangerouslySkipPermissions` | boolean | ❌ | `false` | 跳过权限确认（仅在显式传入 `true` 时开启） |
+| `resume` | boolean | ❌ | `false` | 仅在用户明确要求保留同一个 Claude Code 会话时，恢复当前工作区最近完成任务的 Claude session |
+| `resumeSession` | string | ❌ | — | 仅在用户明确指定 Claude session 时恢复该会话；不能与 `resume` 同时使用 |
 
 **行为：**
 
@@ -142,6 +144,14 @@ cc-plugin-codex/
    - 更新 job 状态为 completed
    - **自动返回结果**，包含摘要和修改的文件列表
 4. `background=true`：已废弃并拒绝。不再支持 detached 模式。
+
+**后续任务的上下文策略：**
+
+- 审查修复、普通“继续”或下一轮实现默认不传 `resume` / `resumeSession`，开启新 Claude Code 会话。
+- Codex 传递有界交接包：当前目标、可执行发现、仍有效约束、验收命令，并要求 Claude Code 以当前工作区和 git diff 为主要证据。
+- 不复制完整旧会话、完整 diff 或冗长日志；这些内容由 Claude Code 在工作区中按需读取。
+- 只有用户明确要求保留同一个 Claude Code 对话，或明确指定 session ID，才使用 resume。
+- 不使用 `--fork-session` 解决成本问题，因为它会继承被恢复会话的历史，只改变后续 session ID。
 
 **输出（前台完成时）：**
 

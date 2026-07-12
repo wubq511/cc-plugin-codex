@@ -20,8 +20,8 @@ Send a coding task to Claude Code for execution. Claude Code runs in a separate 
    - `background`: DEPRECATED AND REJECTED. Do not pass `background=true` — it will always produce an error. Default foreground delegation waits silently without polling.
    - `timeoutSeconds` (optional): hard timeout in seconds (1..604800). When omitted, the task runs until it completes, fails, is cancelled, or the server shuts down. Supply only when the user explicitly requests a deadline.
    - `dangerouslySkipPermissions`: set to `true` to let Claude Code write without confirmation (default: false)
-   - `resume`: set to `true` to resume the last completed plugin job in this workspace that has a claudeSessionId. Cannot be combined with resumeSession.
-   - `resumeSession`: pass a session ID to resume a specific Claude Code session (adds `--resume <id>`). Cannot be combined with resume.
+   - `resume`: set to `true` only when the user explicitly asks to preserve the same/latest Claude Code conversation. It resumes the last completed plugin job in this workspace that has a claudeSessionId. Cannot be combined with resumeSession.
+   - `resumeSession`: pass a session ID only when the user explicitly identifies the Claude Code conversation to preserve (adds `--resume <id>`). Cannot be combined with resume.
 
    Call the registered `cc_delegate` MCP tool directly. You may announce the delegation once before the tool call, then remain silent while it is pending. Do not manually start `cc-companion.mjs`, wrap it in a shell/PTY, or emit periodic "still running" commentary. If the registered `cc_*` tools are unavailable, use the setup workflow and ask the user to restart or open a new task; never emulate delegation with a polling fallback.
 
@@ -47,20 +47,50 @@ Execution model and usage key have different semantics and may differ (e.g., exe
 
 Do not call `cc_list_models` before ordinary delegation — it does not enumerate available models.
 
-## Resume
+## Follow-up Context Policy
 
-When the user wants to continue a previous Claude Code session:
-- "keep going", "resume", "continue" → `cc_delegate` with `resume=true`
-- "resume session abc123" → `cc_delegate` with `resumeSession="abc123"`
-- "fresh start" → `cc_delegate` without resume flags (new session)
+Task continuity does not require conversation continuity. The workspace, git diff, tests, and project instructions are the authoritative state for review-and-fix work.
+
+For ordinary follow-ups such as "keep going", "continue", "fix the review findings", or another review/fix round:
+
+- start a fresh Claude Code session by omitting both resume flags;
+- give Claude Code a bounded handoff with only the current objective, actionable findings, still-valid constraints, and acceptance checks;
+- tell Claude Code to inspect the current workspace and git diff as primary evidence;
+- do not paste the full prior transcript, full diff, or verbose logs into the handoff.
+
+Use this concise shape and omit empty sections:
+
+```text
+Objective
+<current outcome and scope>
+
+Current findings
+<actionable review findings or verification failures>
+
+Constraints
+<still-valid decisions and non-negotiable requirements>
+
+Acceptance checks
+<commands or observable results that must pass>
+
+Inspect the current workspace and git diff as primary evidence before editing.
+```
+
+Resume is an explicit conversation-preservation operation, not the default continuation strategy:
+
+- "continue the same/latest Claude Code conversation" → `cc_delegate` with `resume=true`
+- "resume Claude Code session abc123" → `cc_delegate` with `resumeSession="abc123"`
+- ambiguous "continue" or "keep going" → fresh session with a bounded handoff
+- "fresh start" → fresh session without resume flags
 
 ## Examples
 
 - "Have Claude Code implement the auth middleware"
 - "Delegate the CSS fix to Claude Code"
 - "Ask Claude Code to refactor the database layer"
-- "Resume the last Claude Code session and keep going" → `resume=true`
-- "Continue Claude Code session cc-abc123" → `resumeSession="..."`
+- "Continue the same latest Claude Code conversation" → `resume=true`
+- "Resume Claude Code session cc-abc123" → `resumeSession="..."`
+- "Fix these review findings and rerun the tests" → fresh session with a bounded handoff
 
 ## Notes
 
@@ -75,3 +105,4 @@ When the user wants to continue a previous Claude Code session:
 - `write=false` strictly prohibits Bash and write-capable tools; only Read, Glob, and Grep are exposed.
 - Only one write-enabled delegation can run per workspace at a time (writer lease). Read-only delegations can run concurrently.
 - Resume=true resolves to the latest completed plugin job with a claudeSessionId in the same workspace, not a global resume-last.
+- Do not use `--fork-session` as a context-cost optimization: it creates a new session ID while retaining the resumed conversation history.

@@ -365,7 +365,7 @@ const CWD_SCHEMA = {
 const TOOLS = [
   {
     name: "cc_delegate",
-    description: "Delegate a coding task to Claude Code. All tasks keep one foreground tool call pending and return automatically on completion. Call this registered tool directly: while it is pending, do not manually launch the MCP server, poll, or emit periodic 'still running' commentary. background=true is deprecated and rejected. Task prompts are sent via stdin for privacy. Use resume=true to continue the last Claude Code session, or resumeSession=<id> to resume a specific session. By default, delegation inherits the user's current Claude Code Provider and model configuration — do not pass --model unless the user explicitly names one.",
+    description: "Delegate a coding task to Claude Code. All tasks keep one foreground tool call pending and return automatically on completion. Call this registered tool directly: while it is pending, do not manually launch the MCP server, poll, or emit periodic 'still running' commentary. background=true is deprecated and rejected. Task prompts are sent via stdin for privacy. Follow-up and review-fix work starts a fresh Claude Code session by default: omit resume flags and pass a bounded handoff containing the objective, actionable findings, constraints, and acceptance checks. Use resume only when the user explicitly requests preservation of the same Claude Code conversation. By default, delegation inherits the user's current Claude Code Provider and model configuration — do not pass --model unless the user explicitly names one.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -378,8 +378,8 @@ const TOOLS = [
         effort: { type: "string", description: "Reasoning effort level", enum: ["low", "medium", "high", "xhigh", "max"] },
         dangerouslySkipPermissions: { type: "boolean", description: "Skip permission prompts (default: false, set true to allow Claude Code to write without confirmation)" },
         timeoutSeconds: { type: "integer", description: "Optional hard timeout in seconds. When omitted, the task runs until it completes, fails, is cancelled, or the server shuts down. Must be an integer in 1..604800 if supplied." },
-        resume: { type: "boolean", description: "Resume the last completed plugin job in this workspace that has a claudeSessionId. Cannot be combined with resumeSession." },
-        resumeSession: { type: "string", description: "Resume a specific Claude Code session by session ID (adds --resume <id> flag). Cannot be combined with resume." }
+        resume: { type: "boolean", description: "Explicit conversation preservation: resume the last completed plugin job in this workspace that has a claudeSessionId. Do not use for ordinary follow-up or review-fix work; start fresh with a bounded handoff instead. Cannot be combined with resumeSession." },
+        resumeSession: { type: "string", description: "Explicit conversation preservation: resume a specific Claude Code session by session ID (adds --resume <id> flag). Do not use for ordinary follow-up or review-fix work. Cannot be combined with resume." }
       },
       required: ["cwd", "task"]
     }
@@ -1384,7 +1384,7 @@ function handleMessage(msg) {
           protocolVersion: PROTOCOL_VERSION,
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: "claude-code-companion", version: SERVER_VERSION },
-          instructions: "Claude Code Companion: call cc_delegate directly and let its foreground tools/call remain pending until completion. Do not emulate it through shell/PTY, poll it, or emit periodic waiting commentary. Supports atomic per-job persistence, watchdog execution, session scoping, prefix matching, and resume."
+          instructions: "Claude Code Companion: call cc_delegate directly and let its foreground tools/call remain pending until completion. Do not emulate it through shell/PTY, poll it, or emit periodic waiting commentary. For ordinary follow-up and review-fix work, start a fresh Claude Code session with a bounded handoff; preserve a prior Claude conversation only when the user explicitly requests same-session resume. Supports atomic per-job persistence, watchdog execution, session scoping, prefix matching, and explicit resume."
         });
         break;
       }
