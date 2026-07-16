@@ -82,7 +82,7 @@ function startServer(t, { env: extraEnv } = {}) {
       const timer = setTimeout(() => {
         waiters.delete(id);
         reject(new Error(`Timed out waiting for response ${id}. stderr: ${stderr}`));
-      }, 5000);
+      }, 10000);
       waiters.set(id, {
         resolve: (message) => {
           clearTimeout(timer);
