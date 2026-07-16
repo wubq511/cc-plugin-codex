@@ -603,6 +603,13 @@ export async function collectModelEvidence({
   const absoluteDeadline = startTime + deadlineMs;
   let projectsDir;
   try {
+    // Pre-check deadline before initiating async I/O — withDeadline throws
+    // after the promise is already created, leaving a dangling realpath that
+    // can fire ENOENT after the caller's cleanup. This is especially
+    // important for deadlineMs=0 where the deadline is already exceeded.
+    if (absoluteDeadline - Date.now() <= 0) {
+      throw new DeadlineExceeded("deadline-pre-check");
+    }
     const resolvedConfigRoot = await withDeadline(
       fs.promises.realpath(configRoot), absoluteDeadline, "config-root-realpath"
     );
