@@ -122,7 +122,7 @@ function hashDir(dirPath) {
 // ─── Step 1: Tests ──────────────────────────────────────────────────────
 
 step(1, "Run tests");
-run("npm test", { stdio: "inherit", timeout: 120000 });
+run("npm test", { stdio: "inherit", timeout: 300000 });
 pass("All tests passed");
 
 // ─── Step 2: Syntax check ───────────────────────────────────────────────

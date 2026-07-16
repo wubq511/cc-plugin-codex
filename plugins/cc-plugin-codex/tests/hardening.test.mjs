@@ -29,6 +29,27 @@ async function waitFor(predicate, timeoutMs = 3000) {
   throw new Error(`Condition was not met within ${timeoutMs}ms`);
 }
 
+/**
+ * Windows-safe recursive directory removal.
+ * On Windows, deleting a directory while a child process still holds it as
+ * CWD (or descendant handles are briefly lingering) fails with EBUSY/ENOTEMPTY.
+ * Retry with backoff on Windows; on POSIX a single attempt is enough.
+ */
+async function safeRmDir(dir) {
+  const maxRetries = process.platform === "win32" ? 5 : 1;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      if ((err.code === "EBUSY" || err.code === "ENOTEMPTY") && i < maxRetries - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      // Last resort: ignore — OS will clean up temp dir eventually
+    }
+  }
+}
+
 function startServer(t, opts = {}) {
   const workspace = opts.workspace || fs.mkdtempSync(path.join(os.tmpdir(), "cc-hardening-test-"));
   const binDir = path.join(workspace, "bin");
@@ -83,8 +104,9 @@ function startServer(t, opts = {}) {
     // fails with EBUSY. The watchdog and fake-claude also need a moment to
     // detect the IPC disconnect and exit.
     await new Promise((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) return resolve();
       child.once("exit", resolve);
-      setTimeout(resolve, 3000).unref?.();
+      setTimeout(resolve, 3000);
     });
     // Retry deletion on Windows — descendant processes may still hold handles briefly
     const maxRetries = process.platform === "win32" ? 5 : 1;
@@ -109,9 +131,9 @@ function startServer(t, opts = {}) {
 
 test("20 concurrent job writers preserve all 20 jobs", async (t) => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-concurrent-writers-"));
-  t.after(() => {
-    fs.rmSync(resolveStateDir(workspace), { recursive: true, force: true });
-    fs.rmSync(workspace, { recursive: true, force: true });
+  t.after(async () => {
+    await safeRmDir(resolveStateDir(workspace));
+    await safeRmDir(workspace);
   });
 
   const jobIds = [];
@@ -153,9 +175,9 @@ test("20 concurrent job writers preserve all 20 jobs", async (t) => {
 
 test("foreign-session PID survives cancel attempt", async (t) => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-foreign-pid-"));
-  t.after(() => {
-    fs.rmSync(resolveStateDir(workspace), { recursive: true, force: true });
-    fs.rmSync(workspace, { recursive: true, force: true });
+  t.after(async () => {
+    await safeRmDir(resolveStateDir(workspace));
+    await safeRmDir(workspace);
   });
 
   // Start a harmless process to act as a foreign PID
@@ -237,9 +259,9 @@ test("non-terminal jobs from foreign servers become orphaned on startup", async 
 
 test("writer lease prevents concurrent write-enabled delegations from different servers", async (t) => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-lease-cross-"));
-  t.after(() => {
-    fs.rmSync(resolveStateDir(workspace), { recursive: true, force: true });
-    fs.rmSync(workspace, { recursive: true, force: true });
+  t.after(async () => {
+    await safeRmDir(resolveStateDir(workspace));
+    await safeRmDir(workspace);
   });
 
   // Simulate two different server tokens acquiring the lease
@@ -267,9 +289,9 @@ test("writer lease prevents concurrent write-enabled delegations from different 
 
 test("writer lease acquisition is atomic across racing processes", async (t) => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-lease-race-"));
-  t.after(() => {
-    fs.rmSync(resolveStateDir(workspace), { recursive: true, force: true });
-    fs.rmSync(workspace, { recursive: true, force: true });
+  t.after(async () => {
+    await safeRmDir(resolveStateDir(workspace));
+    await safeRmDir(workspace);
   });
 
   const stateUrl = pathToFileURL(path.join(pluginRoot, "scripts", "lib", "state.mjs")).href;
@@ -299,9 +321,9 @@ test("writer lease acquisition is atomic across racing processes", async (t) => 
 
 test("writer lease heartbeat refreshes staleness timestamp", async (t) => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-lease-heartbeat-"));
-  t.after(() => {
-    fs.rmSync(resolveStateDir(workspace), { recursive: true, force: true });
-    fs.rmSync(workspace, { recursive: true, force: true });
+  t.after(async () => {
+    await safeRmDir(resolveStateDir(workspace));
+    await safeRmDir(workspace);
   });
   assert.equal(acquireWriterLease(workspace, "heartbeat-owner").acquired, true);
   const before = getWriterLeaseOwner(workspace).ts;
@@ -426,7 +448,7 @@ fs.writeFileSync(path.join(process.cwd(), "existing.txt"), "modified\\n");
 process.stdout.write(JSON.stringify({ result: "wrote files", session_id: "s", total_cost_usd: 0, duration_ms: 1, modelUsage: { m: {} } }));
 `, { mode: 0o755 });
 
-  t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+  t.after(async () => { await safeRmDir(workspace); });
 
   const server = startServer(t, { workspace });
   // Replace the bin dir with our malicious claude
@@ -474,9 +496,9 @@ test("result truncation metadata is included when output exceeds presentation li
 
 test("job log does not exceed 1 MiB limit", async (t) => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-log-limit-"));
-  t.after(() => {
-    fs.rmSync(resolveStateDir(workspace), { recursive: true, force: true });
-    fs.rmSync(workspace, { recursive: true, force: true });
+  t.after(async () => {
+    await safeRmDir(resolveStateDir(workspace));
+    await safeRmDir(workspace);
   });
 
   const jobId = generateJobId("cc");
@@ -553,7 +575,7 @@ test("review context frames untrusted content and excludes sensitive files", asy
   fs.writeFileSync(path.join(workspace, "id_rsa"), "-----BEGIN RSA PRIVATE KEY-----\n");
   fs.writeFileSync(path.join(workspace, "normal.txt"), "normal content\n");
 
-  t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+  t.after(async () => { await safeRmDir(workspace); });
 
   const server = startServer(t, { workspace });
   const review = await server.send(1, "cc_review", { scope: "working-tree" });
@@ -604,7 +626,7 @@ test("review prompts use canonical verdict enum: approve, needs-attention, reque
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-review-verdict-"));
   spawnSync("git", ["init", "--quiet"], { cwd: workspace });
   fs.writeFileSync(path.join(workspace, "test.txt"), "test\n");
-  t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+  t.after(async () => { await safeRmDir(workspace); });
 
   const review = await server.send(1, "cc_review", { cwd: workspace, scope: "working-tree" });
   const text = review.result.content[0].text;
@@ -640,9 +662,9 @@ test("full result is stored as separate artifact, not duplicated in metadata", a
 
 test("job store rejects metadata above the 64 KiB contract", async (t) => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-metadata-limit-"));
-  t.after(() => {
-    fs.rmSync(resolveStateDir(workspace), { recursive: true, force: true });
-    fs.rmSync(workspace, { recursive: true, force: true });
+  t.after(async () => {
+    await safeRmDir(resolveStateDir(workspace));
+    await safeRmDir(workspace);
   });
   assert.throws(() => upsertJob(workspace, {
     id: "cc-oversized-metadata",
@@ -782,7 +804,7 @@ test("review context caps untracked files at 20 and total bytes at 256KiB", asyn
     fs.writeFileSync(path.join(workspace, `untracked-${i}.txt`), `content ${i}\n`);
   }
 
-  t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+  t.after(async () => { await safeRmDir(workspace); });
 
   const server = startServer(t, { workspace });
   const review = await server.send(1, "cc_review", { scope: "working-tree" });
@@ -850,9 +872,9 @@ test("total artifact retention is enforced", async () => {
 
 test("100 MiB artifact cap runs even when there are fewer than 50 jobs", async (t) => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-artifact-cap-"));
-  t.after(() => {
-    fs.rmSync(resolveStateDir(workspace), { recursive: true, force: true });
-    fs.rmSync(workspace, { recursive: true, force: true });
+  t.after(async () => {
+    await safeRmDir(resolveStateDir(workspace));
+    await safeRmDir(workspace);
   });
   upsertJob(workspace, { id: "cc-large-terminal", status: "completed", phase: "completed" });
   const artifact = writeResultArtifact(workspace, "cc-large-terminal", { result: "x" });
@@ -865,9 +887,9 @@ test("100 MiB artifact cap runs even when there are fewer than 50 jobs", async (
 
 test("artifact cap never removes active job diagnostics", async (t) => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-artifact-active-"));
-  t.after(() => {
-    fs.rmSync(resolveStateDir(workspace), { recursive: true, force: true });
-    fs.rmSync(workspace, { recursive: true, force: true });
+  t.after(async () => {
+    await safeRmDir(resolveStateDir(workspace));
+    await safeRmDir(workspace);
   });
   upsertJob(workspace, { id: "cc-active-large", status: "running", phase: "executing" });
   const artifact = writeResultArtifact(workspace, "cc-active-large", { result: "x" });
@@ -982,7 +1004,7 @@ test("write=false passes --allowedTools with only Read,Glob,Grep (no Bash/Edit/W
   fs.copyFileSync(fakeClaudeSource, argEchoClaude);
   fs.chmodSync(argEchoClaude, 0o755);
 
-  t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+  t.after(async () => { await safeRmDir(workspace); });
 
   const server = startServer(t, { workspace });
   const result = await server.send(1, "cc_delegate", { task: "echo-args", write: false });
@@ -1042,7 +1064,7 @@ process.stdout.write(JSON.stringify({
 }));
 `, { mode: 0o755 });
 
-  t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+  t.after(async () => { await safeRmDir(workspace); });
 
   const server = startServer(t, { workspace });
   // Read-only delegation: write=false
@@ -1072,7 +1094,7 @@ test("read-only delegation leaves temporary workspace byte-for-byte unchanged", 
   const originalContent = fs.readFileSync(path.join(workspace, "existing.txt"), "utf8");
   const originalFiles = fs.readdirSync(workspace).filter((f) => !f.startsWith("."));
 
-  t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+  t.after(async () => { await safeRmDir(workspace); });
 
   const server = startServer(t, { workspace });
   const result = await server.send(1, "cc_delegate", { task: "success", write: false });
@@ -1158,7 +1180,7 @@ test("review context excludes .env and private key files from untracked content"
   fs.writeFileSync(path.join(workspace, "credentials.json"), '{"key":"val"}');
   fs.writeFileSync(path.join(workspace, "normal.txt"), "safe content\n");
 
-  t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+  t.after(async () => { await safeRmDir(workspace); });
 
   const server = startServer(t, { workspace });
   const review = await server.send(1, "cc_review", { scope: "working-tree" });
@@ -1187,7 +1209,7 @@ test("review context reports omission counts when untracked files exceed budget"
     fs.writeFileSync(path.join(workspace, `file-${i}.txt`), `content ${i}\n`);
   }
 
-  t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+  t.after(async () => { await safeRmDir(workspace); });
 
   const server = startServer(t, { workspace });
   const review = await server.send(1, "cc_review", { scope: "working-tree" });
@@ -1343,8 +1365,9 @@ test("cc_cancel terminates actual watchdog/Claude processes, not just job state"
   t.after(async () => {
     try { child.kill("SIGTERM"); } catch { /* already dead */ }
     await new Promise((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) return resolve();
       child.once("exit", resolve);
-      setTimeout(resolve, 3000).unref?.();
+      setTimeout(resolve, 3000);
     });
     const maxRetries = process.platform === "win32" ? 5 : 1;
     for (let i = 0; i < maxRetries; i++) {

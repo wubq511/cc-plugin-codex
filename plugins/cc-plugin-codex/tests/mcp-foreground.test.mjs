@@ -24,6 +24,26 @@ async function waitFor(predicate, timeoutMs = 2000) {
   throw new Error(`Condition was not met within ${timeoutMs}ms`);
 }
 
+/**
+ * Windows-safe recursive directory removal.
+ * On Windows, deleting a directory while a child process still holds it as
+ * CWD (or descendant handles are briefly lingering) fails with EBUSY/ENOTEMPTY.
+ * Retry with backoff on Windows; on POSIX a single attempt is enough.
+ */
+async function safeRmDir(dir) {
+  const maxRetries = process.platform === "win32" ? 5 : 1;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      if ((err.code === "EBUSY" || err.code === "ENOTEMPTY") && i < maxRetries - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    }
+  }
+}
+
 function startServer(t, { env: extraEnv } = {}) {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-companion-test-"));
   const binDir = path.join(workspace, "bin");
@@ -83,8 +103,9 @@ function startServer(t, { env: extraEnv } = {}) {
   t.after(async () => {
     try { child.kill("SIGTERM"); } catch { /* already dead */ }
     await new Promise((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) return resolve();
       child.once("exit", resolve);
-      setTimeout(resolve, 3000).unref?.();
+      setTimeout(resolve, 3000);
     });
     const maxRetries = process.platform === "win32" ? 5 : 1;
     for (let i = 0; i < maxRetries; i++) {
@@ -191,7 +212,7 @@ test("stateful tool schemas require the user's workspace cwd", async (t) => {
 test("public cwd runs Claude in the user workspace rather than the MCP server cache", async (t) => {
   const server = startServer(t);
   const target = fs.mkdtempSync(path.join(os.tmpdir(), "cc-companion-target-"));
-  t.after(() => fs.rmSync(target, { recursive: true, force: true }));
+  t.after(async () => { await safeRmDir(target); });
 
   const completed = await server.send(30, "cc_delegate", { cwd: target, task: "cwd" });
   assert.match(completed.result.content[0].text, new RegExp(target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -208,7 +229,7 @@ test("stateful tools reject relative cwd instead of resolving it inside the plug
 test("adversarial working-tree review works without a recorded Claude Code job", async (t) => {
   const server = startServer(t);
   const target = fs.mkdtempSync(path.join(os.tmpdir(), "cc-companion-review-"));
-  t.after(() => fs.rmSync(target, { recursive: true, force: true }));
+  t.after(async () => { await safeRmDir(target); });
   const initialized = spawnSync("git", ["init", "--quiet"], { cwd: target, encoding: "utf8" });
   assert.equal(initialized.status, 0, initialized.stderr);
   fs.writeFileSync(path.join(target, "example.txt"), "review me\n", "utf8");
@@ -229,10 +250,10 @@ test("stdin close cancels foreground and detached jobs from every workspace befo
     fs.mkdtempSync(path.join(os.tmpdir(), "cc-companion-shutdown-a-")),
     fs.mkdtempSync(path.join(os.tmpdir(), "cc-companion-shutdown-b-"))
   ];
-  t.after(() => {
+  t.after(async () => {
     for (const target of targets) {
-      fs.rmSync(resolveStateDir(target), { recursive: true, force: true });
-      fs.rmSync(target, { recursive: true, force: true });
+      await safeRmDir(resolveStateDir(target));
+      await safeRmDir(target);
     }
   });
 
@@ -270,9 +291,9 @@ test("stdin close cancels foreground and detached jobs from every workspace befo
 
 test("shutdown never cancels a running job owned by another MCP server session", async (t) => {
   const target = fs.mkdtempSync(path.join(os.tmpdir(), "cc-companion-foreign-job-"));
-  t.after(() => {
-    fs.rmSync(resolveStateDir(target), { recursive: true, force: true });
-    fs.rmSync(target, { recursive: true, force: true });
+  t.after(async () => {
+    await safeRmDir(resolveStateDir(target));
+    await safeRmDir(target);
   });
   upsertJob(target, {
     id: "cc-foreign-session",
@@ -517,9 +538,9 @@ test("cc_list_models without cwd reports from session workspaces (generic no-cwd
 test("cc_list_models with cwd loads history from that workspace directly", async (t) => {
   const server = startServer(t);
   const target = fs.mkdtempSync(path.join(os.tmpdir(), "cc-companion-list-models-"));
-  t.after(() => {
-    fs.rmSync(resolveStateDir(target), { recursive: true, force: true });
-    fs.rmSync(target, { recursive: true, force: true });
+  t.after(async () => {
+    await safeRmDir(resolveStateDir(target));
+    await safeRmDir(target);
   });
 
   // Create a completed job in the target workspace's state

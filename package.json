@@ -11,7 +11,7 @@
     "verify:ci": "node scripts/verify-install.mjs --ci"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "license": "MIT"
 }
