@@ -407,7 +407,7 @@ if (!SOURCE_ONLY) {
   try {
     const testDir = path.join(activeCache.activePath, "tests");
     if (fs.existsSync(testDir)) {
-      run(`node --test "${testDir}"/*.test.mjs`, { timeout: 60000, cwd: activeCache.activePath });
+      run(`node --test "${testDir}"${path.sep}*.test.mjs`, { timeout: 60000, cwd: activeCache.activePath });
       pass("Installed-cache tests passed");
     } else {
       warn("No tests/ directory in cache — skipping installed-cache tests");

@@ -80,9 +80,23 @@ function startServer(t, { env: extraEnv } = {}) {
     });
   }
 
-  t.after(() => {
-    child.kill("SIGTERM");
-    fs.rmSync(workspace, { recursive: true, force: true });
+  t.after(async () => {
+    try { child.kill("SIGTERM"); } catch { /* already dead */ }
+    await new Promise((resolve) => {
+      child.once("exit", resolve);
+      setTimeout(resolve, 3000).unref?.();
+    });
+    const maxRetries = process.platform === "win32" ? 5 : 1;
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        fs.rmSync(workspace, { recursive: true, force: true });
+        break;
+      } catch (err) {
+        if ((err.code === "EBUSY" || err.code === "ENOTEMPTY") && i < maxRetries - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+      }
+    }
   });
 
   return { child, messages, request, send, workspace };

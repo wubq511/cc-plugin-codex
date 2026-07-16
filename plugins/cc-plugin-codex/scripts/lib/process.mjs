@@ -91,8 +91,23 @@ export function resolveWindowsCommand(command, userArgs = []) {
     return { command, args: userArgs, shell: false };
   }
 
-  // If the command doesn't end in .cmd, try it as-is (might be a direct executable)
+  // If the command is a .js/.mjs file, run it with node
+  if (/\.(js|mjs)$/i.test(command)) {
+    return { command: process.execPath, args: [command, ...userArgs], shell: false };
+  }
+
+  // If the command doesn't end in .cmd, check if it's a Node shebang script
   if (!command.toLowerCase().endsWith(".cmd")) {
+    // On Windows, spawn() with shell=false cannot execute extensionless files
+    // even if they have a shebang. Detect Node shebang scripts and wrap with node.
+    try {
+      const content = fs.readFileSync(command, "utf8");
+      if (content.startsWith("#!/usr/bin/env node") || content.startsWith("#!node")) {
+        return { command: process.execPath, args: [command, ...userArgs], shell: false };
+      }
+    } catch {
+      // Can't read the file — fall through to return as-is
+    }
     return { command, args: userArgs, shell: false };
   }
 

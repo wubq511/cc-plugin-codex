@@ -76,9 +76,30 @@ function startServer(t, opts = {}) {
     return request(id, "tools/call", { name, arguments: stateful ? { cwd: workspace, ...args } : args });
   }
 
-  t.after(() => {
-    child.kill("SIGTERM");
-    fs.rmSync(workspace, { recursive: true, force: true });
+  t.after(async () => {
+    try { child.kill("SIGTERM"); } catch { /* already dead */ }
+    // Wait for the companion process to exit before cleaning up.
+    // On Windows, deleting a directory while a child process holds it as CWD
+    // fails with EBUSY. The watchdog and fake-claude also need a moment to
+    // detect the IPC disconnect and exit.
+    await new Promise((resolve) => {
+      child.once("exit", resolve);
+      setTimeout(resolve, 3000).unref?.();
+    });
+    // Retry deletion on Windows — descendant processes may still hold handles briefly
+    const maxRetries = process.platform === "win32" ? 5 : 1;
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        fs.rmSync(workspace, { recursive: true, force: true });
+        break;
+      } catch (err) {
+        if ((err.code === "EBUSY" || err.code === "ENOTEMPTY") && i < maxRetries - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        } else {
+          // Last resort: ignore — OS will clean up temp dir eventually
+        }
+      }
+    }
   });
 
   return { child, messages, request, send, workspace, stderr: () => stderr };
@@ -138,7 +159,8 @@ test("foreign-session PID survives cancel attempt", async (t) => {
   });
 
   // Start a harmless process to act as a foreign PID
-  const harmless = spawn("sleep", ["60"], { stdio: "ignore" });
+  // Use node instead of "sleep" for cross-platform compatibility (sleep is not available on Windows)
+  const harmless = spawn(process.execPath, ["-e", "setInterval(()=>{},60000)"], { stdio: "ignore" });
   t.after(() => { try { harmless.kill(); } catch { /* */ } });
 
   // Create a job owned by another server — the current server will orphan it
@@ -665,17 +687,28 @@ test("state directories and files have private permissions", async () => {
     const stateDir = resolveStateDir(workspace);
     const jobsDir = resolveJobsDir(workspace);
 
-    // Check directory permissions (0o700 = 448 decimal)
-    const stateDirStat = fs.statSync(stateDir);
-    assert.equal(stateDirStat.mode & 0o777, 0o700, `State dir should be 0700, got ${(stateDirStat.mode & 0o777).toString(8)}`);
+    // Unix permission bits (0o700/0o600) are only meaningful on POSIX systems.
+    // Windows NTFS uses ACLs, not Unix mode bits — fs.statSync().mode returns
+    // default values (0o666) regardless of the mode passed to mkdir/writeFileSync.
+    // The production code still sets these bits as best-effort; we only assert on POSIX.
+    if (process.platform !== "win32") {
+      // Check directory permissions (0o700 = 448 decimal)
+      const stateDirStat = fs.statSync(stateDir);
+      assert.equal(stateDirStat.mode & 0o777, 0o700, `State dir should be 0700, got ${(stateDirStat.mode & 0o777).toString(8)}`);
 
-    const jobsDirStat = fs.statSync(jobsDir);
-    assert.equal(jobsDirStat.mode & 0o777, 0o700, `Jobs dir should be 0700, got ${(jobsDirStat.mode & 0o777).toString(8)}`);
+      const jobsDirStat = fs.statSync(jobsDir);
+      assert.equal(jobsDirStat.mode & 0o777, 0o700, `Jobs dir should be 0700, got ${(jobsDirStat.mode & 0o777).toString(8)}`);
 
-    // Check file permissions (0o600 = 384 decimal)
-    const jobFile = path.join(jobsDir, `${jobId}.json`);
-    const jobFileStat = fs.statSync(jobFile);
-    assert.equal(jobFileStat.mode & 0o777, 0o600, `Job file should be 0600, got ${(jobFileStat.mode & 0o777).toString(8)}`);
+      // Check file permissions (0o600 = 384 decimal)
+      const jobFile = path.join(jobsDir, `${jobId}.json`);
+      const jobFileStat = fs.statSync(jobFile);
+      assert.equal(jobFileStat.mode & 0o777, 0o600, `Job file should be 0600, got ${(jobFileStat.mode & 0o777).toString(8)}`);
+    } else {
+      // On Windows, verify the directories and files exist (permissions are ACL-based)
+      assert.ok(fs.existsSync(stateDir), "State dir must exist");
+      assert.ok(fs.existsSync(jobsDir), "Jobs dir must exist");
+      assert.ok(fs.existsSync(path.join(jobsDir, `${jobId}.json`)), "Job file must exist");
+    }
   } finally {
     fs.rmSync(resolveStateDir(workspace), { recursive: true, force: true });
     fs.rmSync(workspace, { recursive: true, force: true });
@@ -1057,8 +1090,8 @@ test("read-only delegation leaves temporary workspace byte-for-byte unchanged", 
 // ─── P2: Windows .cmd resolution ────────────────────────────────────────────
 
 test("process.terminateProcessTree handles cross-platform process termination", async () => {
-  // Start a harmless process
-  const harmless = spawn("sleep", ["30"], { stdio: "ignore" });
+  // Start a harmless process (node-based for cross-platform compatibility)
+  const harmless = spawn(process.execPath, ["-e", "setInterval(()=>{},30000)"], { stdio: "ignore" });
   const { terminateProcessTree } = await import("../scripts/lib/process.mjs");
 
   // Should not throw
@@ -1178,7 +1211,19 @@ test("SIGKILL on companion kills watchdog and Claude (hard crash, no graceful cl
 
   const pidFile = path.join(workspace, "claude.pid");
 
-  t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
+  t.after(async () => {
+    const maxRetries = process.platform === "win32" ? 5 : 1;
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        fs.rmSync(workspace, { recursive: true, force: true });
+        break;
+      } catch (err) {
+        if ((err.code === "EBUSY" || err.code === "ENOTEMPTY") && i < maxRetries - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+      }
+    }
+  });
 
   const child = spawn(process.execPath, [serverPath], {
     cwd: workspace,
@@ -1259,8 +1304,6 @@ test("cc_cancel terminates actual watchdog/Claude processes, not just job state"
 
   const pidFile = path.join(workspace, "claude.pid");
 
-  t.after(() => fs.rmSync(workspace, { recursive: true, force: true }));
-
   const child = spawn(process.execPath, [serverPath], {
     cwd: workspace,
     env: {
@@ -1297,7 +1340,24 @@ test("cc_cancel terminates actual watchdog/Claude processes, not just job state"
     return request(id, "tools/call", { name, arguments: { cwd: workspace, ...args } });
   }
 
-  t.after(() => child.kill("SIGTERM"));
+  t.after(async () => {
+    try { child.kill("SIGTERM"); } catch { /* already dead */ }
+    await new Promise((resolve) => {
+      child.once("exit", resolve);
+      setTimeout(resolve, 3000).unref?.();
+    });
+    const maxRetries = process.platform === "win32" ? 5 : 1;
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        fs.rmSync(workspace, { recursive: true, force: true });
+        break;
+      } catch (err) {
+        if ((err.code === "EBUSY" || err.code === "ENOTEMPTY") && i < maxRetries - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+      }
+    }
+  });
 
   // Start a hanging delegate
   const delegate = send(1, "cc_delegate", { task: "hang-pid" });
