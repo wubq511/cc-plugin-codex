@@ -1,6 +1,6 @@
 # Provider-Agnostic Model Selection and Runtime Liveness
 
-> **Status: implemented and verified.** Provider inheritance, free-form model
+> **Status: partially superseded by [Dynamic Model Routing and Delegation Liveness](./2026-07-22-dynamic-model-routing-and-delegation-liveness-design.md).** Provider inheritance, free-form model
 > overrides, silent foreground waiting, and opt-in deadlines remain current.
 > References below to an “observed model” describe the original design and are
 > superseded by [Model Evidence Provenance](./2026-07-11-model-evidence-provenance-design.md),
