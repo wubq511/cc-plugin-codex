@@ -10,7 +10,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   resolveStateDir, resolveJobsDir, listJobs, upsertJob, generateJobId,
   acquireWriterLease, refreshWriterLease, releaseWriterLease, getWriterLeaseOwner, reconcileOrphans,
-  resetMigrationFlag, writeResultArtifact, cleanupOldJobs
+  resetMigrationFlag, writeResultArtifact, readResultArtifact, cleanupOldJobs
 } from "../scripts/lib/state.mjs";
 import { resolveReviewTarget, collectReviewContext, isSensitivePath } from "../scripts/lib/git.mjs";
 
@@ -93,7 +93,7 @@ function startServer(t, opts = {}) {
   }
 
   function send(id, name, args = {}) {
-    const stateful = name !== "cc_list_models";
+    const stateful = name !== "cc_list_models" && name !== "cc_resolve_route";
     return request(id, "tools/call", { name, arguments: stateful ? { cwd: workspace, ...args } : args });
   }
 
@@ -369,26 +369,45 @@ test("Claude is_error JSON produces failed job even with exit code zero", async 
   const server = startServer(t);
   const result = await server.send(1, "cc_delegate", { task: "is_error" });
   assert.match(result.result.content[0].text, /Task Failed/);
-  assert.match(result.result.content[0].text, /Model overloaded/);
+  // MCP output shows safe summary, not raw error detail
+  assert.match(result.result.content[0].text, /\[provider_response\]/);
 
   const jobs = listJobs(server.workspace);
   const job = jobs.find((j) => j.status === "failed");
   assert.ok(job, "Job must be failed");
-  assert.match(job.errorMessage, /Model overloaded/);
+  assert.match(job.errorMessage, /\[provider_response\]/);
+  // The detailed error message is in the private artifact
+  const artifact = readResultArtifact(server.workspace, job.id);
+  assert.ok(artifact);
+  assert.match(JSON.stringify(artifact), /Model overloaded/);
 });
 
 test("Claude error_subtype (nested result.error) produces failed job", async (t) => {
   const server = startServer(t);
   const result = await server.send(1, "cc_delegate", { task: "error_result_object" });
   assert.match(result.result.content[0].text, /Task Failed/);
-  assert.match(result.result.content[0].text, /Rate limit exceeded/);
+  assert.match(result.result.content[0].text, /\[provider_response\]/);
+  // Detailed error is in the private artifact
+  const jobs = listJobs(server.workspace);
+  const job = jobs.find((j) => j.status === "failed");
+  assert.ok(job);
+  const artifact = readResultArtifact(server.workspace, job.id);
+  assert.ok(artifact);
+  assert.match(JSON.stringify(artifact), /Rate limit exceeded/);
 });
 
 test("Claude top-level subtype=error produces failed job even with exit code zero", async (t) => {
   const server = startServer(t);
   const result = await server.send(1, "cc_delegate", { task: "error_subtype" });
   assert.match(result.result.content[0].text, /Task Failed/);
-  assert.match(result.result.content[0].text, /Max turns reached/);
+  assert.match(result.result.content[0].text, /\[provider_response\]/);
+  // Detailed error is in the private artifact
+  const jobs = listJobs(server.workspace);
+  const job = jobs.find((j) => j.status === "failed");
+  assert.ok(job);
+  const artifact = readResultArtifact(server.workspace, job.id);
+  assert.ok(artifact);
+  assert.match(JSON.stringify(artifact), /Max turns reached/);
 });
 
 // ─── P0: Resume Semantics ───────────────────────────────────────────────────
@@ -1575,4 +1594,349 @@ test("resolveCommandForSpawn fails clearly when a Windows command is absent", as
     () => resolveCommandForSpawn("claude", [], { platform: "win32", lookup: () => [] }),
     /Cannot resolve Windows command/
   );
+});
+
+// ─── P3: Dynamic Model Routing — print-mode protocol, route resolution, diagnostics ──
+
+test("P0 REGRESSION: watchdog uses --print --input-format text --output-format json (not bare --output-format json)", async (t) => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-print-protocol-"));
+  const binDir = path.join(workspace, "bin");
+  fs.mkdirSync(binDir, { recursive: true });
+  const argEchoClaude = path.join(binDir, "claude");
+  fs.copyFileSync(fakeClaudeSource, argEchoClaude);
+  fs.chmodSync(argEchoClaude, 0o755);
+
+  t.after(async () => { await safeRmDir(workspace); });
+
+  const server = startServer(t, { workspace });
+  const result = await server.send(200, "cc_delegate", { task: "echo-args" });
+  const text = result.result.content[0].text;
+  // P0 fix: --output-format json requires --print in Claude Code 2.1.208+
+  assert.match(text, /--print/);
+  assert.match(text, /--input-format text/);
+  assert.match(text, /--output-format json/);
+});
+
+test("P0 REGRESSION: print-strict mode fails without --print and succeeds with it", async (t) => {
+  // This tests the fake claude's print-strict mode which simulates Claude Code 2.1.208+ behavior
+  const server = startServer(t);
+  const result = await server.send(201, "cc_delegate", { task: "print-strict" });
+  // With the P0 fix, --print is always passed, so print-strict mode should succeed
+  assert.match(result.result.content[0].text, /Task Completed/);
+});
+
+test("cc_resolve_route is listed in tools/list with read-only schema", async (t) => {
+  const server = startServer(t);
+  const listed = await server.request(202, "tools/list");
+  const tool = listed.result.tools.find((candidate) => candidate.name === "cc_resolve_route");
+  assert.ok(tool, "cc_resolve_route must be listed");
+  assert.equal(tool.inputSchema.additionalProperties, false);
+  // cc_resolve_route is stateless — does NOT require cwd
+  assert.ok(!tool.inputSchema.required || !tool.inputSchema.required.includes("cwd"),
+    "cc_resolve_route must not require cwd (stateless resolver)");
+});
+
+test("cc_resolve_route resolves alias selectors (Opus → opus)", async (t) => {
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-resolve-route-cfg-"));
+  const profile = {
+    profileIdentity: "test-profile",
+    aliasMappings: { opus: "anthropic-opus-4", fable: "anthropic-fable-1", sonnet: "anthropic-sonnet-4", haiku: "anthropic-haiku-4" },
+    nativeDisplayNames: { "DeepSeek V4 Pro": "deepseek-v4-pro", "GLM 5.2": "glm-5.2" },
+    stripInherited: ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"],
+    envVars: { ANTHROPIC_API_KEY: "sk-test-secret-key", ANTHROPIC_BASE_URL: "https://api.test.example.com" },
+  };
+  fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
+  t.after(async () => { await safeRmDir(configDir); });
+
+  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir } });
+  const response = await server.request(203, "tools/call", {
+    name: "cc_resolve_route",
+    arguments: { selector: "Opus" }
+  });
+  const text = response.result.content[0].text;
+  assert.match(text, /alias/i);
+  assert.match(text, /opus/);
+  // Must NOT leak the API key or base URL
+  assert.doesNotMatch(text, /sk-test-secret-key/);
+  assert.doesNotMatch(text, /api\.test\.example\.com/);
+  assert.doesNotMatch(text, /api_key/i);
+  assert.doesNotMatch(text, /secret/i);
+});
+
+test("cc_resolve_route resolves native IDs unchanged", async (t) => {
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-resolve-native-cfg-"));
+  const profile = {
+    profileIdentity: "test-profile",
+    aliasMappings: {},
+    nativeDisplayNames: {},
+    stripInherited: [],
+    envVars: {},
+  };
+  fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
+  t.after(async () => { await safeRmDir(configDir); });
+
+  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir } });
+  const response = await server.request(204, "tools/call", {
+    name: "cc_resolve_route",
+    arguments: { selector: "glm-5.2" }
+  });
+  const text = response.result.content[0].text;
+  assert.match(text, /native/i);
+  assert.match(text, /glm-5\.2/);
+});
+
+test("cc_resolve_route fails closed on ambiguous selectors", async (t) => {
+  const server = startServer(t);
+  const response = await server.request(205, "tools/call", {
+    name: "cc_resolve_route",
+    arguments: { selector: "some-ambiguous-name" }
+  });
+  const text = response.result.content[0].text;
+  assert.match(text, /ambiguous|clarif|unknown|reject/i);
+});
+
+test("cc_resolve_route omitted selector returns inherited", async (t) => {
+  const server = startServer(t);
+  const response = await server.request(206, "tools/call", {
+    name: "cc_resolve_route",
+    arguments: {}
+  });
+  const text = response.result.content[0].text;
+  assert.match(text, /inherited/i);
+});
+
+test("cc_setup with active profile does not leak secrets, tokens, or api_key", async (t) => {
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-setup-profile-cfg-"));
+  const profile = {
+    profileIdentity: "test-profile",
+    aliasMappings: { opus: "anthropic-opus-4" },
+    nativeDisplayNames: { "GLM 5.2": "glm-5.2" },
+    stripInherited: ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"],
+    envVars: {
+      ANTHROPIC_API_KEY: "sk-leak-test-secret-key-12345",
+      ANTHROPIC_BASE_URL: "https://api.leak-test.example.com",
+      ANTHROPIC_AUTH_TOKEN: "tok_leak_test_abc123",
+    },
+  };
+  fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
+  t.after(async () => { await safeRmDir(configDir); });
+
+  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir } });
+  const result = await server.send(207, "cc_setup");
+  const text = result.result.content[0].text;
+
+  // Must show the profile is resolvable
+  assert.match(text, /Active profile resolvable.*test-profile/);
+  assert.match(text, /Fingerprint/);
+
+  // Must NOT leak any secret values
+  assert.doesNotMatch(text, /sk-leak-test-secret-key-12345/);
+  assert.doesNotMatch(text, /api\.leak-test\.example\.com/);
+  assert.doesNotMatch(text, /tok_leak_test_abc123/);
+  // The hardening contract: cc_setup output must not contain these words
+  assert.doesNotMatch(text, /ANTHROPIC_API_KEY/);
+  assert.doesNotMatch(text, /api_key/i);
+  assert.doesNotMatch(text, /token/i);
+  assert.doesNotMatch(text, /secret/i);
+});
+
+test("cc_setup static checks do not trigger any model call", async (t) => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-setup-static-"));
+  const binDir = path.join(workspace, "bin");
+  fs.mkdirSync(binDir, { recursive: true });
+  // Create a claude that FAILS if invoked (proves no model call during setup)
+  const trapClaude = path.join(binDir, "claude");
+  fs.writeFileSync(trapClaude, `#!/usr/bin/env node
+process.stderr.write("CLAUDE_WAS_CALLED_DURING_SETUP\\n");
+process.exit(99);
+`);
+  fs.chmodSync(trapClaude, 0o755);
+  t.after(async () => { await safeRmDir(workspace); });
+
+  const server = startServer(t, { workspace });
+  // Run cc_setup WITHOUT livenessProbe — must not invoke claude
+  const result = await server.send(208, "cc_setup");
+  const text = result.result.content[0].text;
+  assert.match(text, /Plugin Version/);
+  assert.match(text, /State Schema/);
+  // The trap claude must NOT have been called
+  assert.doesNotMatch(text, /CLAUDE_WAS_CALLED_DURING_SETUP/);
+});
+
+test("cc_setup rejects livenessProbe without explicit timeoutSeconds", async (t) => {
+  const server = startServer(t);
+  const response = await server.send(209, "cc_setup", { livenessProbe: true });
+  // livenessProbe=true without timeoutSeconds must be rejected (cost-bearing — needs explicit budget)
+  assert.equal(response.result.isError, true);
+  assert.match(response.result.content[0].text, /timeoutSeconds|budget|positive/i);
+});
+
+test("delegate with alias model passes canonical alias to Claude CLI (case-insensitive)", async (t) => {
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-alias-cli-cfg-"));
+  const profile = {
+    profileIdentity: "test-profile",
+    aliasMappings: { opus: "anthropic-opus-4", fable: "anthropic-fable-1" },
+    nativeDisplayNames: {},
+    stripInherited: [],
+    envVars: {},
+  };
+  fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
+  t.after(async () => { await safeRmDir(configDir); });
+
+  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir } });
+  const result = await server.send(210, "cc_delegate", { task: "echo-args", model: "Opus" });
+  const text = result.result.content[0].text;
+  // Alias must be normalized to lowercase "opus" for the CLI
+  assert.match(text, /--model opus\b/);
+  // Must NOT pass "Opus" (the original casing) to the CLI
+  assert.doesNotMatch(text, /--model Opus\b/);
+});
+
+test("delegate records selectorKind and routeSnapshot in job state (v5)", async (t) => {
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-v5-state-cfg-"));
+  const profile = {
+    profileIdentity: "test-profile",
+    aliasMappings: { opus: "anthropic-opus-4" },
+    nativeDisplayNames: {},
+    stripInherited: [],
+    envVars: {},
+  };
+  fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
+  t.after(async () => { await safeRmDir(configDir); });
+
+  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir } });
+  await server.send(211, "cc_delegate", { task: "success", model: "glm-5.2-pro" });
+  const jobs = listJobs(server.workspace);
+  const job = jobs.find((j) => j.requestedModel === "glm-5.2-pro");
+  assert.ok(job);
+  assert.equal(job.selectorKind, "native");
+  assert.ok(job.routeSnapshot, "v5 job must have routeSnapshot");
+  assert.ok(job.routeSnapshot.profileFingerprint, "routeSnapshot must have profileFingerprint");
+  // routeSnapshot must NOT contain secrets
+  const snapshotJson = JSON.stringify(job.routeSnapshot);
+  assert.doesNotMatch(snapshotJson, /api_key/i);
+  assert.doesNotMatch(snapshotJson, /secret/i);
+  assert.doesNotMatch(snapshotJson, /token/i);
+});
+
+test("delegate failure stores diagnostics in artifact but shows only safe summary in MCP output", async (t) => {
+  const server = startServer(t);
+  const result = await server.send(212, "cc_delegate", { task: "nonzero", model: "glm-5.2-pro" });
+  const text = result.result.content[0].text;
+  // MCP output must show a safe error with stage prefix
+  assert.match(text, /\[provider_response\]/);
+  // MCP output must NOT contain the raw stderr detail
+  assert.doesNotMatch(text, /fake claude failure/);
+
+  // The detailed diagnostics must be in the private artifact
+  const jobs = listJobs(server.workspace);
+  const job = jobs.find((j) => j.status === "failed");
+  assert.ok(job);
+  const artifact = readResultArtifact(server.workspace, job.id);
+  assert.ok(artifact, "failed job must have a result artifact");
+  const artifactJson = JSON.stringify(artifact);
+  // Artifact MUST contain the detailed stderr
+  assert.match(artifactJson, /fake claude failure/);
+  // Artifact must have failureStage
+  assert.match(artifactJson, /failureStage|provider_response/);
+});
+
+test("delegate stdout-only error is captured (P0 fix — previously only stderr was read)", async (t) => {
+  const server = startServer(t);
+  const result = await server.send(213, "cc_delegate", { task: "stdout-error", model: "glm-5.2-pro" });
+  const text = result.result.content[0].text;
+  // stdout-only errors must now be classified and captured
+  assert.match(text, /\[provider_response\]/);
+  // The artifact must contain the stdout error detail
+  const jobs = listJobs(server.workspace);
+  const job = jobs.find((j) => j.status === "failed");
+  assert.ok(job);
+  const artifact = readResultArtifact(server.workspace, job.id);
+  assert.ok(artifact);
+  const artifactJson = JSON.stringify(artifact);
+  assert.match(artifactJson, /model not found|HTTP 404/);
+});
+
+test("delegate structured JSON error on non-zero exit is classified correctly", async (t) => {
+  const server = startServer(t);
+  const result = await server.send(214, "cc_delegate", { task: "structured-error", model: "glm-5.2-pro" });
+  const text = result.result.content[0].text;
+  // Structured errors on non-zero exit must be detected
+  assert.match(text, /\[provider_response\]/);
+  // The artifact must contain the structured error message
+  const jobs = listJobs(server.workspace);
+  const job = jobs.find((j) => j.status === "failed");
+  assert.ok(job);
+  const artifact = readResultArtifact(server.workspace, job.id);
+  assert.ok(artifact);
+  const artifactJson = JSON.stringify(artifact);
+  assert.match(artifactJson, /unknown-model/);
+});
+
+test("diagnostics redact secrets from stderr — no leak in MCP output or artifact", async (t) => {
+  const server = startServer(t);
+  // "secret-leak" mode writes secrets to stderr — tests that redaction scrubs them
+  const result = await server.send(215, "cc_delegate", { task: "secret-leak", model: "glm-5.2-pro" });
+  const text = result.result.content[0].text;
+  // MCP output must not contain any raw secrets
+  assert.doesNotMatch(text, /sk-leak-abc123def456/);
+  assert.doesNotMatch(text, /tok_secret_xyz/);
+  assert.doesNotMatch(text, /hunter2/);
+  assert.doesNotMatch(text, /user:pass/);
+
+  // The artifact must also have redacted the secrets in diagnostics
+  const jobs = listJobs(server.workspace);
+  const job = jobs.find((j) => j.status === "failed");
+  assert.ok(job);
+  const artifact = readResultArtifact(server.workspace, job.id);
+  assert.ok(artifact);
+  const artifactJson = JSON.stringify(artifact);
+  // Redaction must have scrubbed the secrets
+  assert.doesNotMatch(artifactJson, /sk-leak-abc123def456/);
+  assert.doesNotMatch(artifactJson, /tok_secret_xyz/);
+  assert.doesNotMatch(artifactJson, /hunter2/);
+  assert.doesNotMatch(artifactJson, /user:pass@api/);
+  // But the redaction markers should be present (proving the secret was there and was scrubbed)
+  assert.match(artifactJson, /\[REDACTED\]/);
+});
+
+test("route snapshot is NOT treated as execution proof — modelUsage key never becomes execution model", async (t) => {
+  const server = startServer(t);
+  // Use a model that differs from the fake claude's usage key
+  await server.send(216, "cc_delegate", { task: "success", model: "glm-5.2-pro" });
+  const jobs = listJobs(server.workspace);
+  const job = jobs.find((j) => j.requestedModel === "glm-5.2-pro");
+  assert.ok(job);
+  // requestedModel is the user's input
+  assert.equal(job.requestedModel, "glm-5.2-pro");
+  // modelEvidence.usageModelKeys comes from the fake claude (mimo-v2.5)
+  assert.ok(job.modelEvidence.usageModelKeys.includes("mimo-v2.5"));
+  // executedModels must NOT contain the usage key — they are semantically separate
+  assert.ok(!job.modelEvidence.executedModels.includes("mimo-v2.5"),
+    "usage key must never appear in executedModels");
+  // Without a transcript, routeStatus is accepted_but_unverified (not model_drift_possible).
+  // Drift can only be detected when transcript evidence exists. The fake claude has no transcript.
+  assert.equal(job.routeStatus, "accepted_but_unverified");
+});
+
+test("no implicit Opus → Fable auto-downgrade on failure", async (t) => {
+  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-no-downgrade-cfg-"));
+  const profile = {
+    profileIdentity: "test-profile",
+    aliasMappings: { opus: "anthropic-opus-4", fable: "anthropic-fable-1" },
+    nativeDisplayNames: {},
+    stripInherited: [],
+    envVars: {},
+  };
+  fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
+  t.after(async () => { await safeRmDir(configDir); });
+
+  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir } });
+  // Request Opus, but the fake claude fails
+  const result = await server.send(217, "cc_delegate", { task: "nonzero", model: "Opus" });
+  const text = result.result.content[0].text;
+  // Must NOT silently downgrade to Fable
+  assert.doesNotMatch(text, /fable/i);
+  // Must show the failure
+  assert.match(text, /\[provider_response\]/);
 });

@@ -66,9 +66,12 @@ function safeStatus(status) {
  * @param {string|null} options.requestedModel - User's explicit model override
  * @param {string} options.requestMode - 'explicit' or 'inherited'
  * @param {object} options.modelEvidence - The modelEvidence structure
+ * @param {object|null} options.routeSnapshot - Non-secret route snapshot (v5)
+ * @param {string|null} options.routeStatus - Route status (v5)
+ * @param {string|null} options.selectorKind - Selector kind (v5)
  * @returns {string} Formatted model evidence lines
  */
-export function formatModelEvidence({ requestedModel, requestMode, modelEvidence }) {
+export function formatModelEvidence({ requestedModel, requestMode, modelEvidence, routeSnapshot, routeStatus, selectorKind }) {
   if (!modelEvidence) {
     // Legacy/fallback — should not happen in v4 but be safe
     if (requestedModel) {
@@ -79,11 +82,34 @@ export function formatModelEvidence({ requestedModel, requestMode, modelEvidence
 
   const lines = [];
 
-  // Request line
-  if (requestMode === "explicit" && requestedModel) {
+  // Request line — show selector kind when available (v5)
+  if (selectorKind === "alias" && requestedModel) {
+    lines.push(`**Requested model:** ${safeModelIdForDisplay(requestedModel)} (alias)`);
+  } else if (selectorKind === "native" && requestedModel) {
+    lines.push(`**Requested model:** ${safeModelIdForDisplay(requestedModel)} (native ID)`);
+  } else if (requestMode === "explicit" && requestedModel) {
     lines.push(`**Requested model:** ${safeModelIdForDisplay(requestedModel)}`);
   } else {
     lines.push(`**Model request:** inherited from Claude Code configuration`);
+  }
+
+  // Route snapshot — non-secret configuration claim (v5)
+  if (routeSnapshot && routeSnapshot.profileIdentity) {
+    const aliasClaim = routeSnapshot.aliasClaim
+      ? ` — alias claim: ${escapeModelIdForMarkdown(routeSnapshot.aliasClaim.alias)} → ${safeModelIdForDisplay(routeSnapshot.aliasClaim.nativeId)}`
+      : "";
+    lines.push(`**Route snapshot:** profile ${escapeModelIdForMarkdown(routeSnapshot.profileIdentity)} (fingerprint: ${escapeModelIdForMarkdown(routeSnapshot.profileFingerprint || "—")})${aliasClaim}`);
+  }
+
+  // Route status — honest post-execution verification (v5)
+  if (routeStatus) {
+    const statusLabels = {
+      resolved: "resolved (claim confirmed by execution evidence)",
+      accepted_but_unverified: "accepted but unverified (no transcript evidence)",
+      model_drift_possible: "model drift possible (claim and evidence disagree)",
+      rejected: "rejected (CLI or Provider failure)",
+    };
+    lines.push(`**Route status:** ${statusLabels[routeStatus] || routeStatus}`);
   }
 
   // Execution models — re-sanitize at output boundary
@@ -147,7 +173,7 @@ export function formatModelEvidence({ requestedModel, requestMode, modelEvidence
  * Format model evidence for compact table display (cc_check all=true).
  * Shows primary execution model or inherited/requested, with evidence status.
  */
-export function formatModelCompact({ requestedModel, requestMode, modelEvidence }) {
+export function formatModelCompact({ requestedModel, requestMode, modelEvidence, routeStatus }) {
   if (!modelEvidence) {
     return requestedModel ? safeModelIdForDisplay(requestedModel) : "inherited";
   }
@@ -158,12 +184,15 @@ export function formatModelCompact({ requestedModel, requestMode, modelEvidence 
   // Prefer main-scope execution model
   const mainModel = executedModels.find((m) => Array.isArray(m?.scopes) && m.scopes.includes("main"));
   if (mainModel) {
-    const suffix = safeStatus(modelEvidence.status) === "partial" ? " ⚠" : "";
+    let suffix = safeStatus(modelEvidence.status) === "partial" ? " ⚠" : "";
+    if (routeStatus === "model_drift_possible") suffix += " ⚡";
     return safeModelIdForDisplay(mainModel?.id) + suffix;
   }
   // Fallback to first execution model
   if (executedModels.length > 0) {
-    return safeModelIdForDisplay(executedModels[0]?.id);
+    let suffix = "";
+    if (routeStatus === "model_drift_possible") suffix = " ⚡";
+    return safeModelIdForDisplay(executedModels[0]?.id) + suffix;
   }
   // No execution evidence
   if (requestMode === "explicit" && requestedModel) {

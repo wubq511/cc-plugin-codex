@@ -45,7 +45,10 @@ export function runClaude(task, options = {}) {
     resumeSession: options.resumeSession || null,
     timeoutMs,
     maxCaptureBytes,
-    command
+    command,
+    childEnv: options.childEnv || null,
+    routeSnapshot: options.routeSnapshot || null,
+    cliVersion: options.cliVersion || null
   };
 
   // Spawn watchdog with IPC channel for control.
@@ -113,16 +116,17 @@ export function runClaude(task, options = {}) {
 
       // No valid result from watchdog
       if (code === 4) {
-        resolve({ ok: false, cancelled: true, error: "Claude task was cancelled or companion died.", exitCode: code });
+        resolve({ ok: false, cancelled: true, error: "Claude task was cancelled or companion died.", exitCode: code, failureStage: "cancelled" });
       } else if (code === 2) {
-        resolve({ ok: false, error: `Claude task timed out after ${timeoutMs}ms.`, exitCode: code });
+        resolve({ ok: false, error: `Claude task timed out after ${timeoutMs}ms.`, exitCode: code, failureStage: "timeout" });
       } else if (code === 3) {
-        resolve({ ok: false, error: `Claude output exceeded the ${maxCaptureBytes}-byte capture limit.`, exitCode: code });
+        resolve({ ok: false, error: `Claude output exceeded the ${maxCaptureBytes}-byte capture limit.`, exitCode: code, failureStage: "provider_response" });
       } else {
         resolve({
           ok: false,
           error: stderr.trim() || `Watchdog exited with code ${code}${signal ? ` (${signal})` : ""}`,
-          exitCode: code ?? -1
+          exitCode: code ?? -1,
+          failureStage: "spawn"
         });
       }
     });

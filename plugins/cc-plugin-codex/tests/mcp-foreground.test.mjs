@@ -93,7 +93,7 @@ function startServer(t, { env: extraEnv } = {}) {
   }
 
   function send(id, name, args = {}) {
-    const stateful = name !== "cc_list_models";
+    const stateful = name !== "cc_list_models" && name !== "cc_resolve_route";
     return request(id, "tools/call", {
       name,
       arguments: stateful ? { cwd: workspace, ...args } : args
@@ -455,17 +455,20 @@ test("job state distinguishes requestedModel from modelEvidence", async (t) => {
   const server = startServer(t);
   await server.send(96, "cc_delegate", {
     task: "success",
-    model: "custom-model-xyz"
+    model: "custom-model-v1"
   });
   const jobs = listJobs(server.workspace);
-  const job = jobs.find((j) => j.requestedModel === "custom-model-xyz");
+  const job = jobs.find((j) => j.requestedModel === "custom-model-v1");
   assert.ok(job, "job must have requestedModel");
-  assert.equal(job.requestedModel, "custom-model-xyz");
+  assert.equal(job.requestedModel, "custom-model-v1");
   assert.equal(job.requestMode, "explicit");
+  // v5: selectorKind is stored for route routing
+  assert.equal(job.selectorKind, "native");
+  assert.ok(job.routeSnapshot, "job must have routeSnapshot in v5");
   // modelEvidence.usageModelKeys comes from the fake claude's modelUsage
   assert.ok(job.modelEvidence, "job must have modelEvidence");
   assert.ok(job.modelEvidence.usageModelKeys.includes("mimo-v2.5"), "usageModelKeys must include mimo-v2.5 from fake claude");
-  // No observedModel field in v4
+  // No observedModel field in v4+
   assert.equal(job.observedModel, undefined);
 });
 
@@ -473,11 +476,11 @@ test("cc_check shows requested model and usage key with new terminology", async 
   const server = startServer(t);
   await server.send(97, "cc_delegate", {
     task: "success",
-    model: "custom-model-xyz"
+    model: "custom-model-v1"
   });
   const status = await server.send(98, "cc_check");
   const text = status.result.content[0].text;
-  assert.match(text, /Requested model.*custom-model-xyz/);
+  assert.match(text, /Requested model.*custom-model-v1/);
   assert.match(text, /Provider usage key.*mimo-v2\.5/);
   // Must NOT use old "Observed Model" terminology
   assert.doesNotMatch(text, /Observed Model/);
@@ -498,7 +501,8 @@ test("delegate passes model identifier to claude CLI exactly unchanged", async (
   assert.match(text, /--model mimo-v2\.5-pro/);
   // Also verify the model wasn't trimmed (if it had been, the surrounding
   // args context would show it differently). Check exact arg boundary:
-  assert.match(text, /--output-format json --model mimo-v2\.5-pro/);
+  // P0 fix: print-mode JSON protocol is now `--print --input-format text --output-format json`.
+  assert.match(text, /--print --input-format text --output-format json --model mimo-v2\.5-pro/);
 });
 
 // ─── timeoutSeconds upper bound ────────────────────────────────────────────
@@ -526,13 +530,14 @@ test("delegate accepts timeoutSeconds at the 604800 boundary", async (t) => {
 
 test("cc_list_models without cwd reports from session workspaces (generic no-cwd behavior)", async (t) => {
   const server = startServer(t);
-  // First run a delegate to populate the workspace
-  await server.send(103, "cc_delegate", { task: "success", model: "test-model-abc" });
+  // First run a delegate to populate the workspace.
+  // Use a native ID (must contain a digit to pass the native-ID heuristic).
+  await server.send(103, "cc_delegate", { task: "success", model: "test-model-v1" });
   // Now call cc_list_models without cwd — should find the job from the session workspace
   const response = await server.send(104, "cc_list_models");
   const text = response.result.content[0].text;
   assert.match(text, /Latest Completed Job/);
-  assert.match(text, /test-model-abc/);
+  assert.match(text, /test-model-v1/);
 });
 
 test("cc_list_models with cwd loads history from that workspace directly", async (t) => {

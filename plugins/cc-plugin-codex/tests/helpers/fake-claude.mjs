@@ -5,25 +5,31 @@
  *
  * Reads mode from (in priority order):
  *   1. FAKE_CLAUDE_MODE env var
- *   2. -p CLI argument
+ *   2. -p CLI argument (legacy)
  *   3. stdin content (when no env/arg mode found)
  *
  * Modes:
- *   success        — return fake result
- *   delay:<ms>     — return result after delay
- *   invalid-json   — output non-JSON
- *   nonzero        — exit with code 7
- *   hang           — hang forever
- *   hang-pid       — write PID to $HANG_PID_FILE then hang (for crash tests)
- *   hang-tree      — spawn a child, write its PID, then hang (tree-kill tests)
- *   flood          — output 4096 bytes then hang
- *   cwd            — return CWD
- *   args           — echo CLI args (legacy, needs -p)
- *   echo-args      — echo CLI args immediately (no stdin wait)
- *   is_error       — Claude is_error=true
- *   error_subtype  — top-level subtype="error_max_turns"
+ *   success             — return fake result
+ *   delay:<ms>          — return result after delay
+ *   invalid-json        — output non-JSON
+ *   nonzero             — exit with code 7, stderr only
+ *   stdout-error        — exit with code 7, stdout only (tests P0 stdout capture fix)
+ *   structured-error    — exit with code 1, structured JSON error on stdout
+ *   secret-leak         — exit with code 7, stderr contains secrets (tests redaction)
+ *   print-strict        — verify --print is in argv; fail with CLI contract error if missing
+ *   hang                — hang forever
+ *   hang-pid            — write PID to $HANG_PID_FILE then hang (for crash tests)
+ *   hang-tree           — spawn a child, write its PID, then hang (tree-kill tests)
+ *   flood               — output 4096 bytes then hang
+ *   cwd                 — return CWD
+ *   args                — echo CLI args (legacy, needs -p)
+ *   echo-args           — echo CLI args immediately (no stdin wait)
+ *   is_error            — Claude is_error=true
+ *   error_subtype       — top-level subtype="error_max_turns"
  *   error_result_object — result is object with error field
- *   stdin-prompt   — read from stdin, echo it back
+ *   stdin-prompt        — read from stdin, echo it back
+ *   multi-usage-keys    — return multiple usage model keys
+ *   exec-model          — return a specific execution model in modelUsage (via EXEC_MODEL env)
  */
 
 const args = process.argv.slice(2);
@@ -31,12 +37,13 @@ const taskIndex = args.indexOf("-p");
 const taskFromArgs = taskIndex >= 0 ? args[taskIndex + 1] : "";
 
 function success(result = "fake result") {
+  const execModel = process.env.EXEC_MODEL || "mimo-v2.5";
   process.stdout.write(JSON.stringify({
     result,
     session_id: "fake-session",
     total_cost_usd: 0.01,
     duration_ms: 25,
-    modelUsage: { "mimo-v2.5": {} }
+    modelUsage: { [execModel]: {} }
   }));
 }
 
@@ -49,6 +56,37 @@ function handleMode(mode) {
   } else if (mode === "nonzero") {
     process.stderr.write("fake claude failure\n");
     process.exitCode = 7;
+  } else if (mode === "stdout-error") {
+    // P0 test: error appears in stdout only, stderr is empty
+    process.stdout.write("Error: model not found (HTTP 404)\n");
+    process.exitCode = 7;
+  } else if (mode === "structured-error") {
+    // Structured JSON error on stdout with non-zero exit
+    process.stdout.write(JSON.stringify({
+      is_error: true,
+      error: "Model 'unknown-model' not found",
+      result: "",
+      session_id: "fake-session-struct-err",
+      total_cost_usd: 0,
+      duration_ms: 5,
+      modelUsage: {}
+    }));
+    process.exitCode = 1;
+  } else if (mode === "secret-leak") {
+    // Simulates a Provider error that accidentally includes secrets in stderr.
+    // Tests that the diagnostics redaction scrubs them before persistence.
+    process.stderr.write("Error: auth failed. ANTHROPIC_API_KEY=sk-leak-abc123def456 token=tok_secret_xyz password=hunter2\n");
+    process.stderr.write("Request URL: https://user:pass@api.provider.com/v1/messages\n");
+    process.exitCode = 7;
+  } else if (mode === "print-strict") {
+    // Simulate Claude Code 2.1.208+ behavior: --output-format json requires --print
+    if (!args.includes("--print")) {
+      process.stderr.write("error: --output-format json requires --print mode\n");
+      process.stderr.write("usage: claude --print --output-format json\n");
+      process.exitCode = 1;
+    } else {
+      success();
+    }
   } else if (mode === "hang") {
     setInterval(() => {}, 1000);
   } else if (mode === "hang-pid") {

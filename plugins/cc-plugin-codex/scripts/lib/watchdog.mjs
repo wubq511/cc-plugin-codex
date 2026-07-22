@@ -24,6 +24,12 @@
 import { spawn } from "node:child_process";
 import { extractUsageModelKeys } from "../lib/model-evidence.mjs";
 import { resolveCommandForSpawn, terminateProcessTree } from "../lib/process.mjs";
+import {
+  buildFailureEnvelope,
+  classifyFailureStage,
+  buildSafeErrorMessage,
+  FAILURE_STAGES,
+} from "../lib/diagnostics.mjs";
 
 const DEFAULT_MAX_CAPTURE = 8 * 1024 * 1024; // 8 MiB
 
@@ -122,7 +128,10 @@ async function main() {
     resumeSession = null,
     timeoutMs = null,
     maxCaptureBytes = DEFAULT_MAX_CAPTURE,
-    command = "claude"
+    command = "claude",
+    childEnv = null,
+    routeSnapshot = null,
+    cliVersion = null
   } = config;
 
   maxCapture = maxCaptureBytes;
@@ -149,7 +158,9 @@ async function main() {
   }
 
   // ── Phase 3: Build Claude args (task via stdin, never argv) ──
-  const args = ["--output-format", "json"];
+  // P0 fix: Claude Code 2.1.208+ requires --print for --output-format json.
+  // The task is delivered via stdin (--input-format text), never in argv.
+  const args = ["--print", "--input-format", "text", "--output-format", "json"];
   if (dangerouslySkipPermissions === true) args.push("--dangerously-skip-permissions");
   if (model) args.push("--model", model);
   if (effort && ["low", "medium", "high", "xhigh", "max"].includes(effort)) args.push("--effort", effort);
@@ -162,12 +173,14 @@ async function main() {
   }
 
   // ── Phase 4: Spawn Claude with stdin=pipe ──
-  // Task is written to Claude stdin, never appears in argv
+  // Task is written to Claude stdin, never appears in argv.
+  // Use the child env from the active profile (strips stale ANTHROPIC_*, injects profile vars).
+  const startTime = Date.now();
   try {
     const resolved = resolveCommandForSpawn(command, args);
     child = spawn(resolved.command, resolved.args, {
       cwd,
-      env: process.env,
+      env: childEnv || process.env,
       // On POSIX, make Claude the leader of its own process group so the
       // watchdog can terminate Claude plus tool/subagent descendants. Windows
       // uses taskkill /T in terminateProcessTree instead.
@@ -178,6 +191,25 @@ async function main() {
     });
   } catch (err) {
     process.stderr.write(`[watchdog] Failed to spawn: ${err.message}\n`);
+    const stage = FAILURE_STAGES.SPAWN;
+    writeResult({
+      ok: false,
+      error: buildSafeErrorMessage(stage, err.message),
+      exitCode: -1,
+      failureStage: stage,
+      diagnostics: buildFailureEnvelope({
+        stage,
+        requestedSelector: routeSnapshot ? { kind: routeSnapshot.selectorKind, value: routeSnapshot.requestedValue } : null,
+        effort,
+        cliVersion,
+        exitCode: -1,
+        signal: null,
+        durationMs: Date.now() - startTime,
+        stdout: "",
+        stderr: err.message,
+        structuredError: false,
+      }),
+    });
     exitWith(1);
     return;
   }
@@ -198,10 +230,24 @@ async function main() {
   child.once("error", (err) => {
     if (settled) return;
     settled = true;
+    const stage = FAILURE_STAGES.SPAWN;
     writeResult({
       ok: false,
-      error: err.message || String(err),
-      exitCode: -1
+      error: buildSafeErrorMessage(stage, err.message || String(err)),
+      exitCode: -1,
+      failureStage: stage,
+      diagnostics: buildFailureEnvelope({
+        stage,
+        requestedSelector: routeSnapshot ? { kind: routeSnapshot.selectorKind, value: routeSnapshot.requestedValue } : null,
+        effort,
+        cliVersion,
+        exitCode: -1,
+        signal: null,
+        durationMs: Date.now() - startTime,
+        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+        structuredError: false,
+      }),
     });
     exitWith(1);
   });
@@ -213,61 +259,153 @@ async function main() {
 
     const stdout = Buffer.concat(stdoutChunks).toString("utf8");
     const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
+    const durationMs = Date.now() - startTime;
+    const requestedSelector = routeSnapshot
+      ? { kind: routeSnapshot.selectorKind, value: routeSnapshot.requestedValue }
+      : null;
+
+    // Helper: build a failure result with diagnostics
+    function failResult(stage, exitCodeVal, opts = {}) {
+      const { cancelled = false, structuredError = false, parsedError = null, sessionId = null, usageKey = null, transcriptFound = false } = opts;
+      const errorDetail = opts.errorDetail || (structuredError && parsedError
+        ? (typeof parsedError?.error === "string" ? parsedError.error : typeof parsedError?.result === "string" ? parsedError.result : null)
+        : null) || stderr || null;
+      return {
+        ok: false,
+        cancelled,
+        error: buildSafeErrorMessage(stage, errorDetail),
+        exitCode: exitCodeVal,
+        failureStage: stage,
+        diagnostics: buildFailureEnvelope({
+          stage,
+          requestedSelector,
+          effort,
+          cliVersion,
+          exitCode: exitCodeVal,
+          signal: signal || null,
+          durationMs,
+          structuredError,
+          sessionId,
+          usageKey,
+          transcriptFound,
+          errorDetail,
+          stdout,
+          stderr,
+        }),
+      };
+    }
 
     if (terminationReason === "output-limit") {
-      writeResult({
-        ok: false,
-        error: `Claude output exceeded the ${maxCaptureBytes}-byte capture limit and was terminated.`,
-        exitCode: code ?? -1
-      });
+      const stage = FAILURE_STAGES.PROVIDER_RESPONSE;
+      writeResult(failResult(stage, code ?? -1, {
+        errorDetail: `Claude output exceeded the ${maxCaptureBytes}-byte capture limit and was terminated.`,
+      }));
       exitWith(3);
       return;
     }
 
     if (terminationReason === "timeout") {
-      writeResult({
-        ok: false,
-        error: `Claude task timed out after ${timeoutMs}ms and was terminated.`,
-        exitCode: code ?? -1
-      });
+      const stage = FAILURE_STAGES.TIMEOUT;
+      writeResult(failResult(stage, code ?? -1, {
+        errorDetail: `Claude task timed out after ${timeoutMs}ms and was terminated.`,
+      }));
       exitWith(2);
       return;
     }
 
     if (terminationReason === "cancelled") {
+      const stage = FAILURE_STAGES.CANCELLED;
       writeResult({
         ok: false,
         cancelled: true,
-        error: "Claude task was cancelled.",
-        exitCode: code ?? -1
+        error: buildSafeErrorMessage(stage, "Claude task was cancelled."),
+        exitCode: code ?? -1,
+        failureStage: stage,
+        diagnostics: buildFailureEnvelope({
+          stage,
+          requestedSelector,
+          effort,
+          cliVersion,
+          exitCode: code ?? -1,
+          signal: signal || null,
+          durationMs,
+          stdout,
+          stderr,
+          structuredError: false,
+        }),
       });
       exitWith(4);
       return;
     }
 
+    // Non-zero exit: inspect BOTH stdout and stderr (P0 fix — previously only stderr was used)
     if (code !== 0) {
-      writeResult({
-        ok: false,
-        error: stderr || `claude exited with code ${code}${signal ? ` (${signal})` : ""}`,
-        exitCode: code ?? -1
+      // Try to detect a structured JSON error in stdout even on non-zero exit
+      let structuredError = false;
+      let parsedError = null;
+      let sessionId = null;
+      let usageKey = null;
+      try {
+        const parsed = JSON.parse(stdout);
+        if (parsed.is_error === true || (parsed.subtype && String(parsed.subtype).startsWith("error")) ||
+            (parsed.result && typeof parsed.result === "object" && parsed.result.error)) {
+          structuredError = true;
+          parsedError = parsed;
+          sessionId = parsed.session_id || null;
+          if (parsed.modelUsage) {
+            const keys = extractUsageModelKeys(parsed.modelUsage);
+            usageKey = keys.length > 0 ? keys[0] : null;
+          }
+        }
+      } catch {
+        // stdout is not JSON — not a structured error
+      }
+
+      const stage = classifyFailureStage({
+        terminationReason,
+        spawnError: false,
+        stdout,
+        stderr,
+        structuredError,
+        parsedError,
       });
+
+      writeResult(failResult(stage, code ?? -1, {
+        structuredError,
+        parsedError,
+        sessionId,
+        usageKey,
+        errorDetail: structuredError && parsedError
+          ? (typeof parsedError?.error === "string" ? parsedError.error : typeof parsedError?.result === "string" ? parsedError.result : `claude exited with code ${code}`)
+          : (stderr || `claude exited with code ${code}${signal ? ` (${signal})` : ""}`),
+      }));
       exitWith(1);
       return;
     }
 
-    // Check for Claude structured error even with exit code 0
+    // Exit code 0: check for Claude structured error, then parse success
     try {
       const parsed = JSON.parse(stdout);
 
       // Check is_error flag (top-level)
       if (parsed.is_error === true) {
         const errorMsg = parsed.error || parsed.result || "Claude reported a structured error";
-        writeResult({
-          ok: false,
-          error: typeof errorMsg === "string" ? errorMsg : JSON.stringify(errorMsg),
-          exitCode: 0,
-          is_error: true
+        const stage = classifyFailureStage({
+          terminationReason: null,
+          spawnError: false,
+          stdout,
+          stderr,
+          structuredError: true,
+          parsedError: parsed,
         });
+        const usageKeys = parsed.modelUsage ? extractUsageModelKeys(parsed.modelUsage) : [];
+        writeResult(failResult(stage, 0, {
+          structuredError: true,
+          parsedError: parsed,
+          sessionId: parsed.session_id || null,
+          usageKey: usageKeys.length > 0 ? usageKeys[0] : null,
+          errorDetail: typeof errorMsg === "string" ? errorMsg : JSON.stringify(errorMsg),
+        }));
         exitWith(1);
         return;
       }
@@ -275,24 +413,44 @@ async function main() {
       // Check top-level subtype (error indicators)
       if (parsed.subtype && String(parsed.subtype).startsWith("error")) {
         const errorMsg = parsed.error || parsed.result || `Claude error subtype: ${parsed.subtype}`;
-        writeResult({
-          ok: false,
-          error: typeof errorMsg === "string" ? errorMsg : JSON.stringify(errorMsg),
-          exitCode: 0,
-          error_subtype: parsed.subtype
+        const stage = classifyFailureStage({
+          terminationReason: null,
+          spawnError: false,
+          stdout,
+          stderr,
+          structuredError: true,
+          parsedError: parsed,
         });
+        const usageKeys = parsed.modelUsage ? extractUsageModelKeys(parsed.modelUsage) : [];
+        writeResult(failResult(stage, 0, {
+          structuredError: true,
+          parsedError: parsed,
+          sessionId: parsed.session_id || null,
+          usageKey: usageKeys.length > 0 ? usageKeys[0] : null,
+          errorDetail: typeof errorMsg === "string" ? errorMsg : JSON.stringify(errorMsg),
+        }));
         exitWith(1);
         return;
       }
 
       // Check nested result.error (object with error field)
       if (parsed.result && typeof parsed.result === "object" && parsed.result.error) {
-        writeResult({
-          ok: false,
-          error: typeof parsed.result.error === "string" ? parsed.result.error : JSON.stringify(parsed.result.error),
-          exitCode: 0,
-          error_subtype: parsed.result.error
+        const stage = classifyFailureStage({
+          terminationReason: null,
+          spawnError: false,
+          stdout,
+          stderr,
+          structuredError: true,
+          parsedError: parsed,
         });
+        const usageKeys = parsed.modelUsage ? extractUsageModelKeys(parsed.modelUsage) : [];
+        writeResult(failResult(stage, 0, {
+          structuredError: true,
+          parsedError: parsed,
+          sessionId: parsed.session_id || null,
+          usageKey: usageKeys.length > 0 ? usageKeys[0] : null,
+          errorDetail: typeof parsed.result.error === "string" ? parsed.result.error : JSON.stringify(parsed.result.error),
+        }));
         exitWith(1);
         return;
       }
@@ -311,12 +469,10 @@ async function main() {
       });
       exitWith(0);
     } catch (parseError) {
-      writeResult({
-        ok: false,
-        error: `Claude output was not valid JSON: ${parseError.message}`,
-        rawOutput: stdout.slice(0, 4096),
-        exitCode: 0
-      });
+      const stage = FAILURE_STAGES.JSON_PROTOCOL;
+      writeResult(failResult(stage, 0, {
+        errorDetail: `Claude output was not valid JSON: ${parseError.message}`,
+      }));
       exitWith(1);
     }
   });
@@ -343,8 +499,9 @@ function handleSignal() {
         writeResult({
           ok: false,
           cancelled: true,
-          error: "Claude task was cancelled (signal).",
-          exitCode: -1
+          error: buildSafeErrorMessage(FAILURE_STAGES.CANCELLED, "Claude task was cancelled (signal)."),
+          exitCode: -1,
+          failureStage: FAILURE_STAGES.CANCELLED,
         });
       }
       exitWith(4);

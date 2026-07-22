@@ -15,7 +15,7 @@ import path from "node:path";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 import { migrateV3ModelFields } from "./model-evidence.mjs";
 
-const STATE_VERSION = 4;
+const STATE_VERSION = 5;
 const CONFIG_FILE_NAME = "config.json";
 const LEASE_FILE_NAME = "lease.lock";
 const JOBS_DIR_NAME = "jobs";
@@ -306,22 +306,45 @@ export function reconcileOrphans(cwd) {
   return orphanCount;
 }
 
-// ─── V3 → V4 Migration ──────────────────────────────────────────────────────
+// ─── V3 → V4 → V5 Migration ─────────────────────────────────────────────────
 
 /**
- * Migrate a single v3 job to v4 model evidence structure.
- * Uses migrateV3ModelFields from model-evidence.mjs for the model fields.
- * Idempotent — v4 jobs pass through unchanged.
+ * Migrate a job to the current schema version (v5).
+ *
+ * v3 → v4: model evidence restructure (observedModel → usageModelKeys).
+ * v4 → v5: add selectorKind, routeSnapshot, routeStatus (additive null fields).
+ *
+ * Idempotent — v5 jobs pass through unchanged.
  */
-function migrateV3Job(job) {
-  if (!job || job.version >= 4) return job;
-  try {
-    return migrateV3ModelFields(job);
-  } catch (err) {
-    process.stderr.write(`[state] Failed to migrate v3 job ${job.id}: ${err.message}\n`);
-    return job; // Return as-is on migration failure
+function migrateJob(job) {
+  if (!job || job.version >= STATE_VERSION) return job;
+
+  let migrated = job;
+
+  // v3 → v4: model evidence restructure
+  if (migrated.version < 4) {
+    try {
+      migrated = migrateV3ModelFields(migrated);
+    } catch (err) {
+      process.stderr.write(`[state] Failed to migrate v3 job ${migrated.id}: ${err.message}\n`);
+      // Continue — v4→v5 migration is additive and safe even on unmigrated v3
+    }
   }
+
+  // v4 → v5: add route routing fields (additive, null for legacy jobs)
+  if (migrated.version < 5) {
+    migrated = { ...migrated };
+    migrated.selectorKind = migrated.selectorKind || null;
+    migrated.routeSnapshot = migrated.routeSnapshot || null;
+    migrated.routeStatus = migrated.routeStatus || null;
+    migrated.version = 5;
+  }
+
+  return migrated;
 }
+
+// Backward compat alias
+const migrateV3Job = migrateJob;
 
 // ─── Core CRUD ───────────────────────────────────────────────────────────────
 

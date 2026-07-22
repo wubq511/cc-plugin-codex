@@ -3,8 +3,9 @@
 /**
  * Claude Code Companion — MCP Server for Codex
  *
- * Schema v4 with atomic per-job persistence, watchdog-based execution,
- * and comprehensive safety hardening.
+ * Schema v5 with dynamic model routing, route snapshots, failure diagnostics,
+ * atomic per-job persistence, watchdog-based execution, and comprehensive
+ * safety hardening.
  *
  * P0: Per-job atomic persistence, private permissions, ownerServerId/claudeSessionId
  *     separation, orphaned status, safe cancellation, writer lease, workspace
@@ -14,9 +15,14 @@
  * P2: Runtime MCP input validation, NUL-delimited Git, review context caps,
  *     sensitive file exclusion, untrusted data framing, canonical review schema,
  *     EPIPE/fatal handling, cc_setup diagnostics.
+ * P3: Dynamic model routing (inherited/alias/native), per-job route snapshots,
+ *     active profile resolution with secret stripping, cc_resolve_route tool,
+ *     structured failure envelopes with redaction, print-mode JSON protocol,
+ *     optional cost-bearing liveness probe.
  */
 
 import { createHash, randomBytes } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
@@ -44,6 +50,17 @@ import {
   collectModelEvidence, formatModelEvidence, formatModelCompact,
   normalizeModelIdForStorage, sanitizeModelId, extractUsageModelKeys
 } from "./lib/model-evidence.mjs";
+import {
+  resolveRoute, resolveRouteForDisplay, resolveClaudeConfigDir,
+  getClaudeVersion, classifySelector, AmbiguousSelectorError,
+  readActiveProfile
+} from "./lib/routing.mjs";
+import {
+  buildSafeErrorMessage, FAILURE_STAGES, isValidStage, redactText
+} from "./lib/diagnostics.mjs";
+import {
+  computeRouteStatus, ROUTE_STATUSES, describeRouteStatus
+} from "./lib/route-status.mjs";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -166,14 +183,21 @@ function validateToolArgs(toolName, params) {
       enums: { scope: ["auto", "working-tree", "branch"] }
     },
     cc_setup: {
-      allowed: new Set(["cwd"]),
+      allowed: new Set(["cwd", "livenessProbe", "timeoutSeconds"]),
       required: ["cwd"],
-      strings: ["cwd"]
+      booleans: ["livenessProbe"],
+      strings: ["cwd"],
+      integers: ["timeoutSeconds"]
     },
     cc_list_models: {
       allowed: new Set(["cwd"]),
       required: [],
       strings: ["cwd"]
+    },
+    cc_resolve_route: {
+      allowed: new Set(["selector"]),
+      required: [],
+      strings: ["selector"]
     }
   };
 
@@ -396,6 +420,17 @@ const TOOLS = [
     }
   },
   {
+    name: "cc_resolve_route",
+    description: "Read-only model route resolver. Use when the user explicitly names a model for delegation (e.g., Opus, Fable, DeepSeek V4 Pro, GLM 5.2, or a native model ID). Returns the selector kind (alias/native/inherited), the canonical CLI argument, the active profile fingerprint, and a non-secret alias claim if available. Does NOT enumerate Provider models, does NOT promise Provider acceptance, and does NOT make a model call. Unknown or ambiguous selectors are rejected with a clarification message. Omit the selector for inherited (default) behavior — no resolver call is needed.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        selector: { type: "string", description: "Natural-language or exact model selector (e.g., 'Opus', 'Fable', 'DeepSeek V4 Pro', 'glm-5.2'). Omit for inherited default." }
+      }
+    }
+  },
+  {
     name: "cc_check",
     description: "Check job status or get results. With only the required workspace cwd, returns the latest job. Pass a job ID (or prefix) for details. Set all=true to list all jobs. Set wait=true to wait for a running job to complete. Set session=true to filter by current session.",
     inputSchema: {
@@ -443,8 +478,17 @@ const TOOLS = [
   },
   {
     name: "cc_setup",
-    description: "Check if Claude Code is installed and ready to use. Reports version, availability, state schema health, and any issues.",
-    inputSchema: { type: "object", additionalProperties: false, properties: { cwd: CWD_SCHEMA }, required: ["cwd"] }
+    description: "Check if Claude Code is installed and ready to use. Performs static checks (zero model calls): CLI protocol verification (print-mode JSON support), companion/source/cache compatibility, active profile routing resolvability, and state schema health. Set livenessProbe=true to run a real Provider liveness probe — this makes one model call and incurs a cost; it requires a positive timeoutSeconds budget and must not be treated as a free check.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        cwd: CWD_SCHEMA,
+        livenessProbe: { type: "boolean", description: "When true, run a real Provider liveness probe (one model call, incurs cost). Requires timeoutSeconds > 0. Default: false (static checks only, zero model calls)." },
+        timeoutSeconds: { type: "integer", description: "Positive timeout budget for the liveness probe. Required when livenessProbe=true." }
+      },
+      required: ["cwd"]
+    }
   }
 ];
 
@@ -542,6 +586,50 @@ async function handleDelegate(params, context = {}) {
     timeoutMs = ts * 1000;
   }
 
+  // P0: Dynamic route resolution — fresh snapshot per job, no cross-job caching.
+  // Resolves the selector kind (inherited/alias/native), builds a non-secret
+  // route snapshot, and constructs the child environment (strips stale
+  // ANTHROPIC_* vars, injects active profile secrets).
+  let route;
+  try {
+    const claudeConfigDir = resolveClaudeConfigDir();
+    const cliVersion = getClaudeVersion(cwd);
+    route = resolveRoute({
+      claudeConfigDir,
+      selectorInput: model,
+      cliVersion,
+      parentEnv: process.env
+    });
+  } catch (err) {
+    if (err instanceof AmbiguousSelectorError) {
+      return {
+        content: [{
+          type: "text",
+          text: `## Ambiguous Model Selector\n\nCould not safely resolve \`${model}\` to a Claude alias or native model ID.\n\n**Reason:** ${err.message}\n\nTo resolve:\n- Use a Claude alias: \`opus\`, \`fable\`, \`sonnet\`, \`haiku\` (case-insensitive)\n- Use a full native model ID with version (e.g., \`deepseek-v4-pro\`, \`glm-5.2\`)\n- Use a display name declared in the active profile\n\nOmit \`model\` entirely for inherited (default) behavior. No fallback model is selected.`
+        }],
+        isError: true
+      };
+    }
+    // Corrupt or unreadable active profile — fail closed, no fallback
+    return {
+      content: [{
+        type: "text",
+        text: `## Configuration Error\n\nThe active profile could not be safely resolved and no fallback profile is used.\n\n**Reason:** ${err.message}\n\nFix the active profile file or remove it to use bare inheritance.`
+      }],
+      isError: true
+    };
+  }
+
+  // The resolved CLI argument is what Claude actually receives.
+  // For inherited: null (no --model flag)
+  // For alias: lowercase canonical alias (e.g., "opus")
+  // For native: the native ID unchanged (e.g., "deepseek-v4-pro")
+  const resolvedModel = route.selector.cliArg;
+  const selectorKind = route.selector.kind;
+  const routeSnapshot = route.snapshot;
+  const childEnv = route.childEnv;
+  const cliVersion = route.snapshot.cliVersion;
+
   // P0: Resume semantics — resolve resume=true to latest completed job
   let resolvedResumeSession = resumeSession;
   if (resume && !resumeSession) {
@@ -613,6 +701,9 @@ async function handleDelegate(params, context = {}) {
     taskHash: hash,
     requestedModel: storedRequestedModel,
     requestMode: model ? "explicit" : "inherited",
+    selectorKind,
+    routeSnapshot,
+    routeStatus: null,
     modelEvidence: {
       status: "unavailable",
       executedModels: [],
@@ -651,10 +742,13 @@ async function handleDelegate(params, context = {}) {
   updateJob(workspaceRoot, { id: jobId, phase: "executing" });
 
   execution = runClaude(task, {
-    cwd: workspaceRoot, write, model, effort,
+    cwd: workspaceRoot, write, model: resolvedModel, effort,
     dangerouslySkipPermissions: skipPerms, resume,
     resumeSession: resolvedResumeSession,
-    timeout: timeoutMs
+    timeout: timeoutMs,
+    childEnv,
+    routeSnapshot,
+    cliVersion
   });
   activeForegroundRuns.set(jobId, execution);
   updateJob(workspaceRoot, { id: jobId, pid: execution.pid });
@@ -736,6 +830,17 @@ async function handleDelegate(params, context = {}) {
       };
     }
 
+    // Compute honest post-execution route status from the route snapshot
+    // and the transcript execution evidence. A configuration claim is
+    // never treated as execution proof; a usage key is never an execution model.
+    const routeStatus = computeRouteStatus({
+      routeSnapshot,
+      jobOk: true,
+      cancelled: false,
+      executedModels: modelEvidence.executedModels,
+      usageModelKeys: modelEvidence.usageModelKeys,
+    });
+
     // Store full result as separate artifact
     const resultArtifactPath = writeResultArtifact(workspaceRoot, jobId, {
       result: result.result,
@@ -746,6 +851,9 @@ async function handleDelegate(params, context = {}) {
       exitCode: result.exitCode,
       requestedModel: storedRequestedModel,
       requestMode: model ? "explicit" : "inherited",
+      selectorKind,
+      routeSnapshot,
+      routeStatus,
       modelEvidence
     });
 
@@ -767,6 +875,7 @@ async function handleDelegate(params, context = {}) {
       cost: result.cost,
       duration: result.duration,
       modelEvidence,
+      routeStatus,
       claudeSessionId: result.sessionId || null,
       touchedFiles: workspaceChanges.totalChanges > 0
         ? boundedTouchedFiles([...workspaceChanges.added, ...workspaceChanges.modified, ...workspaceChanges.removed])
@@ -793,7 +902,10 @@ async function handleDelegate(params, context = {}) {
     const modelLine = formatModelEvidence({
       requestedModel: storedRequestedModel,
       requestMode: model ? "explicit" : "inherited",
-      modelEvidence
+      modelEvidence,
+      routeSnapshot,
+      routeStatus,
+      selectorKind
     });
 
     const truncationNote = truncation
@@ -807,23 +919,63 @@ async function handleDelegate(params, context = {}) {
       }]
     };
   } else {
+    // Failure path: compute route status (rejected for non-cancelled failures)
+    // and store diagnostics in the private job artifact only.
+    const failureStage = result.failureStage || FAILURE_STAGES.PROVIDER_RESPONSE;
+    const failedRouteStatus = computeRouteStatus({
+      routeSnapshot,
+      jobOk: false,
+      cancelled: result.cancelled === true,
+      executedModels: [],
+      usageModelKeys: result.usageModelKeys || [],
+    });
+    const safeError = result.cancelled === true
+      ? buildSafeErrorMessage(FAILURE_STAGES.CANCELLED, result.error || "Claude task was cancelled.")
+      : buildSafeErrorMessage(failureStage, result.error || "Claude task failed.");
+
+    // Store diagnostics in the private result artifact (redacted, bounded)
+    const failureArtifactPath = writeResultArtifact(workspaceRoot, jobId, {
+      result: null,
+      sessionId: result.sessionId || null,
+      cost: result.cost || null,
+      duration: result.duration || null,
+      usageModelKeys: result.usageModelKeys || [],
+      exitCode: result.exitCode,
+      requestedModel: storedRequestedModel,
+      requestMode: model ? "explicit" : "inherited",
+      selectorKind,
+      routeSnapshot,
+      routeStatus: failedRouteStatus,
+      modelEvidence: {
+        status: "unavailable",
+        executedModels: [],
+        usageModelKeys: result.usageModelKeys || [],
+        usageSource: "claude-result-modelUsage",
+        warnings: []
+      },
+      diagnostics: result.diagnostics || null,
+      failureStage
+    });
+
     updateJob(workspaceRoot, {
       id: jobId,
       status: "failed",
       phase: "failed",
       pid: null,
       completedAt,
-      errorMessage: boundedText(result.error, MAX_ERROR_MESSAGE_BYTES),
+      errorMessage: boundedText(safeError, MAX_ERROR_MESSAGE_BYTES),
+      routeStatus: failedRouteStatus,
+      resultArtifact: failureArtifactPath,
       truncation: null
     });
-    appendLogLine(workspaceRoot, jobId, `Failed: ${boundedText(result.error, MAX_ERROR_MESSAGE_BYTES)}`);
+    appendLogLine(workspaceRoot, jobId, `Failed: ${boundedText(safeError, MAX_ERROR_MESSAGE_BYTES)}`);
 
     cleanupOldJobs(workspaceRoot);
 
     return {
       content: [{
         type: "text",
-        text: `## Task Failed\n\n**Job ID:** ${jobId}\n**Error:** ${boundedText(result.error, MAX_ERROR_MESSAGE_BYTES)}\n\nCheck \`/claude:status\` for details.`
+        text: `## Task Failed\n\n**Job ID:** ${jobId}\n**Error:** ${boundedText(safeError, MAX_ERROR_MESSAGE_BYTES)}\n\nCheck \`/claude:status\` for details.`
       }],
       isError: true
     };
@@ -848,7 +1000,10 @@ function handleListModels(params = {}) {
       const modelLines = formatModelEvidence({
         requestedModel: latest.requestedModel,
         requestMode: latest.requestMode || (latest.requestedModel ? "explicit" : "inherited"),
-        modelEvidence: latest.modelEvidence
+        modelEvidence: latest.modelEvidence,
+        routeSnapshot: latest.routeSnapshot || null,
+        routeStatus: latest.routeStatus || null,
+        selectorKind: latest.selectorKind || null
       });
       jobInfo = [
         "",
@@ -880,6 +1035,74 @@ function handleListModels(params = {}) {
   return { content: [{ type: "text", text }] };
 }
 
+// cc_resolve_route — read-only model route resolver
+function handleResolveRoute(params) {
+  // cc_resolve_route is stateless — it does NOT require cwd.
+  // It resolves the selector against the active profile only.
+  const claudeConfigDir = resolveClaudeConfigDir();
+  const cliVersion = getClaudeVersion();
+  const selectorInput = params.selector ?? null;
+
+  let resolution;
+  try {
+    resolution = resolveRouteForDisplay({
+      claudeConfigDir,
+      selectorInput,
+      cliVersion,
+    });
+  } catch (err) {
+    if (err instanceof AmbiguousSelectorError) {
+      return {
+        content: [{
+          type: "text",
+          text: `## Ambiguous Model Selector\n\nCould not safely resolve \`${selectorInput}\` to a Claude alias or native model ID.\n\n**Reason:** ${err.message}\n\nTo resolve:\n- Use a Claude alias: \`opus\`, \`fable\`, \`sonnet\`, \`haiku\` (case-insensitive)\n- Use a full native model ID with version (e.g., \`deepseek-v4-pro\`, \`glm-5.2\`)\n- Use a display name declared in the active profile\n\nOmit the selector entirely for inherited (default) behavior.`
+        }],
+        isError: true
+      };
+    }
+    // Corrupt or unreadable active profile — fail closed
+    return {
+      content: [{
+        type: "text",
+        text: `## Configuration Error\n\nThe active profile could not be safely resolved.\n\n**Reason:** ${err.message}\n\nNo fallback profile is used. Fix the profile file or remove it to use bare inheritance.`
+      }],
+      isError: true
+    };
+  }
+
+  const lines = ["## Model Route Resolution\n"];
+  lines.push(`**Selector kind:** ${resolution.selectorKind}`);
+  if (resolution.requestedValue) {
+    lines.push(`**Requested value:** \`${resolution.requestedValue}\``);
+  }
+  if (resolution.cliArg) {
+    lines.push(`**CLI argument:** \`--model ${resolution.cliArg}\``);
+  }
+  if (resolution.canonicalAlias) {
+    lines.push(`**Canonical alias:** ${resolution.canonicalAlias}`);
+  }
+  if (resolution.resolvedFrom) {
+    lines.push(`**Resolved from:** ${resolution.resolvedFrom}`);
+  }
+  if (resolution.profileIdentity) {
+    lines.push(`**Active profile:** ${resolution.profileIdentity}`);
+    lines.push(`**Profile fingerprint:** ${resolution.profileFingerprint || "—"}`);
+  } else {
+    lines.push(`**Active profile:** none (bare inheritance from parent environment)`);
+  }
+  if (resolution.aliasClaim) {
+    lines.push(`**Alias claim:** ${resolution.aliasClaim.alias} → ${resolution.aliasClaim.nativeId}`);
+  }
+  if (resolution.cliVersion) {
+    lines.push(`**Claude CLI version:** ${resolution.cliVersion}`);
+  }
+
+  lines.push("");
+  lines.push(`_Note: ${resolution.note}_`);
+
+  return { content: [{ type: "text", text: lines.join("\n") }] };
+}
+
 // cc_check
 async function handleCheck(params) {
   const cwd = getCwd(params);
@@ -903,7 +1126,8 @@ async function handleCheck(params) {
         const modelDisplay = formatModelCompact({
           requestedModel: j.requestedModel,
           requestMode: j.requestMode || (j.requestedModel ? "explicit" : "inherited"),
-          modelEvidence: j.modelEvidence
+          modelEvidence: j.modelEvidence,
+          routeStatus: j.routeStatus || null
         });
         return `| ${j.id} | ${j.status} | ${j.phase || "—"} | ${taskShort} | ${modelDisplay} | ${formatDuration(j.duration ? j.duration * 1000 : null)} |`;
       })
@@ -977,7 +1201,10 @@ async function handleCheck(params) {
   const modelLine = formatModelEvidence({
     requestedModel: job.requestedModel,
     requestMode: job.requestMode || (job.requestedModel ? "explicit" : "inherited"),
-    modelEvidence: job.modelEvidence
+    modelEvidence: job.modelEvidence,
+    routeSnapshot: job.routeSnapshot || null,
+    routeStatus: job.routeStatus || null,
+    selectorKind: job.selectorKind || null
   });
 
   const truncationNote = resultPresentation.truncated
@@ -1251,7 +1478,10 @@ function handleReview(params) {
   const reviewModel = formatModelEvidence({
     requestedModel: job.requestedModel,
     requestMode: job.requestMode || (job.requestedModel ? "explicit" : "inherited"),
-    modelEvidence: job.modelEvidence
+    modelEvidence: job.modelEvidence,
+    routeSnapshot: job.routeSnapshot || null,
+    routeStatus: job.routeStatus || null,
+    selectorKind: job.selectorKind || null
   });
 
   return {
@@ -1262,17 +1492,38 @@ function handleReview(params) {
   };
 }
 
-// cc_setup
-function handleSetup(params) {
+// cc_setup — static checks (zero model calls) + optional cost-bearing liveness probe
+async function handleSetup(params) {
   const cwd = getCwd(params);
   const claudeStatus = getClaudeAvailability(cwd);
   const nodeStatus = binaryAvailable("node", ["--version"], { cwd });
+  const livenessProbe = params.livenessProbe === true;
+  const probeTimeoutSeconds = params.timeoutSeconds;
+
+  // Validate liveness probe prerequisites
+  if (livenessProbe) {
+    if (!probeTimeoutSeconds || !Number.isFinite(probeTimeoutSeconds) || probeTimeoutSeconds <= 0 || !Number.isInteger(probeTimeoutSeconds)) {
+      return {
+        content: [{
+          type: "text",
+          text: "Error: livenessProbe=true requires a positive integer timeoutSeconds budget. This probe makes one real model call and incurs a cost — it must not be treated as a free check."
+        }],
+        isError: true
+      };
+    }
+    if (probeTimeoutSeconds > 604800) {
+      return {
+        content: [{ type: "text", text: `Error: timeoutSeconds must not exceed 604800 (7 days), received: ${probeTimeoutSeconds}` }],
+        isError: true
+      };
+    }
+  }
 
   const lines = ["## Claude Code Companion Setup\n"];
 
   // Version info (no secrets)
   lines.push(`**Plugin Version:** ${SERVER_VERSION}`);
-  lines.push(`**State Schema:** v4 (model evidence, atomic per-job)`);
+  lines.push(`**State Schema:** v5 (dynamic model routing, route snapshots, failure diagnostics)`);
 
   if (claudeStatus.available) {
     lines.push(`✅ Claude Code: ${claudeStatus.detail}`);
@@ -1293,6 +1544,87 @@ function handleSetup(params) {
     lines.push(`⚠️ Git: not found (review features need git)`);
   }
 
+  // ── Static CLI Protocol Check (zero model calls) ──
+  // Verifies that the Claude CLI supports print-mode JSON output by inspecting
+  // `claude --help` for the required flags. No model is invoked.
+  lines.push(`\n### Static CLI Protocol Check (zero model calls)`);
+  let cliProtocolOk = false;
+  let cliProtocolDetail = "";
+  if (claudeStatus.available) {
+    try {
+      const helpResult = spawnSync("claude", ["--help"], {
+        cwd,
+        encoding: "utf8",
+        timeout: 10000,
+        stdio: "pipe"
+      });
+      const helpText = `${helpResult.stdout || ""}\n${helpResult.stderr || ""}`;
+      const hasPrint = /--print\b/.test(helpText);
+      const hasInputFormat = /--input-format\b/.test(helpText);
+      const hasOutputFormat = /--output-format\b/.test(helpText);
+      if (hasPrint && hasInputFormat && hasOutputFormat) {
+        cliProtocolOk = true;
+        cliProtocolDetail = "print-mode JSON protocol supported (--print, --input-format, --output-format all recognized)";
+        lines.push(`✅ ${cliProtocolDetail}`);
+      } else {
+        const missing = [];
+        if (!hasPrint) missing.push("--print");
+        if (!hasInputFormat) missing.push("--input-format");
+        if (!hasOutputFormat) missing.push("--output-format");
+        cliProtocolDetail = `Claude CLI may not support print-mode JSON (missing: ${missing.join(", ")}). Update Claude Code.`;
+        lines.push(`❌ ${cliProtocolDetail}`);
+      }
+    } catch (err) {
+      cliProtocolDetail = `Could not run claude --help: ${err.message}`;
+      lines.push(`⚠️ ${cliProtocolDetail}`);
+    }
+  } else {
+    cliProtocolDetail = "Claude CLI not available — cannot check protocol";
+    lines.push(`⚠️ ${cliProtocolDetail}`);
+  }
+
+  // ── Companion / Source / Cache Compatibility Check (zero model calls) ──
+  lines.push(`\n### Companion Compatibility Check (zero model calls)`);
+  const cliVersion = getClaudeVersion(cwd);
+  if (cliVersion) {
+    lines.push(`✅ Claude CLI version: ${cliVersion}`);
+  } else {
+    lines.push(`⚠️ Could not determine Claude CLI version (best-effort)`);
+  }
+  lines.push(`✅ Companion server: v${SERVER_VERSION}, schema v5`);
+  lines.push(`✅ Watchdog protocol: --print --input-format text --output-format json (task via stdin, never argv)`);
+
+  // ── Active Profile Routing Resolvability Check (zero model calls) ──
+  // Reads the active profile and verifies it can be safely resolved.
+  // Does NOT make a model call. Does NOT display secrets.
+  lines.push(`\n### Active Profile Routing Resolvability (zero model calls)`);
+  const claudeConfigDir = resolveClaudeConfigDir();
+  lines.push(`- **Claude config dir:** ${claudeConfigDir}`);
+  let profileResolvable = false;
+  let profileIdentity = null;
+  let profileFingerprint = null;
+  try {
+    const profile = readActiveProfile(claudeConfigDir);
+    if (profile === null) {
+      lines.push(`✅ No active-profile.json found — bare inheritance from parent environment (no profile stripping)`);
+      profileResolvable = true;
+    } else {
+      profileIdentity = profile.projection.profileIdentity || "(unnamed)";
+      profileFingerprint = profile.projection.profileFingerprint || "—";
+      lines.push(`✅ Active profile resolvable: ${profileIdentity}`);
+      lines.push(`- **Fingerprint:** ${profileFingerprint}`);
+      const aliasCount = profile.projection.aliasMappings ? Object.keys(profile.projection.aliasMappings).length : 0;
+      const nativeCount = profile.projection.nativeDisplayNames ? Object.keys(profile.projection.nativeDisplayNames).length : 0;
+      lines.push(`- **Alias mappings:** ${aliasCount}`);
+      lines.push(`- **Native display names:** ${nativeCount}`);
+      lines.push(`- **Private env vars:** ${Object.keys(profile.secrets.envVars).length} (values not displayed)`);
+      profileResolvable = true;
+    }
+  } catch (err) {
+    lines.push(`❌ Active profile is corrupt or unreadable: ${err.message}`);
+    lines.push(`   No fallback profile is used. Fix the file or remove it for bare inheritance.`);
+  }
+
   const workspaceRoot = rememberWorkspaceRoot(cwd);
   let defaultBranch = "HEAD~1";
   try {
@@ -1311,7 +1643,8 @@ function handleSetup(params) {
     if (orphanedCount > 0) stateHealth = `${orphanedCount} orphaned job(s)`;
   } catch { stateHealth = "no state yet" }
 
-  lines.push(`\n**Workspace:** ${workspaceRoot}`);
+  lines.push(`\n### Workspace State`);
+  lines.push(`**Workspace:** ${workspaceRoot}`);
   lines.push(`**Default branch:** ${defaultBranch}`);
   lines.push(`**Session ID:** ${SESSION_ID}`);
   lines.push(`**State health:** ${stateHealth}`);
@@ -1325,11 +1658,71 @@ function handleSetup(params) {
   lines.push(`- **Node:** ${process.execPath}`);
   lines.push(`- **Platform:** ${process.platform} ${process.arch}`);
 
-  if (claudeStatus.available && nodeStatus.available) {
-    lines.push("\n✅ Plugin ready\n");
-    lines.push("No issues found. Use `/claude:delegate` to start delegating tasks.");
+  // ── Optional Liveness Probe (cost-bearing, explicitly authorized) ──
+  if (livenessProbe) {
+    lines.push(`\n### Provider Liveness Probe (COST-BEARING — one model call)`);
+    lines.push(`⚠️ This probe makes a real model call and incurs a cost. Budget: ${probeTimeoutSeconds}s.`);
+    if (!claudeStatus.available) {
+      lines.push(`❌ Cannot run liveness probe: Claude CLI not available`);
+    } else if (!cliProtocolOk) {
+      lines.push(`❌ Cannot run liveness probe: CLI protocol check failed`);
+    } else if (!profileResolvable) {
+      lines.push(`❌ Cannot run liveness probe: active profile is not resolvable`);
+    } else {
+      try {
+        const probeTask = "Reply with exactly: OK";
+        const probeStart = Date.now();
+        const probeRoute = resolveRoute({
+          claudeConfigDir,
+          selectorInput: null,
+          cliVersion,
+          parentEnv: process.env
+        });
+        const probeExecution = runClaude(probeTask, {
+          cwd: workspaceRoot,
+          write: false,
+          model: null,
+          effort: "low",
+          dangerouslySkipPermissions: false,
+          resume: false,
+          resumeSession: null,
+          timeout: probeTimeoutSeconds * 1000,
+          childEnv: probeRoute.childEnv,
+          routeSnapshot: probeRoute.snapshot,
+          cliVersion
+        });
+        const probeResult = await probeExecution.result;
+        const probeDuration = ((Date.now() - probeStart) / 1000).toFixed(1);
+        if (probeResult.ok) {
+          lines.push(`✅ Provider liveness confirmed in ${probeDuration}s`);
+          lines.push(`- **Cost:** ${formatCost(probeResult.cost)}`);
+          lines.push(`- **Duration:** ${probeDuration}s`);
+          lines.push(`- **Response:** ${boundedText(probeResult.result, 200)}`);
+          if (probeResult.usageModelKeys && probeResult.usageModelKeys.length > 0) {
+            lines.push(`- **Usage key:** ${probeResult.usageModelKeys.join(", ")}`);
+          }
+        } else {
+          const probeStage = probeResult.failureStage || FAILURE_STAGES.PROVIDER_RESPONSE;
+          lines.push(`❌ Provider liveness probe failed in ${probeDuration}s`);
+          lines.push(`- **Stage:** ${probeStage}`);
+          lines.push(`- **Error:** ${boundedText(buildSafeErrorMessage(probeStage, probeResult.error || "Unknown"), 500)}`);
+        }
+      } catch (err) {
+        lines.push(`❌ Liveness probe error: ${err.message}`);
+      }
+    }
+  }
+
+  // ── Summary ──
+  const staticChecksOk = claudeStatus.available && nodeStatus.available && cliProtocolOk && profileResolvable;
+  if (staticChecksOk) {
+    lines.push("\n✅ Static checks passed (zero model calls)\n");
+    lines.push("Use `/claude:delegate` to start delegating tasks. Use `cc_resolve_route` to preview model routing.");
     if (orphanedCount > 0) {
       lines.push(`\n⚠️ ${orphanedCount} orphaned job(s) detected. These were running when a previous companion server exited. Check with \`/claude:status --all\`.`);
+    }
+    if (!livenessProbe) {
+      lines.push(`\n_For a real Provider liveness probe (incurs cost), call cc_setup with livenessProbe=true and a positive timeoutSeconds._`);
     }
   } else {
     lines.push("\n❌ Setup incomplete");
@@ -1338,6 +1731,12 @@ function handleSetup(params) {
     }
     if (!nodeStatus.available) {
       lines.push("Install Node.js: https://nodejs.org/");
+    }
+    if (!cliProtocolOk) {
+      lines.push("Update Claude Code to support print-mode JSON: `npm update -g @anthropic-ai/claude-code`");
+    }
+    if (!profileResolvable) {
+      lines.push("Fix or remove the corrupt active-profile.json in the Claude config directory.");
     }
   }
 
@@ -1351,6 +1750,7 @@ function handleSetup(params) {
 const HANDLERS = {
   cc_delegate: handleDelegate,
   cc_list_models: handleListModels,
+  cc_resolve_route: handleResolveRoute,
   cc_check: handleCheck,
   cc_cancel: handleCancel,
   cc_review: handleReview,

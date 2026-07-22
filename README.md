@@ -13,10 +13,12 @@
 ## 功能
 
 - **分派任务** — 把编码任务交给 Claude Code，可选传入任意模型标识和推理强度
+- **动态模型路由** — 支持 inherited/alias/native 三种选择器意图，按 job 重新解析 active profile，旧环境变量不污染新 profile
 - **Provider 无关** — 默认继承用户当前 Claude Code 配置的 Provider 和模型，无需手动选择
 - **自动等待完成** — 所有任务保持一次 pending 调用，完成后自动返回，不需要轮询
 - **任务隐私** — 任务通过 stdin 传递，不出现在任何进程命令行中
-- **状态追踪** — 实时查看任务进度、阶段、耗时、成本，区分请求模型、执行记录和用量 key
+- **状态追踪** — 实时查看任务进度、阶段、耗时、成本，区分请求模型、路由快照、执行记录和用量 key
+- **失败诊断** — 私有、脱敏、有大小限制的 failure envelope，MCP 输出只返回安全摘要和错误分类
 - **代码审查** — 标准审查（找 bug）或对抗审查（质疑实现选择、攻击面分析）
 - **有界上下文续作** — 审查修复默认开新会话并传递精炼交接包；仍支持显式恢复指定 Claude Code 会话
 - **Job 管理** — 前缀匹配、会话过滤、取消运行中的任务
@@ -63,7 +65,14 @@ codex plugin add cc-plugin-codex
 /claude:delegate
 ```
 
-默认继承当前 Claude Code 配置的 Provider 和模型，无需手动选择。也可以通过 `model` 参数传入任意模型标识进行单次覆盖，通过 `effort` 参数指定推理强度。
+默认继承当前 Claude Code 配置的 Provider 和模型，无需手动选择。也可以通过 `model` 参数指定模型：
+
+- **inherited**（默认）：省略 `model`，不传 `--model`
+- **alias**：`Opus` / `Fable` / `Sonnet` / `Haiku`（大小写无关），标准化为 Claude CLI alias
+- **native**：如 `deepseek-v4-pro` / `glm-5.2`，原样透传
+- 不明确的模型家族描述会被拒绝（fail closed），不猜测不 fallback
+
+通过 `effort` 参数指定推理强度。使用 `cc_resolve_route` 可在不发起模型调用的前提下预览模型路由解析结果。
 
 ### 查看状态
 
@@ -105,16 +114,17 @@ codex plugin add cc-plugin-codex
 
 ## MCP 工具
 
-插件通过 MCP server 暴露 6 个工具，供 Codex 直接调用：
+插件通过 MCP server 暴露 7 个工具，供 Codex 直接调用：
 
 | 工具 | 说明 |
 |------|------|
-| `cc_delegate` | 分派编码任务给 Claude Code（默认继承 Provider 配置） |
+| `cc_delegate` | 分派编码任务给 Claude Code（默认继承 Provider 配置，支持 alias/native 模型路由） |
+| `cc_resolve_route` | 只读模型路由解析器（不发起模型调用，不枚举 Provider 模型） |
 | `cc_list_models` | 报告模型解析行为和最近完成任务的模型证据信息 |
 | `cc_check` | 查看任务状态/结果 |
 | `cc_cancel` | 取消运行中的任务 |
 | `cc_review` | 审查代码变更 |
-| `cc_setup` | 检查环境可用性 |
+| `cc_setup` | 环境检查（静态零模型调用 + 可选付费 liveness probe） |
 
 ## 项目结构
 
@@ -128,15 +138,18 @@ codex plugin add cc-plugin-codex
     │   ├── cc-companion.mjs         # MCP server 主进程
     │   └── lib/
     │       ├── claude-runner.mjs  # watchdog 调用封装
-    │       ├── watchdog.mjs       # Claude 监督运行器
+    │       ├── watchdog.mjs       # Claude 监督运行器（print-mode JSON 协议）
+    │       ├── routing.mjs        # 动态模型路由（selector 分类、route snapshot、child env）
+    │       ├── route-status.mjs   # 路由状态计算（resolved/unverified/drift/rejected）
+    │       ├── diagnostics.mjs    # 失败诊断 envelope（脱敏、有界、stage 分类）
     │       ├── git.mjs            # Git 集成（diff、review context）
     │       ├── job-log.mjs        # Job 日志和阶段追踪
     │       ├── process.mjs        # 进程管理
-    │       ├── state.mjs          # Job 状态、writer lease 与保留策略
+    │       ├── state.mjs          # Job 状态、writer lease 与保留策略（schema v5）
     │       ├── model-evidence.mjs # 模型证据模块统一出口
     │       ├── model-evidence-collector.mjs # 有界 transcript 采集
     │       ├── model-evidence-formatter.mjs # 统一安全展示
-    │       ├── model-evidence-migration.mjs # v3 → v4 迁移
+    │       ├── model-evidence-migration.mjs # v3 → v4 → v5 迁移
     │       ├── model-evidence-shared.mjs # 常量与规范化
     │       └── workspace.mjs      # 工作区解析
     ├── skills/                    # Codex skill 定义
@@ -186,9 +199,9 @@ npm run verify:source
 | 维度 | codex-plugin-cc | 本插件 |
 |------|-----------------|--------|
 | 方向 | Claude Code → Codex | Codex → Claude Code |
-| 通信 | codex app-server JSON-RPC | claude -p CLI |
+| 通信 | codex app-server JSON-RPC | claude --print --output-format json |
 | 插件系统 | Claude Code 插件 | Codex 插件 |
-| 任务执行 | Codex app-server turn | claude -p 子进程 |
+| 任务执行 | Codex app-server turn | claude --print 子进程 |
 | 审查 | Codex 内置 reviewer | Codex 自身审查 diff |
 
 ## License

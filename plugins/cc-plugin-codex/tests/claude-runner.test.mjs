@@ -30,21 +30,35 @@ test("foreground runner parses the existing Claude JSON result", async () => {
 test("foreground runner rejects invalid JSON", async () => {
   const result = await run("invalid-json").result;
   assert.equal(result.ok, false);
-  assert.match(result.error, /not valid JSON/);
+  // Safe error shows stage prefix, not raw detail
+  assert.match(result.error, /^\[json_protocol\]/);
+  assert.equal(result.failureStage, "json_protocol");
+  // Detailed evidence is in the diagnostics envelope
+  assert.ok(result.diagnostics);
 });
 
-test("foreground runner reports nonzero exits with stderr", async () => {
+test("foreground runner reports nonzero exits with stderr captured in diagnostics", async () => {
   const result = await run("nonzero").result;
   assert.equal(result.ok, false);
   assert.equal(result.exitCode, 7);
-  assert.equal(result.error, "fake claude failure");
+  // Safe error message includes the failure stage prefix
+  assert.match(result.error, /^\[provider_response\]/);
+  assert.equal(result.failureStage, "provider_response");
+  // Diagnostics envelope captures the redacted stderr
+  assert.ok(result.diagnostics);
+  assert.match(result.diagnostics.stderrTail, /fake claude failure/);
 });
 
 test("foreground runner terminates tasks at an explicit finite timeout", async () => {
   const startedAt = Date.now();
   const result = await run("hang", { timeout: 50 }).result;
   assert.equal(result.ok, false);
-  assert.match(result.error, /timed out after 50ms and was terminated/);
+  // Safe error shows stage prefix
+  assert.match(result.error, /^\[timeout\]/);
+  assert.equal(result.failureStage, "timeout");
+  // The detailed duration is in the diagnostics envelope
+  assert.ok(result.diagnostics);
+  assert.match(result.diagnostics.errorDetail, /timed out after 50ms/);
   assert.ok(Date.now() - startedAt < 2000);
 });
 
@@ -57,7 +71,12 @@ test("foreground runner has no default timeout — a delayed task completes with
 test("foreground runner bounds combined stdout and stderr capture", async () => {
   const result = await run("flood", { maxCaptureBytes: 1024, timeout: 2000 }).result;
   assert.equal(result.ok, false);
-  assert.match(result.error, /exceeded the 1024-byte capture limit and was terminated/);
+  // Safe error shows stage prefix
+  assert.match(result.error, /^\[provider_response\]/);
+  assert.equal(result.failureStage, "provider_response");
+  // The detailed byte limit is in the diagnostics envelope
+  assert.ok(result.diagnostics);
+  assert.match(result.diagnostics.errorDetail, /exceeded the 1024-byte capture limit/);
 });
 
 test("foreground runner passes through an arbitrary model identifier unchanged", async () => {
