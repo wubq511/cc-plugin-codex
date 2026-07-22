@@ -1,6 +1,6 @@
 # Dynamic Model Routing and Delegation Liveness
 
-> Status: approved design, ready for one implementation agent.
+> Status: approved design; initial implementation requires remediation before merge. See [the final review and remediation](2026-07-22-dynamic-model-routing-remediation.md).
 >
 > Date: 2026-07-22
 >
