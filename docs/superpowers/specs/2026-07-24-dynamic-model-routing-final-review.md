@@ -1,6 +1,6 @@
 # Dynamic Model Routing — Final Review Round 2
 
-> Status: required rework before merge.
+> Status: superseded by [Final Review Round 3](./2026-07-24-dynamic-model-routing-final-review-round-3.md).
 >
 > Reviewed branch: `glm/dynamic-model-routing@3665cf2`
 >
