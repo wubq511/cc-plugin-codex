@@ -7,7 +7,7 @@ description: Use when you want to check the status of a Claude Code task — see
 
 ## Overview
 
-Check the status and results of Claude Code tasks. Shows phase tracking, recent log entries, model evidence, and session info.
+Check the status and results of Claude Code tasks. Shows phase tracking, recent log entries, model evidence, route status, and a bounded diagnostic summary for failed/cancelled jobs.
 
 ## Workflow
 
@@ -23,6 +23,8 @@ Check the status and results of Claude Code tasks. Shows phase tracking, recent 
    - Current phase and its description
    - Recent log entries showing progress
    - Session ID for the job
+   - Route status (resolved / accepted_but_unverified / model_drift_possible / rejected / cancelled)
+   - For failed/cancelled jobs: a bounded, doubly-redacted diagnostic summary (failure stage, duration, structured-error flag, 500-byte error-detail excerpt). Raw stdout/stderr, session IDs, and usage keys are never exposed in MCP output — they live only in the private job artifact.
 
 ## Phase Tracking
 

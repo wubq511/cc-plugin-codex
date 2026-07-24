@@ -26,6 +26,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
+import { fileURLToPath } from "node:url";
 
 import { runClaude, getClaudeAvailability } from "./lib/claude-runner.mjs";
 import {
@@ -53,7 +54,7 @@ import {
 import {
   resolveRoute, resolveRouteForDisplay, resolveClaudeConfigDir,
   getClaudeVersion, classifySelector, AmbiguousSelectorError,
-  readActiveProfile
+  readActiveAuthority, ProfileResolutionError
 } from "./lib/routing.mjs";
 import {
   buildSafeErrorMessage, FAILURE_STAGES, isValidStage, redactText
@@ -61,6 +62,9 @@ import {
 import {
   computeRouteStatus, ROUTE_STATUSES, describeRouteStatus
 } from "./lib/route-status.mjs";
+import {
+  resolveActiveCache, compareSourceCache
+} from "./lib/install-cache.mjs";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -183,10 +187,10 @@ function validateToolArgs(toolName, params) {
       enums: { scope: ["auto", "working-tree", "branch"] }
     },
     cc_setup: {
-      allowed: new Set(["cwd", "livenessProbe", "timeoutSeconds"]),
+      allowed: new Set(["cwd", "livenessProbe", "timeoutSeconds", "model", "maxBudgetUsd"]),
       required: ["cwd"],
       booleans: ["livenessProbe"],
-      strings: ["cwd"],
+      strings: ["cwd", "model"],
       integers: ["timeoutSeconds"]
     },
     cc_list_models: {
@@ -478,14 +482,16 @@ const TOOLS = [
   },
   {
     name: "cc_setup",
-    description: "Check if Claude Code is installed and ready to use. Performs static checks (zero model calls): CLI protocol verification (print-mode JSON support), companion/source/cache compatibility, active profile routing resolvability, and state schema health. Set livenessProbe=true to run a real Provider liveness probe — this makes one model call and incurs a cost; it requires a positive timeoutSeconds budget and must not be treated as a free check.",
+    description: "Check if Claude Code is installed and ready to use. Performs static checks (zero model calls): CLI protocol verification (print-mode JSON support), real source-vs-cache comparison, active authority routing resolvability, and state schema health. Set livenessProbe=true to run a real Provider liveness probe — this makes one model call and incurs a cost. The probe accepts the same optional `model` selector as cc_delegate, requires a positive `timeoutSeconds`, a positive `maxBudgetUsd`, and a CLI budget-guard capability that is verified before the paid call. If the budget guard is unsupported the probe fails closed without a Provider call.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
         cwd: CWD_SCHEMA,
-        livenessProbe: { type: "boolean", description: "When true, run a real Provider liveness probe (one model call, incurs cost). Requires timeoutSeconds > 0. Default: false (static checks only, zero model calls)." },
-        timeoutSeconds: { type: "integer", description: "Positive timeout budget for the liveness probe. Required when livenessProbe=true." }
+        livenessProbe: { type: "boolean", description: "When true, run a real Provider liveness probe (one model call, incurs cost). Requires timeoutSeconds > 0, maxBudgetUsd > 0, and CLI budget-guard support. Default: false (static checks only, zero model calls)." },
+        timeoutSeconds: { type: "integer", description: "Positive timeout budget in seconds for the liveness probe. Required when livenessProbe=true." },
+        model: { type: "string", description: "Optional model selector for the liveness probe (same semantics as cc_delegate). Omit for inherited default." },
+        maxBudgetUsd: { type: "number", description: "Positive maximum budget in USD for the liveness probe. Passed through to the CLI budget guard. Required when livenessProbe=true.", exclusiveMinimum: 0 }
       },
       required: ["cwd"]
     }
@@ -590,6 +596,9 @@ async function handleDelegate(params, context = {}) {
   // Resolves the selector kind (inherited/alias/native), builds a non-secret
   // route snapshot, and constructs the child environment (strips stale
   // ANTHROPIC_* vars, injects active profile secrets).
+  // The active authority is re-read fresh from cc-profile-switch (or fallback)
+  // on every call — a profile switch takes effect on the next delegation
+  // without restarting the companion.
   let route;
   try {
     const claudeConfigDir = resolveClaudeConfigDir();
@@ -598,7 +607,8 @@ async function handleDelegate(params, context = {}) {
       claudeConfigDir,
       selectorInput: model,
       cliVersion,
-      parentEnv: process.env
+      parentEnv: process.env,
+      env: process.env
     });
   } catch (err) {
     if (err instanceof AmbiguousSelectorError) {
@@ -610,7 +620,16 @@ async function handleDelegate(params, context = {}) {
         isError: true
       };
     }
-    // Corrupt or unreadable active profile — fail closed, no fallback
+    if (err instanceof ProfileResolutionError) {
+      return {
+        content: [{
+          type: "text",
+          text: `## Configuration Error\n\nThe active profile authority could not be safely resolved and no fallback profile is used.\n\n**Reason:** ${err.message}\n\nThe active authority (cc-profile-switch or Claude settings) must resolve before any delegation. Fix the configuration or remove it to use bare inheritance.`
+        }],
+        isError: true
+      };
+    }
+    // Unexpected error — fail closed, no fallback
     return {
       content: [{
         type: "text",
@@ -774,7 +793,8 @@ async function handleDelegate(params, context = {}) {
       phase: "cancelled",
       pid: null,
       completedAt: cancelledAt,
-      errorMessage: "Cancelled by MCP client request."
+      errorMessage: "Cancelled by MCP client request.",
+      routeStatus: ROUTE_STATUSES.CANCELLED
     });
     execution.cancel();
   });
@@ -1038,7 +1058,8 @@ function handleListModels(params = {}) {
 // cc_resolve_route — read-only model route resolver
 function handleResolveRoute(params) {
   // cc_resolve_route is stateless — it does NOT require cwd.
-  // It resolves the selector against the active profile only.
+  // It resolves the selector against the active authority only.
+  // The authority is re-read fresh on every call.
   const claudeConfigDir = resolveClaudeConfigDir();
   const cliVersion = getClaudeVersion();
   const selectorInput = params.selector ?? null;
@@ -1049,6 +1070,7 @@ function handleResolveRoute(params) {
       claudeConfigDir,
       selectorInput,
       cliVersion,
+      env: process.env
     });
   } catch (err) {
     if (err instanceof AmbiguousSelectorError) {
@@ -1056,6 +1078,15 @@ function handleResolveRoute(params) {
         content: [{
           type: "text",
           text: `## Ambiguous Model Selector\n\nCould not safely resolve \`${selectorInput}\` to a Claude alias or native model ID.\n\n**Reason:** ${err.message}\n\nTo resolve:\n- Use a Claude alias: \`opus\`, \`fable\`, \`sonnet\`, \`haiku\` (case-insensitive)\n- Use a full native model ID with version (e.g., \`deepseek-v4-pro\`, \`glm-5.2\`)\n- Use a display name declared in the active profile\n\nOmit the selector entirely for inherited (default) behavior.`
+        }],
+        isError: true
+      };
+    }
+    if (err instanceof ProfileResolutionError) {
+      return {
+        content: [{
+          type: "text",
+          text: `## Configuration Error\n\nThe active profile authority could not be safely resolved.\n\n**Reason:** ${err.message}\n\nNo fallback profile is used. Fix the configuration or remove it to use bare inheritance.`
         }],
         isError: true
       };
@@ -1084,11 +1115,23 @@ function handleResolveRoute(params) {
   if (resolution.resolvedFrom) {
     lines.push(`**Resolved from:** ${resolution.resolvedFrom}`);
   }
+  if (resolution.sourceKind) {
+    lines.push(`**Authority source:** ${resolution.sourceKind}`);
+  }
   if (resolution.profileIdentity) {
     lines.push(`**Active profile:** ${resolution.profileIdentity}`);
     lines.push(`**Profile fingerprint:** ${resolution.profileFingerprint || "—"}`);
   } else {
     lines.push(`**Active profile:** none (bare inheritance from parent environment)`);
+  }
+  if (resolution.injectedKeyNames && resolution.injectedKeyNames.length > 0) {
+    lines.push(`**Injected env keys:** ${resolution.injectedKeyNames.join(", ")} (values not displayed)`);
+  }
+  if (resolution.routingPolicy) {
+    const policyParts = [];
+    if (resolution.routingPolicy.bedrock) policyParts.push("Bedrock");
+    if (resolution.routingPolicy.vertex) policyParts.push("Vertex");
+    lines.push(`**Routing policy:** ${policyParts.length > 0 ? policyParts.join(" + ") : "Anthropic direct"}`);
   }
   if (resolution.aliasClaim) {
     lines.push(`**Alias claim:** ${resolution.aliasClaim.alias} → ${resolution.aliasClaim.nativeId}`);
@@ -1100,7 +1143,10 @@ function handleResolveRoute(params) {
   lines.push("");
   lines.push(`_Note: ${resolution.note}_`);
 
-  return { content: [{ type: "text", text: lines.join("\n") }] };
+  return {
+    content: [{ type: "text", text: lines.join("\n") }],
+    structuredContent: resolution.structuredContent
+  };
 }
 
 // cc_check
@@ -1171,11 +1217,37 @@ async function handleCheck(params) {
 
   // Load full result from artifact if available
   let fullResult = job.result || "";
+  let artifact = null;
   if (job.resultArtifact) {
     try {
-      const artifact = readResultArtifact(workspaceRoot, job.id);
+      artifact = readResultArtifact(workspaceRoot, job.id);
       if (artifact?.result) fullResult = artifact.result;
     } catch { /* use truncated result from metadata */ }
+  }
+
+  // Bounded, redacted diagnostic summary for failed jobs (requirement #11).
+  // The private artifact contains a full failure envelope; we surface only
+  // the stage and a doubly-redacted, byte-bounded error detail. Secrets,
+  // stdout/stderr tails, session IDs, and usage keys are NOT exposed.
+  let diagnosticSection = "";
+  if ((job.status === "failed" || job.status === "cancelled") && artifact?.diagnostics) {
+    const diag = artifact.diagnostics;
+    const diagLines = ["### Diagnostic Summary (redacted, bounded)"];
+    if (diag.stage) {
+      diagLines.push(`- **Failure stage:** ${diag.stage}`);
+    }
+    if (diag.durationMs != null) {
+      diagLines.push(`- **Duration:** ${formatDuration(diag.durationMs)}`);
+    }
+    if (diag.structuredError != null) {
+      diagLines.push(`- **Structured CLI error:** ${diag.structuredError ? "yes" : "no"}`);
+    }
+    if (diag.errorDetail) {
+      // Second-layer redaction (belt-and-suspenders) + bound to 500 bytes
+      const redactedDetail = redactText(diag.errorDetail, 500);
+      diagLines.push(`- **Error detail (redacted):** ${redactedDetail}`);
+    }
+    diagnosticSection = diagLines.join("\n");
   }
 
   const resultPresentation = truncateForPresentation(fullResult);
@@ -1214,7 +1286,7 @@ async function handleCheck(params) {
   return {
     content: [{
       type: "text",
-      text: `## Job: ${job.id}\n\n**Status:** ${job.status}\n**Phase:** ${phase} (${phaseDescription(phase)})\n**Task:** ${job.taskPreview || job.task || "—"}\n${modelLine}\n**Effort:** ${job.effort || "—"}\n**Duration:** ${formatDuration(job.duration ? job.duration * 1000 : null)}\n**Cost:** ${formatCost(job.cost)}\n**Owner Session:** ${job.ownerServerId || "—"}\n**Claude Session:** ${job.claudeSessionId || "—"}\n${elapsedSection}**Started:** ${job.startedAt || job.createdAt || "—"}\n**Completed:** ${job.completedAt || "—"}\n\n${resultSection}${truncationNote}\n\n${filesSection}\n\n${progressSection}`
+      text: `## Job: ${job.id}\n\n**Status:** ${job.status}\n**Phase:** ${phase} (${phaseDescription(phase)})\n**Task:** ${job.taskPreview || job.task || "—"}\n${modelLine}\n**Effort:** ${job.effort || "—"}\n**Duration:** ${formatDuration(job.duration ? job.duration * 1000 : null)}\n**Cost:** ${formatCost(job.cost)}\n**Owner Session:** ${job.ownerServerId || "—"}\n**Claude Session:** ${job.claudeSessionId || "—"}\n${elapsedSection}**Started:** ${job.startedAt || job.createdAt || "—"}\n**Completed:** ${job.completedAt || "—"}\n\n${resultSection}${truncationNote}\n\n${filesSection}\n\n${progressSection}\n\n${diagnosticSection}`
     }]
   };
 }
@@ -1274,7 +1346,8 @@ function handleCancel(params) {
     phase: "cancelled",
     pid: null,
     completedAt: now,
-    errorMessage: "Cancelled by user."
+    errorMessage: "Cancelled by user.",
+    routeStatus: ROUTE_STATUSES.CANCELLED
   });
 
   return {
@@ -1499,6 +1572,8 @@ async function handleSetup(params) {
   const nodeStatus = binaryAvailable("node", ["--version"], { cwd });
   const livenessProbe = params.livenessProbe === true;
   const probeTimeoutSeconds = params.timeoutSeconds;
+  const probeModel = params.model ?? null;
+  const probeMaxBudgetUsd = params.maxBudgetUsd;
 
   // Validate liveness probe prerequisites
   if (livenessProbe) {
@@ -1514,6 +1589,30 @@ async function handleSetup(params) {
     if (probeTimeoutSeconds > 604800) {
       return {
         content: [{ type: "text", text: `Error: timeoutSeconds must not exceed 604800 (7 days), received: ${probeTimeoutSeconds}` }],
+        isError: true
+      };
+    }
+    if (probeMaxBudgetUsd === undefined || probeMaxBudgetUsd === null) {
+      return {
+        content: [{
+          type: "text",
+          text: "Error: livenessProbe=true requires a positive maxBudgetUsd. The probe must not make a paid call without a verified budget guard."
+        }],
+        isError: true
+      };
+    }
+    if (!Number.isFinite(probeMaxBudgetUsd) || probeMaxBudgetUsd <= 0) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error: maxBudgetUsd must be a positive number, received: ${probeMaxBudgetUsd}`
+        }],
+        isError: true
+      };
+    }
+    if (probeMaxBudgetUsd > 1000) {
+      return {
+        content: [{ type: "text", text: `Error: maxBudgetUsd must not exceed 1000 (safety cap), received: ${probeMaxBudgetUsd}` }],
         isError: true
       };
     }
@@ -1550,6 +1649,8 @@ async function handleSetup(params) {
   lines.push(`\n### Static CLI Protocol Check (zero model calls)`);
   let cliProtocolOk = false;
   let cliProtocolDetail = "";
+  let budgetGuardSupported = false;
+  let helpText = "";
   if (claudeStatus.available) {
     try {
       const helpResult = spawnSync("claude", ["--help"], {
@@ -1558,7 +1659,7 @@ async function handleSetup(params) {
         timeout: 10000,
         stdio: "pipe"
       });
-      const helpText = `${helpResult.stdout || ""}\n${helpResult.stderr || ""}`;
+      helpText = `${helpResult.stdout || ""}\n${helpResult.stderr || ""}`;
       const hasPrint = /--print\b/.test(helpText);
       const hasInputFormat = /--input-format\b/.test(helpText);
       const hasOutputFormat = /--output-format\b/.test(helpText);
@@ -1574,6 +1675,13 @@ async function handleSetup(params) {
         cliProtocolDetail = `Claude CLI may not support print-mode JSON (missing: ${missing.join(", ")}). Update Claude Code.`;
         lines.push(`❌ ${cliProtocolDetail}`);
       }
+      // Budget guard capability check (for liveness probe safety)
+      budgetGuardSupported = /--max-budget-usd\b/.test(helpText);
+      if (budgetGuardSupported) {
+        lines.push(`✅ Budget guard supported (--max-budget-usd recognized)`);
+      } else {
+        lines.push(`⚠️ Budget guard not supported (--max-budget-usd not found in --help)`);
+      }
     } catch (err) {
       cliProtocolDetail = `Could not run claude --help: ${err.message}`;
       lines.push(`⚠️ ${cliProtocolDetail}`);
@@ -1583,8 +1691,11 @@ async function handleSetup(params) {
     lines.push(`⚠️ ${cliProtocolDetail}`);
   }
 
-  // ── Companion / Source / Cache Compatibility Check (zero model calls) ──
-  lines.push(`\n### Companion Compatibility Check (zero model calls)`);
+  // ── Real Source/Cache Compatibility Check (zero model calls) ──
+  // Compares the loaded source against the active installed cache using the
+  // existing install-cache helpers. Never prints a green compatibility claim
+  // without a real comparison.
+  lines.push(`\n### Source/Cache Compatibility (zero model calls)`);
   const cliVersion = getClaudeVersion(cwd);
   if (cliVersion) {
     lines.push(`✅ Claude CLI version: ${cliVersion}`);
@@ -1594,35 +1705,78 @@ async function handleSetup(params) {
   lines.push(`✅ Companion server: v${SERVER_VERSION}, schema v5`);
   lines.push(`✅ Watchdog protocol: --print --input-format text --output-format json (task via stdin, never argv)`);
 
-  // ── Active Profile Routing Resolvability Check (zero model calls) ──
-  // Reads the active profile and verifies it can be safely resolved.
-  // Does NOT make a model call. Does NOT display secrets.
-  lines.push(`\n### Active Profile Routing Resolvability (zero model calls)`);
-  const claudeConfigDir = resolveClaudeConfigDir();
-  lines.push(`- **Claude config dir:** ${claudeConfigDir}`);
+  let sourceCacheOk = false;
+  const pluginDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)));
+  try {
+    const activeCache = resolveActiveCache("cc-plugin-codex", {
+      execFn: (cmd) => {
+        const result = spawnSync(cmd, { encoding: "utf8", timeout: 15000, shell: true, cwd });
+        if (result.status !== 0) throw new Error(`Command failed: ${cmd}`);
+        return (result.stdout || "").trim();
+      },
+      fs,
+      homeDir: process.env.HOME || "",
+    });
+    if (!activeCache.activePath) {
+      lines.push(`ℹ️ Installed cache not found (running from source or not installed). Status: not-installed`);
+      sourceCacheOk = true; // not-installed is an acceptable state when running from source
+    } else {
+      lines.push(`✅ Active cache path: ${activeCache.activePath}`);
+      if (activeCache.version) {
+        lines.push(`- **Cache version:** ${activeCache.version}`);
+      }
+      // Real recursive comparison
+      const comparison = compareSourceCache(pluginDir, activeCache.activePath);
+      if (comparison.diffs === 0) {
+        lines.push(`✅ Source and cache match (${comparison.sourceFileCount} files compared)`);
+        sourceCacheOk = true;
+      } else {
+        lines.push(`❌ Source and cache differ (${comparison.diffs} file(s) differ out of ${comparison.sourceFileCount} source / ${comparison.cacheFileCount} cache)`);
+        for (const detail of comparison.diffDetails.slice(0, 5)) {
+          lines.push(`  - ${detail}`);
+        }
+        if (comparison.diffDetails.length > 5) {
+          lines.push(`  - ... ${comparison.diffDetails.length - 5} more`);
+        }
+        sourceCacheOk = false;
+      }
+    }
+  } catch (err) {
+    lines.push(`⚠️ Could not compare source/cache: ${err.message}`);
+    sourceCacheOk = false;
+  }
+
+  // ── Active Authority Routing Resolvability Check (zero model calls) ──
+  // Reads the active authority (cc-profile-switch, active-profile fixture, or
+  // Claude settings) and verifies it can be safely resolved. Does NOT make a
+  // model call. Does NOT display secrets.
+  lines.push(`\n### Active Authority Routing Resolvability (zero model calls)`);
   let profileResolvable = false;
   let profileIdentity = null;
   let profileFingerprint = null;
   try {
-    const profile = readActiveProfile(claudeConfigDir);
+    const profile = readActiveAuthority({ env: process.env });
     if (profile === null) {
-      lines.push(`✅ No active-profile.json found — bare inheritance from parent environment (no profile stripping)`);
+      lines.push(`✅ No active authority found — bare inheritance from parent environment (no profile stripping)`);
       profileResolvable = true;
     } else {
+      const sourceKind = profile.projection.sourceKind || "unknown";
       profileIdentity = profile.projection.profileIdentity || "(unnamed)";
       profileFingerprint = profile.projection.profileFingerprint || "—";
-      lines.push(`✅ Active profile resolvable: ${profileIdentity}`);
+      lines.push(`✅ Active authority resolvable: ${sourceKind} → ${profileIdentity}`);
       lines.push(`- **Fingerprint:** ${profileFingerprint}`);
       const aliasCount = profile.projection.aliasMappings ? Object.keys(profile.projection.aliasMappings).length : 0;
       const nativeCount = profile.projection.nativeDisplayNames ? Object.keys(profile.projection.nativeDisplayNames).length : 0;
       lines.push(`- **Alias mappings:** ${aliasCount}`);
       lines.push(`- **Native display names:** ${nativeCount}`);
+      lines.push(`- **Injected env keys:** ${(profile.projection.injectedKeyNames || []).join(", ") || "(none)"}`);
+      lines.push(`- **Routing policy:** bedrock=${profile.projection.routingPolicy?.bedrock || false}, vertex=${profile.projection.routingPolicy?.vertex || false}`);
       lines.push(`- **Private env vars:** ${Object.keys(profile.secrets.envVars).length} (values not displayed)`);
       profileResolvable = true;
     }
   } catch (err) {
-    lines.push(`❌ Active profile is corrupt or unreadable: ${err.message}`);
-    lines.push(`   No fallback profile is used. Fix the file or remove it for bare inheritance.`);
+    lines.push(`❌ Active authority is corrupt or unreadable: ${err.message}`);
+    lines.push(`   No fallback profile is used. Fix the configuration or remove it for bare inheritance.`);
   }
 
   const workspaceRoot = rememberWorkspaceRoot(cwd);
@@ -1659,29 +1813,58 @@ async function handleSetup(params) {
   lines.push(`- **Platform:** ${process.platform} ${process.arch}`);
 
   // ── Optional Liveness Probe (cost-bearing, explicitly authorized) ──
+  // Requires: livenessProbe=true, positive timeoutSeconds, positive maxBudgetUsd,
+  // CLI budget-guard support, CLI protocol ok, profile resolvable.
+  // Fails closed (no Provider call) if any prerequisite is unmet.
   if (livenessProbe) {
     lines.push(`\n### Provider Liveness Probe (COST-BEARING — one model call)`);
-    lines.push(`⚠️ This probe makes a real model call and incurs a cost. Budget: ${probeTimeoutSeconds}s.`);
+    lines.push(`⚠️ This probe makes a real model call and incurs a cost. Budget: ${probeTimeoutSeconds}s, max $${probeMaxBudgetUsd}.`);
+
+    // Fail-closed gates — checked BEFORE any Provider call
     if (!claudeStatus.available) {
-      lines.push(`❌ Cannot run liveness probe: Claude CLI not available`);
+      lines.push(`❌ Probe refused (fail-closed): Claude CLI not available`);
     } else if (!cliProtocolOk) {
-      lines.push(`❌ Cannot run liveness probe: CLI protocol check failed`);
+      lines.push(`❌ Probe refused (fail-closed): CLI protocol check failed`);
     } else if (!profileResolvable) {
-      lines.push(`❌ Cannot run liveness probe: active profile is not resolvable`);
+      lines.push(`❌ Probe refused (fail-closed): active authority is not resolvable`);
+    } else if (!budgetGuardSupported) {
+      // Budget guard unsupported — MUST fail closed, no Provider call
+      lines.push(`❌ Probe refused (fail-closed): CLI does not support --max-budget-usd budget guard.`);
+      lines.push(`   The liveness probe requires a verified budget guard. Update Claude Code or do not use livenessProbe.`);
     } else {
+      // All prerequisites met — resolve the route (with model selector if provided)
+      // and run the probe with the budget guard.
       try {
+        const claudeConfigDir = resolveClaudeConfigDir();
+        let probeRoute;
+        try {
+          probeRoute = resolveRoute({
+            claudeConfigDir,
+            selectorInput: probeModel,
+            cliVersion,
+            parentEnv: process.env,
+            env: process.env
+          });
+        } catch (routeErr) {
+          const stage = routeErr instanceof AmbiguousSelectorError ? "ambiguous-selector" : "configuration";
+          lines.push(`❌ Probe refused (fail-closed): route resolution failed (${stage}): ${routeErr.message}`);
+          // Skip the probe — route is not resolvable
+          const staticChecksOk = claudeStatus.available && nodeStatus.available && cliProtocolOk && profileResolvable && sourceCacheOk;
+          lines.push("\n" + (staticChecksOk ? "✅ Static checks passed (zero model calls)" : "❌ Setup incomplete"));
+          return { content: [{ type: "text", text: lines.join("\n") }] };
+        }
+
         const probeTask = "Reply with exactly: OK";
         const probeStart = Date.now();
-        const probeRoute = resolveRoute({
-          claudeConfigDir,
-          selectorInput: null,
-          cliVersion,
-          parentEnv: process.env
-        });
+        if (probeRoute.selector.kind !== "inherited") {
+          lines.push(`- **Model selector:** ${probeRoute.selector.kind} → ${probeRoute.selector.cliArg || "(inherited)"}`);
+        }
+        lines.push(`- **Budget guard:** --max-budget-usd ${probeMaxBudgetUsd}`);
+
         const probeExecution = runClaude(probeTask, {
           cwd: workspaceRoot,
           write: false,
-          model: null,
+          model: probeRoute.selector.cliArg,
           effort: "low",
           dangerouslySkipPermissions: false,
           resume: false,
@@ -1689,7 +1872,8 @@ async function handleSetup(params) {
           timeout: probeTimeoutSeconds * 1000,
           childEnv: probeRoute.childEnv,
           routeSnapshot: probeRoute.snapshot,
-          cliVersion
+          cliVersion,
+          maxBudgetUsd: probeMaxBudgetUsd
         });
         const probeResult = await probeExecution.result;
         const probeDuration = ((Date.now() - probeStart) / 1000).toFixed(1);
@@ -1701,6 +1885,11 @@ async function handleSetup(params) {
           if (probeResult.usageModelKeys && probeResult.usageModelKeys.length > 0) {
             lines.push(`- **Usage key:** ${probeResult.usageModelKeys.join(", ")}`);
           }
+          // Cost provenance
+          const costProvenance = probeResult.cost != null && probeResult.cost > 0
+            ? "provider_reported"
+            : "unknown";
+          lines.push(`- **Cost provenance:** ${costProvenance}`);
         } else {
           const probeStage = probeResult.failureStage || FAILURE_STAGES.PROVIDER_RESPONSE;
           lines.push(`❌ Provider liveness probe failed in ${probeDuration}s`);
@@ -1714,7 +1903,7 @@ async function handleSetup(params) {
   }
 
   // ── Summary ──
-  const staticChecksOk = claudeStatus.available && nodeStatus.available && cliProtocolOk && profileResolvable;
+  const staticChecksOk = claudeStatus.available && nodeStatus.available && cliProtocolOk && profileResolvable && sourceCacheOk;
   if (staticChecksOk) {
     lines.push("\n✅ Static checks passed (zero model calls)\n");
     lines.push("Use `/claude:delegate` to start delegating tasks. Use `cc_resolve_route` to preview model routing.");
@@ -1722,7 +1911,7 @@ async function handleSetup(params) {
       lines.push(`\n⚠️ ${orphanedCount} orphaned job(s) detected. These were running when a previous companion server exited. Check with \`/claude:status --all\`.`);
     }
     if (!livenessProbe) {
-      lines.push(`\n_For a real Provider liveness probe (incurs cost), call cc_setup with livenessProbe=true and a positive timeoutSeconds._`);
+      lines.push(`\n_For a real Provider liveness probe (incurs cost), call cc_setup with livenessProbe=true, a positive timeoutSeconds, and a positive maxBudgetUsd. The CLI must support --max-budget-usd._`);
     }
   } else {
     lines.push("\n❌ Setup incomplete");
@@ -1736,7 +1925,10 @@ async function handleSetup(params) {
       lines.push("Update Claude Code to support print-mode JSON: `npm update -g @anthropic-ai/claude-code`");
     }
     if (!profileResolvable) {
-      lines.push("Fix or remove the corrupt active-profile.json in the Claude config directory.");
+      lines.push("Fix or remove the corrupt active authority configuration (cc-profile-switch or Claude settings).");
+    }
+    if (!sourceCacheOk) {
+      lines.push("Reinstall the plugin to sync source and cache: `codex plugin add cc-plugin-codex@cc-plugin-codex`");
     }
   }
 
@@ -1881,7 +2073,8 @@ async function gracefulShutdown(signal) {
             phase: "cancelled",
             pid: null,
             completedAt,
-            errorMessage: `Cancelled: server received ${signal}`
+            errorMessage: `Cancelled: server received ${signal}`,
+            routeStatus: ROUTE_STATUSES.CANCELLED
           });
           appendLogLine(workspaceRoot, job.id, `Cancelled: server ${signal}`);
         }

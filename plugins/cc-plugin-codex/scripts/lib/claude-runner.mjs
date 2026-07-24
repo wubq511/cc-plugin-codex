@@ -48,7 +48,8 @@ export function runClaude(task, options = {}) {
     command,
     childEnv: options.childEnv || null,
     routeSnapshot: options.routeSnapshot || null,
-    cliVersion: options.cliVersion || null
+    cliVersion: options.cliVersion || null,
+    maxBudgetUsd: options.maxBudgetUsd || null
   };
 
   // Spawn watchdog with IPC channel for control.

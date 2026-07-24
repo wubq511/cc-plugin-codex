@@ -131,7 +131,8 @@ async function main() {
     command = "claude",
     childEnv = null,
     routeSnapshot = null,
-    cliVersion = null
+    cliVersion = null,
+    maxBudgetUsd = null
   } = config;
 
   maxCapture = maxCaptureBytes;
@@ -163,6 +164,9 @@ async function main() {
   const args = ["--print", "--input-format", "text", "--output-format", "json"];
   if (dangerouslySkipPermissions === true) args.push("--dangerously-skip-permissions");
   if (model) args.push("--model", model);
+  if (maxBudgetUsd && Number.isFinite(maxBudgetUsd) && maxBudgetUsd > 0) {
+    args.push("--max-budget-usd", String(maxBudgetUsd));
+  }
   if (effort && ["low", "medium", "high", "xhigh", "max"].includes(effort)) args.push("--effort", effort);
   if (write === false) {
     // Strict read-only: only Read, Glob, Grep — NO Bash

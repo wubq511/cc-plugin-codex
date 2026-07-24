@@ -10,13 +10,14 @@ import {
 
 // ─── Status Enum ─────────────────────────────────────────────────────────────
 
-test("ROUTE_STATUSES contains the 4 defined statuses", () => {
+test("ROUTE_STATUSES contains the 5 defined statuses", () => {
   const statuses = Object.values(ROUTE_STATUSES);
-  assert.equal(statuses.length, 4);
+  assert.equal(statuses.length, 5);
   assert.equal(ROUTE_STATUSES.RESOLVED, "resolved");
   assert.equal(ROUTE_STATUSES.ACCEPTED_BUT_UNVERIFIED, "accepted_but_unverified");
   assert.equal(ROUTE_STATUSES.MODEL_DRIFT_POSSIBLE, "model_drift_possible");
   assert.equal(ROUTE_STATUSES.REJECTED, "rejected");
+  assert.equal(ROUTE_STATUSES.CANCELLED, "cancelled");
 });
 
 test("isValidRouteStatus accepts known statuses and rejects unknown ones", () => {

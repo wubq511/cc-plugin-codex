@@ -36,6 +36,31 @@ const args = process.argv.slice(2);
 const taskIndex = args.indexOf("-p");
 const taskFromArgs = taskIndex >= 0 ? args[taskIndex + 1] : "";
 
+// Handle --version and --help immediately so cc_setup's spawnSync calls
+// don't hang waiting for stdin. The budget-guard flag is controllable via
+// FAKE_CLAUDE_HELP_BUDGET_GUARD=1 so tests can verify fail-closed behavior.
+if (args.includes("--version") || args.includes("-v")) {
+  process.stdout.write("1.0.0-fake\n");
+  process.exit(0);
+}
+if (args.includes("--help") || args.includes("-h")) {
+  const helpLines = [
+    "Usage: claude [options] [prompt]",
+    "",
+    "Options:",
+    "  -p, --print          Print mode (non-interactive)",
+    "  --input-format       Input format (text, stream-json)",
+    "  --output-format      Output format (text, json, stream-json)",
+    "  --model              Model to use",
+    "  --max-turns          Maximum turns",
+  ];
+  if (process.env.FAKE_CLAUDE_HELP_BUDGET_GUARD === "1") {
+    helpLines.push("  --max-budget-usd     Maximum budget in USD (budget guard)");
+  }
+  process.stdout.write(helpLines.join("\n") + "\n");
+  process.exit(0);
+}
+
 function success(result = "fake result") {
   const execModel = process.env.EXEC_MODEL || "mimo-v2.5";
   process.stdout.write(JSON.stringify({

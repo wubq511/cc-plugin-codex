@@ -6,9 +6,16 @@
  *   accepted_but_unverified    — job succeeded but no transcript evidence available
  *   model_drift_possible       — route claim and execution evidence disagree
  *   rejected                   — CLI/Provider rejection or failure
+ *   cancelled                  — documented non-terminal exception: the job was
+ *                                cancelled before execution evidence could be
+ *                                collected. This is NOT a computed route status
+ *                                from execution evidence; it is a documented
+ *                                terminal-state marker that prevents null from
+ *                                being persisted as a final route status.
  *
  * A configuration claim (route snapshot) is NEVER treated as execution proof.
  * A usage key is NEVER treated as an execution model.
+ * Cancellation never persists null — it persists "cancelled".
  */
 
 import { normalizeModelIdForStorage } from "./model-evidence-shared.mjs";
@@ -21,6 +28,7 @@ export const ROUTE_STATUSES = Object.freeze({
   ACCEPTED_BUT_UNVERIFIED: "accepted_but_unverified",
   MODEL_DRIFT_POSSIBLE: "model_drift_possible",
   REJECTED: "rejected",
+  CANCELLED: "cancelled",
 });
 
 const VALID_STATUSES = new Set(Object.values(ROUTE_STATUSES));
@@ -109,6 +117,7 @@ export function describeRouteStatus(status) {
     [ROUTE_STATUSES.ACCEPTED_BUT_UNVERIFIED]: "Job succeeded but no transcript evidence was available to confirm the route.",
     [ROUTE_STATUSES.MODEL_DRIFT_POSSIBLE]: "Route claim and execution evidence disagree — the Provider may have used a different model.",
     [ROUTE_STATUSES.REJECTED]: "Job failed — the route was not accepted by the CLI or Provider.",
+    [ROUTE_STATUSES.CANCELLED]: "Job was cancelled before execution evidence could be collected. This is a documented non-terminal exception, not a computed route status.",
   };
   return descriptions[status] || "Unknown route status.";
 }

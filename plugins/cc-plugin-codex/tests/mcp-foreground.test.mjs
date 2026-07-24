@@ -52,9 +52,23 @@ function startServer(t, { env: extraEnv } = {}) {
   fs.copyFileSync(fakeClaudeSource, fakeClaude);
   fs.chmodSync(fakeClaude, 0o755);
 
+  // Isolate CC_PROFILE_SWITCH_HOME and CLAUDE_CONFIG_DIR from the real user
+  // environment so tests never read the real ~/.cc-profile-switch or ~/.claude.
+  // Tests that need a specific authority can override these via extraEnv.
+  const isolatedCcpsHome = path.join(workspace, "ccps-home");
+  const isolatedClaudeConfigDir = path.join(workspace, "claude-config");
+  fs.mkdirSync(isolatedCcpsHome, { recursive: true });
+  fs.mkdirSync(isolatedClaudeConfigDir, { recursive: true });
+
   const child = spawn(process.execPath, [serverPath], {
     cwd: workspace,
-    env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`, ...extraEnv },
+    env: {
+      ...process.env,
+      CC_PROFILE_SWITCH_HOME: isolatedCcpsHome,
+      CLAUDE_CONFIG_DIR: isolatedClaudeConfigDir,
+      PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
+      ...extraEnv
+    },
     stdio: ["pipe", "pipe", "pipe"]
   });
   const messages = [];
