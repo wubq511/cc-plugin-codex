@@ -20,6 +20,25 @@ const pluginRoot = path.resolve(here, "..");
 const serverPath = path.join(pluginRoot, "scripts", "cc-companion.mjs");
 const fakeClaudeSource = path.join(here, "helpers", "fake-claude.mjs");
 
+function installFakeClaude(binDir) {
+  const fakeClaude = path.join(binDir, "claude");
+  fs.copyFileSync(fakeClaudeSource, fakeClaude);
+  fs.chmodSync(fakeClaude, 0o755);
+
+  // The production CLI is normally an npm-generated `.cmd` shim on Windows.
+  // Add a compatible fake shim so cc_setup exercises the same resolver as a
+  // real installation instead of falsely reporting the test CLI as missing.
+  if (process.platform === "win32") {
+    fs.copyFileSync(fakeClaudeSource, path.join(binDir, "claude.js"));
+    fs.writeFileSync(
+      path.join(binDir, "claude.cmd"),
+      `@ECHO off\r\n"${process.execPath}" "%~dp0claude.js" %*\r\n`,
+      "utf8",
+    );
+  }
+  return fakeClaude;
+}
+
 async function waitFor(predicate, timeoutMs = 3000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -55,9 +74,7 @@ function startServer(t, opts = {}) {
   const workspace = opts.workspace || fs.mkdtempSync(path.join(os.tmpdir(), "cc-hardening-test-"));
   const binDir = path.join(workspace, "bin");
   fs.mkdirSync(binDir, { recursive: true });
-  const fakeClaude = path.join(binDir, "claude");
-  fs.copyFileSync(fakeClaudeSource, fakeClaude);
-  fs.chmodSync(fakeClaude, 0o755);
+  installFakeClaude(binDir);
 
   // Isolate CC_PROFILE_SWITCH_HOME and CLAUDE_CONFIG_DIR from the real user
   // environment so tests never read the real ~/.cc-profile-switch or ~/.claude.

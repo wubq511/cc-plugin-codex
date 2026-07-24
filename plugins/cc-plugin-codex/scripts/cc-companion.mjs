@@ -36,7 +36,7 @@ import {
   findLatestActiveJob, findLatestCompletedJob, writeResultArtifact,
   readResultArtifact, cleanupOldJobs, resolveStateDir
 } from "./lib/state.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, resolveCommandForSpawn, terminateProcessTree } from "./lib/process.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
   appendLogLine, appendLogBlock, createJobLogFile, readLogTail,
@@ -1808,11 +1808,17 @@ async function handleSetup(params) {
   let helpText = "";
   if (claudeStatus.available) {
     try {
-      const helpResult = spawnSync("claude", ["--help"], {
+      // Use the same shell-free Windows `.cmd` shim resolution as watchdog
+      // execution and binaryAvailable(). A direct spawn of `claude` cannot
+      // reliably invoke npm's `.cmd` wrapper on Windows.
+      const resolvedHelpCommand = resolveCommandForSpawn("claude", ["--help"]);
+      const helpResult = spawnSync(resolvedHelpCommand.command, resolvedHelpCommand.args, {
         cwd,
         encoding: "utf8",
         timeout: 10000,
-        stdio: "pipe"
+        stdio: "pipe",
+        shell: resolvedHelpCommand.shell,
+        windowsHide: true,
       });
       helpText = `${helpResult.stdout || ""}\n${helpResult.stderr || ""}`;
       const hasPrint = /--print\b/.test(helpText);

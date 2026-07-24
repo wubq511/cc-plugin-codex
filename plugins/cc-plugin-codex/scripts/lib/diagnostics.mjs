@@ -185,7 +185,15 @@ function taskBearingLeakDetected(redacted, taskMarkers, { failSafeShortMarkers =
     // Never attempt to preserve an arbitrary diagnostic for a short or
     // non-comparable task. The actual task is known sensitive input, unlike a
     // caller-supplied heuristic marker, so this conservative choice is safe.
-    if (failSafeShortMarkers && (m.length < MIN_TASK_MARKER_LEN || comparableMarker.length < MIN_TASK_MARKER_LEN)) return true;
+    const isShortMarker = m.length < MIN_TASK_MARKER_LEN || comparableMarker.length < MIN_TASK_MARKER_LEN;
+    if (isShortMarker) {
+      if (failSafeShortMarkers) return true;
+      // Successful result handling has already performed literal replacement.
+      // Do not apply subsequence matching to a short task here: arbitrary
+      // normal output (for example an absolute working-directory path) can
+      // coincidentally contain three ordered characters and be erased.
+      continue;
+    }
     if (
       comparableRedacted.includes(comparableMarker)
       // A CLI can label each emitted chunk (for example, "chunk: <token>").

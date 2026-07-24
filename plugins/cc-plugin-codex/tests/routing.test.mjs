@@ -1502,7 +1502,7 @@ test("resolveRouteForDisplay includes routing policy and injected key names in t
 
 test("resolveClaudeConfigDir respects CLAUDE_CONFIG_DIR env var", () => {
   const customDir = "/custom/claude/config";
-  assert.equal(resolveClaudeConfigDir({ CLAUDE_CONFIG_DIR: customDir }), customDir);
+  assert.equal(resolveClaudeConfigDir({ CLAUDE_CONFIG_DIR: customDir }), path.resolve(customDir));
 });
 
 test("resolveClaudeConfigDir falls back to ~/.claude when env not set", () => {
@@ -1512,7 +1512,7 @@ test("resolveClaudeConfigDir falls back to ~/.claude when env not set", () => {
 
 test("resolveCcProfileSwitchHome respects CC_PROFILE_SWITCH_HOME env var", () => {
   const customDir = "/custom/ccps/home";
-  assert.equal(resolveCcProfileSwitchHome({ CC_PROFILE_SWITCH_HOME: customDir }), customDir);
+  assert.equal(resolveCcProfileSwitchHome({ CC_PROFILE_SWITCH_HOME: customDir }), path.resolve(customDir));
 });
 
 test("resolveCcProfileSwitchHome falls back to ~/.cc-profile-switch when env not set", () => {

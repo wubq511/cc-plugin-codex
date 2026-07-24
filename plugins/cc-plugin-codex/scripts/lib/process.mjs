@@ -7,12 +7,19 @@ import path from "node:path";
  */
 export function binaryAvailable(command, args = [], options = {}) {
   try {
-    const result = spawnSync(command, args, {
+    // Keep setup/liveness checks on the same shell-free resolution path as
+    // the watchdog. On Windows the normal Claude installation is an npm
+    // `.cmd` shim; spawning the bare name directly makes `cc_setup` report
+    // the CLI as missing even though delegation can resolve the shim.
+    const resolved = resolveCommandForSpawn(command, args);
+    const result = spawnSync(resolved.command, resolved.args, {
       cwd: options.cwd || process.cwd(),
       env: process.env,
       encoding: "utf8",
       timeout: 5000,
-      stdio: "pipe"
+      stdio: "pipe",
+      shell: resolved.shell,
+      windowsHide: true,
     });
     const ok = result.status === 0;
     return {
