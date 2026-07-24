@@ -358,6 +358,22 @@ function boundedText(value, maxBytes) {
   return truncateForPresentation(String(value ?? ""), maxBytes).text;
 }
 
+/**
+ * Recursively apply the redaction boundary to an untrusted diagnostics object
+ * before it crosses from the watchdog into a private result artifact. The
+ * watchdog already redacts its failure envelope, but this second boundary
+ * protects future result fields and opaque profile credentials without
+ * persisting runtime-only secret values.
+ */
+function redactDiagnosticValue(value, markers) {
+  if (typeof value === "string") return redactText(value, 2048, markers);
+  if (Array.isArray(value)) return value.map((entry) => redactDiagnosticValue(entry, markers));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, redactDiagnosticValue(entry, markers)]));
+  }
+  return value;
+}
+
 function boundedTouchedFiles(files) {
   const result = [];
   let bytes = 0;
@@ -743,6 +759,7 @@ async function handleDelegate(params, context = {}) {
   const selectorKind = route.selector.kind;
   const routeSnapshot = route.snapshot;
   const childEnv = route.childEnv;
+  const sensitiveMarkers = [task, ...(route.sensitiveMarkers || [])];
   const cliVersion = route.snapshot.cliVersion;
 
   // P0: Resume semantics — resolve resume=true to latest completed job
@@ -863,6 +880,7 @@ async function handleDelegate(params, context = {}) {
     resumeSession: resolvedResumeSession,
     timeout: timeoutMs,
     childEnv,
+    sensitiveMarkers: route.sensitiveMarkers,
     routeSnapshot,
     cliVersion
   });
@@ -874,7 +892,7 @@ async function handleDelegate(params, context = {}) {
     if (leaseHeartbeat) clearInterval(leaseHeartbeat);
     if (leaseOwner) releaseWriterLease(workspaceRoot, leaseOwner);
     return {
-      content: [{ type: "text", text: `Error: failed to start Claude Code safely: ${err.message}` }],
+      content: [{ type: "text", text: "Error: failed to start Claude Code safely. No task was executed." }],
       isError: true
     };
   }
@@ -962,7 +980,21 @@ async function handleDelegate(params, context = {}) {
     // A successful Provider result can quote or repeat the delegated task.
     // Apply the same task-aware, fail-safe redaction before *any* persistence
     // or MCP presentation, not only on the failure-diagnostics path.
-    const safeResult = redactText(result.result, Number.POSITIVE_INFINITY, [task]);
+    const taskSafeResult = redactText(
+      result.result,
+      Number.POSITIVE_INFINITY,
+      [task],
+      { failSafeShortMarkers: false },
+    );
+    // Task text may legitimately be short in a successful response, but an
+    // opaque credential must always prefer fail-safe redaction. Keep the two
+    // marker classes separate so a chunked short profile secret cannot evade
+    // the task-friendly success-path policy above.
+    const safeResult = redactText(
+      taskSafeResult,
+      Number.POSITIVE_INFINITY,
+      route.sensitiveMarkers || [],
+    );
     const resultArtifactPath = writeResultArtifact(workspaceRoot, jobId, {
       result: safeResult,
       sessionId: result.sessionId,
@@ -1074,7 +1106,7 @@ async function handleDelegate(params, context = {}) {
         usageSource: "claude-result-modelUsage",
         warnings: []
       },
-      diagnostics: result.diagnostics || null,
+      diagnostics: redactDiagnosticValue(result.diagnostics, sensitiveMarkers),
       failureStage
     });
 
@@ -2018,6 +2050,7 @@ async function handleSetup(params) {
           resumeSession: null,
           timeout: probeTimeoutSeconds * 1000,
           childEnv: probeRoute.childEnv,
+          sensitiveMarkers: probeRoute.sensitiveMarkers,
           routeSnapshot: probeRoute.snapshot,
           cliVersion,
           maxBudgetUsd: probeMaxBudgetUsd
@@ -2083,7 +2116,10 @@ async function handleSetup(params) {
           usageModelKeys: probeUsageModelKeys,
           // A usage key is never execution proof — only transcript evidence is.
           usageKeyIsNotExecutionProof: true,
-          diagnostics: probeResult.diagnostics || null,
+          diagnostics: redactDiagnosticValue(
+            probeResult.diagnostics,
+            [probeTask, ...(probeRoute.sensitiveMarkers || [])],
+          ),
         });
 
         if (probeResult.ok) {
@@ -2135,7 +2171,7 @@ async function handleSetup(params) {
               errorDetail: err?.message || "liveness probe infrastructure error",
               stdout: "",
               stderr: "",
-              taskMarkers: ["Reply with exactly: OK"],
+              taskMarkers: ["Reply with exactly: OK", ...(probeRoute?.sensitiveMarkers || [])],
             }),
           });
         } catch { /* the pre-call artifact remains if finalization itself fails */ }

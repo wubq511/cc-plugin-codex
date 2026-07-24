@@ -20,7 +20,7 @@ Verify that Claude Code is installed and the plugin is ready to use. Performs st
    - **Node.js not available**: Suggest installing from https://nodejs.org/
    - **Git not found**: Review features need git — suggest installing git
    - **CLI protocol mismatch**: The installed Claude Code may not support print-mode JSON (`--print --input-format text --output-format json`). Suggest updating Claude Code to 2.1.208+.
-   - **Active authority corrupt or unreadable**: The active cc-profile-switch profile (or fallback authority) could not be safely resolved — corrupt config, missing profile, path traversal, or symlink escape. No fallback profile is used. Fix the config or remove it for bare inheritance.
+   - **Active authority corrupt or unreadable**: The active cc-profile-switch profile (or an explicitly selected fallback authority) could not be safely resolved — corrupt config, missing profile, path traversal, or symlink escape. No fallback profile is used. Fix the config or remove the explicit adapter selection for bare inheritance.
    - **Source/cache mismatch**: The installed plugin cache differs from the running source. Reinstall the plugin to align the cache.
    - **Claude Code not authenticated**: Suggest running `claude auth` or setting `ANTHROPIC_API_KEY`
 
@@ -29,7 +29,7 @@ Verify that Claude Code is installed and the plugin is ready to use. Performs st
 - **Claude Code CLI availability and version**
 - **CLI protocol verification**: confirms `--print`, `--input-format`, and `--output-format` flags are supported (print-mode JSON capability)
 - **Companion compatibility**: server version, state schema v6, watchdog protocol
-- **Active authority routing resolvability**: reads the active cc-profile-switch profile (default) — `${CC_PROFILE_SWITCH_HOME:-~/.cc-profile-switch}/config.json` → `lastUsedProfile` → `profiles/<name>/claude-home/settings.json` + common `api-settings.json` — and verifies it can be safely resolved. Falls back to a Claude-settings adapter (`<CLAUDE_CONFIG_DIR>/settings.json`) and an explicit `active-profile.json` fixture for tests/legacy. Reports source kind, profile identity, fingerprint, alias mapping count, and native display name count. Does NOT display secrets, tokens, or env var values. The authority is re-read fresh on every call — a profile switch takes effect without restarting Codex.
+- **Active authority routing resolvability**: reads the active cc-profile-switch profile (default) — `${CC_PROFILE_SWITCH_HOME:-~/.cc-profile-switch}/config.json` → `lastUsedProfile` → `profiles/<name>/claude-home/settings.json` + common `api-settings.json` — and verifies it can be safely resolved. If cc-profile-switch is absent, bare inheritance is the default; set `CC_COMPANION_AUTHORITY_ADAPTER=claude-settings` to opt into `<CLAUDE_CONFIG_DIR>/settings.json`, or `active-profile-fixture` for the legacy test/compat fixture. Reports source kind, profile identity, fingerprint, alias mapping count, and native display name count. Does NOT display secrets, tokens, or env var values. The authority is re-read fresh on every call — a profile switch takes effect without restarting Codex.
 - **Source/cache compatibility**: performs a real comparison between the running plugin source and the installed cache directory (reports `match`, `differ`, or `not-installed` when running from source). Never prints a green compatibility claim without an actual comparison.
 - **Node.js availability and version**
 - **Git availability and version**

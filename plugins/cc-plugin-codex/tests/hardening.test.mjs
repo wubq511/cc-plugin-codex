@@ -73,6 +73,7 @@ function startServer(t, opts = {}) {
       ...process.env,
       CC_PROFILE_SWITCH_HOME: isolatedCcpsHome,
       CLAUDE_CONFIG_DIR: isolatedClaudeConfigDir,
+      CC_COMPANION_AUTHORITY_ADAPTER: "",
       ...opts.env,
       PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`
     },
@@ -139,7 +140,40 @@ function startServer(t, opts = {}) {
     }
   });
 
-  return { child, messages, request, send, workspace, stderr: () => stderr };
+  return {
+    child,
+    messages,
+    request,
+    send,
+    workspace,
+    ccpsHome: isolatedCcpsHome,
+    claudeConfigDir: isolatedClaudeConfigDir,
+    stderr: () => stderr,
+  };
+}
+
+function configureServerProfile(server, apiKey) {
+  const profileName = "privacy-test";
+  const profileHome = path.join(server.ccpsHome, "profiles", profileName, "claude-home");
+  fs.mkdirSync(profileHome, { recursive: true });
+  fs.writeFileSync(
+    path.join(server.ccpsHome, "config.json"),
+    JSON.stringify({ version: 1, lastUsedProfile: profileName }),
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(profileHome, "settings.json"),
+    JSON.stringify({
+      env: {
+        // Deliberately opaque: this value cannot be safely caught by a
+        // generic `sk-`/`token=` regex and must be redacted from runtime
+        // profile markers before artifact persistence.
+        ANTHROPIC_API_KEY: apiKey,
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "deepseek-v4-pro",
+      },
+    }),
+    "utf8",
+  );
 }
 
 // ─── P0: Concurrent Writers ──────────────────────────────────────────────────
@@ -1695,7 +1729,7 @@ test("cc_resolve_route resolves alias selectors (Opus → opus)", async (t) => {
   fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
   t.after(async () => { await safeRmDir(configDir); });
 
-  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir } });
+  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir, CC_COMPANION_AUTHORITY_ADAPTER: "active-profile-fixture" } });
   const response = await server.request(203, "tools/call", {
     name: "cc_resolve_route",
     arguments: { selector: "Opus" }
@@ -1723,7 +1757,7 @@ test("cc_resolve_route resolves native IDs unchanged", async (t) => {
   fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
   t.after(async () => { await safeRmDir(configDir); });
 
-  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir } });
+  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir, CC_COMPANION_AUTHORITY_ADAPTER: "active-profile-fixture" } });
   const response = await server.request(204, "tools/call", {
     name: "cc_resolve_route",
     arguments: { selector: "glm-5.2" }
@@ -1771,7 +1805,7 @@ test("cc_setup with active profile does not leak secrets, tokens, or api_key", a
   fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
   t.after(async () => { await safeRmDir(configDir); });
 
-  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir } });
+  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir, CC_COMPANION_AUTHORITY_ADAPTER: "active-profile-fixture" } });
   const result = await server.send(207, "cc_setup");
   const text = result.result.content[0].text;
 
@@ -1869,7 +1903,7 @@ test("cc_resolve_route returns bounded structuredContent with no secrets", async
   fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
   t.after(async () => { await safeRmDir(configDir); });
 
-  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir } });
+  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir, CC_COMPANION_AUTHORITY_ADAPTER: "active-profile-fixture" } });
   const response = await server.request(213, "tools/call", {
     name: "cc_resolve_route",
     arguments: { selector: "Opus" }
@@ -1904,7 +1938,7 @@ test("delegate with alias model passes canonical alias to Claude CLI (case-insen
   fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
   t.after(async () => { await safeRmDir(configDir); });
 
-  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir } });
+  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir, CC_COMPANION_AUTHORITY_ADAPTER: "active-profile-fixture" } });
   const result = await server.send(210, "cc_delegate", { task: "echo-args", model: "Opus" });
   const text = result.result.content[0].text;
   // Alias must be normalized to lowercase "opus" for the CLI
@@ -1925,7 +1959,7 @@ test("delegate records selectorKind and routeSnapshot in job state (v5)", async 
   fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
   t.after(async () => { await safeRmDir(configDir); });
 
-  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir } });
+  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir, CC_COMPANION_AUTHORITY_ADAPTER: "active-profile-fixture" } });
   await server.send(211, "cc_delegate", { task: "success", model: "glm-5.2-pro" });
   const jobs = listJobs(server.workspace);
   const job = jobs.find((j) => j.requestedModel === "glm-5.2-pro");
@@ -2052,7 +2086,7 @@ test("no implicit Opus → Fable auto-downgrade on failure", async (t) => {
   fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
   t.after(async () => { await safeRmDir(configDir); });
 
-  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir } });
+  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir, CC_COMPANION_AUTHORITY_ADAPTER: "active-profile-fixture" } });
   // Request Opus, but the fake claude fails
   const result = await server.send(217, "cc_delegate", { task: "nonzero", model: "Opus" });
   const text = result.result.content[0].text;
@@ -2274,6 +2308,30 @@ test("successful Claude output that echoes the task is redacted before artifact,
 
   const checkResult = await server.send(236, "cc_check", { job: job.id });
   assert.doesNotMatch(checkResult.result.content[0].text, /SUCCESS_ECHO_TASK_MARKER_8842/);
+});
+
+test("opaque profile credentials never survive successful or failed Claude output", async (t) => {
+  const opaqueCredential = "q7VxT2pL9mR4aB8cD6eF";
+  for (const [index, mode] of ["echo-profile-secret-error", "echo-profile-secret-success"].entries()) {
+    const server = startServer(t, { env: { FAKE_CLAUDE_MODE: mode } });
+    configureServerProfile(server, opaqueCredential);
+    const response = await server.send(240 + index, "cc_delegate", {
+      task: "Inspect profile credential redaction boundary with a detailed test.",
+      model: "Opus",
+    });
+    assert.doesNotMatch(JSON.stringify(response), new RegExp(opaqueCredential));
+
+    const job = listJobs(server.workspace).find((entry) =>
+      mode.endsWith("success") ? entry.status === "completed" : entry.status === "failed",
+    );
+    assert.ok(job, `mode ${mode} must create a terminal job`);
+    assert.doesNotMatch(JSON.stringify(job), new RegExp(opaqueCredential));
+    const artifact = readResultArtifact(server.workspace, job.id);
+    assert.ok(artifact);
+    const artifactJson = JSON.stringify(artifact);
+    assert.doesNotMatch(artifactJson, new RegExp(opaqueCredential));
+    assert.match(artifactJson, /\[TASK_REDACTED\]|\[TASK_BEARING_OUTPUT_REDACTED\]/);
+  }
 });
 
 // ─── Req 1 (structural): upsertJob strips task content even when passed ──────

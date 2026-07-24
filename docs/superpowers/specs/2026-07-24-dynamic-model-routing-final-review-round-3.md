@@ -26,7 +26,10 @@ The required third rework was implemented at `93ad3c2`; the final local
 closeout additionally verifies the success-output prompt boundary, migrates
 unversioned legacy state through the v6 privacy scrubber, preserves an explicit
 Provider-reported zero cost as evidence, validates fixture profile identities,
-and applies the private retention policy to standalone liveness artifacts.
+applies the private retention policy to standalone liveness artifacts, treats
+opaque credential-bearing profile values as runtime-only redaction markers, and
+requires an explicit fallback-adapter selection when cc-profile-switch is
+absent.
 
 Offline tests and source verification are the merge gate. A real liveness
 probe remains deliberately unrun: it is cost-bearing and requires post-install

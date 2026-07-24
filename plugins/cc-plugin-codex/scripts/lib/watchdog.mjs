@@ -130,12 +130,14 @@ async function main() {
     maxCaptureBytes = DEFAULT_MAX_CAPTURE,
     command = "claude",
     childEnv = null,
+    sensitiveMarkers = [],
     routeSnapshot = null,
     cliVersion = null,
     maxBudgetUsd = null
   } = config;
 
   maxCapture = maxCaptureBytes;
+  const redactionMarkers = [task, ...sensitiveMarkers.filter((value) => typeof value === "string")];
 
   if (!task) {
     process.stderr.write("[watchdog] Missing task\n");
@@ -212,7 +214,7 @@ async function main() {
         stdout: "",
         stderr: err.message,
         structuredError: false,
-        taskMarkers: [task],
+        taskMarkers: redactionMarkers,
       }),
     });
     exitWith(1);
@@ -252,7 +254,7 @@ async function main() {
         stdout: Buffer.concat(stdoutChunks).toString("utf8"),
         stderr: Buffer.concat(stderrChunks).toString("utf8"),
         structuredError: false,
-        taskMarkers: [task],
+        taskMarkers: redactionMarkers,
       }),
     });
     exitWith(1);
@@ -297,7 +299,7 @@ async function main() {
           errorDetail,
           stdout,
           stderr,
-          taskMarkers: [task],
+          taskMarkers: redactionMarkers,
         }),
       };
     }
@@ -339,7 +341,7 @@ async function main() {
           stdout,
           stderr,
           structuredError: false,
-          taskMarkers: [task],
+          taskMarkers: redactionMarkers,
         }),
       });
       exitWith(4);

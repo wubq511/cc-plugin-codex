@@ -9,11 +9,11 @@
  *       -> profiles/<safe-name>/claude-home/settings.json
  *       +  (common) api-settings.json
  *     The profile's claude-home becomes the child-only CLAUDE_CONFIG_DIR.
- *   When cc-profile-switch is absent, a Claude-settings adapter may read
- *     <CLAUDE_CONFIG_DIR>/settings.json, and an explicit active-profile.json
- *     fixture adapter remains available for tests/legacy. None of these is
- *   cached across jobs — every cc_delegate / cc_resolve_route / liveness
- *   probe re-reads the authority fresh.
+ *   When cc-profile-switch is absent, a fallback adapter is available only
+ *   when CC_COMPANION_AUTHORITY_ADAPTER explicitly selects `claude-settings`
+ *   or `active-profile-fixture`; it never activates from a stale file alone.
+ *   None of these is cached across jobs — every cc_delegate /
+ *   cc_resolve_route / liveness probe re-reads the authority fresh.
  *
  * Security boundaries:
  *   - Secrets (env values) exist only in the child environment, never in
@@ -85,6 +85,11 @@ const FORBIDDEN_INJECTED = Object.freeze(new Set([
 
 const ACTIVE_PROFILE_FILENAME = "active-profile.json";
 const CC_PROFILE_SWITCH_DEFAULT_DIRNAME = ".cc-profile-switch";
+export const AUTHORITY_ADAPTER_ENV = "CC_COMPANION_AUTHORITY_ADAPTER";
+const EXPLICIT_FALLBACK_ADAPTERS = Object.freeze(new Set([
+  "claude-settings",
+  "active-profile-fixture",
+]));
 
 // Bounding limits for validated fields.
 const MAX_PROFILE_NAME_LEN = 128;
@@ -92,6 +97,17 @@ const MAX_ENV_KEY_LEN = 128;
 const MAX_ENV_VAL_LEN = 8192;
 const MAX_ENV_ENTRIES = 128;
 const MAX_NATIVE_SELECTOR_LEN = 128;
+
+const NON_SECRET_PROFILE_ENV_KEYS = Object.freeze(new Set([
+  ...Object.values(ALIAS_TO_MODEL_ENV_KEY),
+  "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "DISABLE_AUTOUPDATER",
+]));
 
 /**
  * Allowed characters for a native model selector: letters, digits,
@@ -364,6 +380,27 @@ function filterAllowedEnv(rawEnv) {
     }
   }
   return { allowed, rejected };
+}
+
+/**
+ * Return values that must never reappear in Claude output, diagnostics, state,
+ * or artifacts. Profile configuration is untrusted: any allowed injected
+ * value other than a documented routing selector/control is treated as a
+ * credential-bearing secret. Parent credentials are included for bare-inherit
+ * runs, but the values never enter route snapshots or persistent state.
+ */
+function collectSensitiveMarkers(parentEnv, profile) {
+  const markers = new Set();
+  const add = (value) => {
+    if (typeof value === "string" && value.length > 0) markers.add(value);
+  };
+  for (const [key, value] of Object.entries(parentEnv || {})) {
+    if (/(?:^|_)(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH(?:ORIZATION)?|COOKIE)(?:$|_)/i.test(key)) add(value);
+  }
+  for (const [key, value] of Object.entries(profile?.secrets?.envVars || {})) {
+    if (!NON_SECRET_PROFILE_ENV_KEYS.has(key)) add(value);
+  }
+  return [...markers];
 }
 
 // ─── Alias / Display-Name Derivation ─────────────────────────────────────────
@@ -871,7 +908,7 @@ function validateProfileName(name) {
     throw configError("Invalid cc-profile-switch profile name");
   }
   if (/[\\/\0]/.test(name) || /[\x00-\x1f\x7f]/.test(name)) {
-    throw configError("cc-profile-switch profile name contains unsafe path characters");
+    throw configError("cc-profile-switch profile name contains unsafe path separators or control characters");
   }
   if (name === "." || name === ".." || name.startsWith(".")) {
     throw configError("cc-profile-switch profile name must not be dot-relative");
@@ -903,9 +940,8 @@ function validateProfileIdentity(value, label) {
 /**
  * Resolve the active authority fresh (no caching). Selection order:
  *   1. cc-profile-switch (if its config.json exists) — fail closed if broken
- *   2. active-profile.json fixture (explicit test/legacy compat)
- *   3. Claude settings.json adapter
- *   4. bare inherit (null)
+ *   2. an explicitly selected fallback adapter
+ *   3. bare inherit (null)
  *
  * @param {object} options
  * @param {object} [options.env] - environment (defaults to process.env)
@@ -926,14 +962,24 @@ export function readActiveAuthority({ env = process.env, claudeConfigDir } = {})
     return readCcProfileSwitch(ccpsHome);
   }
 
-  // 2. active-profile.json fixture (explicit test/legacy compat).
-  const fixturePath = path.join(configDir, ACTIVE_PROFILE_FILENAME);
-  if (pathExists(fixturePath)) {
-    return readActiveProfileFixture(configDir);
+  // Fallback authorities are opt-in. A stale fixture/settings file must not
+  // silently become the production route just because cc-profile-switch is
+  // absent. The selected adapter must exist and resolve safely.
+  const requestedAdapter = env?.[AUTHORITY_ADAPTER_ENV];
+  if (requestedAdapter === undefined || requestedAdapter === null || requestedAdapter === "") {
+    return null;
   }
-
-  // 3. Claude settings.json adapter.
-  return readClaudeSettingsAdapter(configDir);
+  if (!EXPLICIT_FALLBACK_ADAPTERS.has(requestedAdapter)) {
+    throw configError("CC_COMPANION_AUTHORITY_ADAPTER has an unsupported value");
+  }
+  if (requestedAdapter === "active-profile-fixture") {
+    const fixture = readActiveProfileFixture(configDir);
+    if (!fixture) throw configError("explicit active-profile fixture adapter is unavailable");
+    return fixture;
+  }
+  const settings = readClaudeSettingsAdapter(configDir);
+  if (!settings) throw configError("explicit Claude settings adapter is unavailable");
+  return settings;
 }
 
 /**
@@ -1109,11 +1155,15 @@ export function buildRouteSnapshot({ selector, profile, cliVersion }) {
  * unchanged — no stripping, no injection.
  */
 export function buildChildEnv(parentEnv, profile) {
+  // This selects the plugin's authority adapter, not Claude Code behavior.
+  // Never pass it into the delegated process.
+  const withoutPluginControl = { ...parentEnv };
+  delete withoutPluginControl[AUTHORITY_ADAPTER_ENV];
   if (!profile) {
-    return { ...parentEnv };
+    return withoutPluginControl;
   }
 
-  const env = { ...parentEnv };
+  const env = withoutPluginControl;
 
   // Fixed strip: remove ALL inherited ANTHROPIC_* + routing flags so stale
   // values from a long-lived Codex process can never survive.
@@ -1152,7 +1202,15 @@ export function resolveRoute({ claudeConfigDir, selectorInput, cliVersion, paren
   const selector = classifySelector(selectorInput, profile?.projection || null);
   const snapshot = buildRouteSnapshot({ selector, profile, cliVersion });
   const childEnv = buildChildEnv(parentEnv, profile);
-  return { selector, snapshot, childEnv, profile };
+  return {
+    selector,
+    snapshot,
+    childEnv,
+    profile,
+    // Runtime-only redaction material. It deliberately never appears in the
+    // projection, snapshot, job record, result graph, or MCP output.
+    sensitiveMarkers: collectSensitiveMarkers(parentEnv, profile),
+  };
 }
 
 /**

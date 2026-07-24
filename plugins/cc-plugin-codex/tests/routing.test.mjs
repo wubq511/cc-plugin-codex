@@ -37,6 +37,7 @@ import {
   buildChildEnv,
   resolveRoute,
   resolveRouteForDisplay,
+  AUTHORITY_ADAPTER_ENV,
 } from "../scripts/lib/routing.mjs";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -49,11 +50,13 @@ function makeTempDir() {
  * Build an isolated env object with CC_PROFILE_SWITCH_HOME and CLAUDE_CONFIG_DIR
  * pointed at temp dirs so tests never read the real user configuration.
  */
-function isolatedEnv(ccpsHome, claudeConfigDir) {
+function isolatedEnv(ccpsHome, claudeConfigDir, authorityAdapter = null) {
   return {
     ...process.env,
     CC_PROFILE_SWITCH_HOME: ccpsHome,
     CLAUDE_CONFIG_DIR: claudeConfigDir,
+    // Never inherit the developer's explicit fallback choice into a unit test.
+    [AUTHORITY_ADAPTER_ENV]: authorityAdapter || "",
   };
 }
 
@@ -334,7 +337,7 @@ test("stale inherited ANTHROPIC_* / Bedrock / Vertex never survive into child en
     const result = resolveRoute({
       selectorInput: null,
       cliVersion: null,
-      parentEnv: STALE_PARENT_ENV,
+      parentEnv: { ...STALE_PARENT_ENV, CC_COMPANION_AUTHORITY_ADAPTER: "claude-settings" },
       env: isolatedEnv(home, configDir),
     });
 
@@ -384,6 +387,33 @@ test("all inherited ANTHROPIC_* vars stripped even if not in profile envVars", (
   }
 });
 
+test("resolved routes keep opaque profile credentials only as runtime redaction markers", () => {
+  const home = makeTempDir();
+  const configDir = makeTempDir();
+  const opaqueCredential = "q7VxT2pL9mR4aB8cD6eF";
+  try {
+    makeCcpsHome(home, {
+      lastUsedProfile: "alpha",
+      profileEnv: {
+        ANTHROPIC_API_KEY: opaqueCredential,
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "deepseek-v4-pro",
+      },
+    });
+    const result = resolveRoute({
+      selectorInput: "Opus",
+      cliVersion: null,
+      parentEnv: {},
+      env: isolatedEnv(home, configDir),
+    });
+    assert.ok(result.sensitiveMarkers.includes(opaqueCredential));
+    assert.doesNotMatch(JSON.stringify(result.snapshot), new RegExp(opaqueCredential));
+    assert.doesNotMatch(JSON.stringify(result.profile.projection), new RegExp(opaqueCredential));
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
 test("bare inherit (no authority) passes parent env unchanged including stale vars", () => {
   const home = makeTempDir(); // empty — no config.json
   const configDir = makeTempDir(); // empty — no settings.json or fixture
@@ -397,6 +427,7 @@ test("bare inherit (no authority) passes parent env unchanged including stale va
     // No profile → bare inherit, no stripping
     assert.equal(result.childEnv.ANTHROPIC_API_KEY, "sk-stale-inherited");
     assert.equal(result.childEnv.CLAUDE_CODE_USE_BEDROCK, "1");
+    assert.equal(result.childEnv.CC_COMPANION_AUTHORITY_ADAPTER, undefined);
     assert.equal(result.profile, null);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
@@ -491,7 +522,7 @@ test("legacy fixture profile identity rejects secret-like values before projecti
       envVars: { ANTHROPIC_DEFAULT_OPUS_MODEL: "deepseek-v4-pro" },
     }));
     assert.throws(
-      () => readActiveAuthority({ env: isolatedEnv(home, configDir) }),
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir, "active-profile-fixture") }),
       /looks like a secret/i,
     );
   } finally {
@@ -554,7 +585,7 @@ test("arbitrary env keys (PATH, NODE_OPTIONS, FOO) are rejected", () => {
       },
     });
     assert.throws(
-      () => readActiveAuthority({ env: isolatedEnv(home, configDir) }),
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir, "claude-settings") }),
       /non-allowlisted keys/i
     );
   } finally {
@@ -576,7 +607,7 @@ test("stripInherited in profile settings.json is rejected", () => {
       "utf8"
     );
     assert.throws(
-      () => readActiveAuthority({ env: isolatedEnv(home, configDir) }),
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir, "claude-settings") }),
       /must not declare stripInherited/i
     );
   } finally {
@@ -599,7 +630,7 @@ test("HOME, USER, SHELL are rejected from profile env", () => {
       },
     });
     assert.throws(
-      () => readActiveAuthority({ env: isolatedEnv(home, configDir) }),
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir, "claude-settings") }),
       /non-allowlisted keys/i
     );
   } finally {
@@ -1016,7 +1047,7 @@ test("structuredContent has no secret-bearing fields", () => {
 
 // ─── §9  Active-Authority Fallback (claude-settings adapter) ──────────────────
 
-test("claude-settings adapter reads env from settings.json when cc-profile-switch absent", () => {
+test("claude-settings adapter reads env only when explicitly selected", () => {
   const home = makeTempDir(); // empty — no cc-profile-switch config.json
   const configDir = makeTempDir();
   try {
@@ -1025,13 +1056,26 @@ test("claude-settings adapter reads env from settings.json when cc-profile-switc
       JSON.stringify({ env: PROFILE_ALPHA_ENV }),
       "utf8"
     );
-    const profile = readActiveAuthority({ env: isolatedEnv(home, configDir) });
+    const profile = readActiveAuthority({ env: isolatedEnv(home, configDir, "claude-settings") });
     assert.ok(profile);
     assert.equal(profile.projection.sourceKind, "claude-settings");
     assert.equal(profile.projection.profileIdentity, null);
     assert.equal(profile.secrets.envVars.ANTHROPIC_API_KEY, "sk-alpha-secret-123");
     // claude-settings adapter does NOT set childClaudeConfigDir (inherits from parent)
     assert.equal(profile.childClaudeConfigDir, null);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+test("fallback files are ignored when cc-profile-switch is absent and no adapter is selected", () => {
+  const home = makeTempDir();
+  const configDir = makeTempDir();
+  try {
+    fs.writeFileSync(path.join(configDir, "settings.json"), JSON.stringify({ env: PROFILE_ALPHA_ENV }), "utf8");
+    writeActiveProfileFixture(configDir, SAMPLE_FIXTURE);
+    assert.equal(readActiveAuthority({ env: isolatedEnv(home, configDir) }), null);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(configDir, { recursive: true, force: true });
@@ -1048,7 +1092,7 @@ test("claude-settings adapter rejects arbitrary env keys", () => {
       "utf8"
     );
     assert.throws(
-      () => readActiveAuthority({ env: isolatedEnv(home, configDir) }),
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir, "claude-settings") }),
       /non-allowlisted keys/i
     );
   } finally {
@@ -1067,7 +1111,7 @@ test("claude-settings adapter rejects stripInherited", () => {
       "utf8"
     );
     assert.throws(
-      () => readActiveAuthority({ env: isolatedEnv(home, configDir) }),
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir, "claude-settings") }),
       /must not declare stripInherited/i
     );
   } finally {
@@ -1076,7 +1120,7 @@ test("claude-settings adapter rejects stripInherited", () => {
   }
 });
 
-test("claude-settings adapter returns null for empty env (bare inherit)", () => {
+test("explicit Claude-settings adapter rejects an empty settings authority", () => {
   const home = makeTempDir();
   const configDir = makeTempDir();
   try {
@@ -1085,8 +1129,10 @@ test("claude-settings adapter returns null for empty env (bare inherit)", () => 
       JSON.stringify({ someOtherField: "value" }),
       "utf8"
     );
-    const profile = readActiveAuthority({ env: isolatedEnv(home, configDir) });
-    assert.equal(profile, null);
+    assert.throws(
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir, "claude-settings") }),
+      /explicit Claude settings adapter is unavailable/i,
+    );
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(configDir, { recursive: true, force: true });
@@ -1168,15 +1214,29 @@ test("readActiveProfile fixture with non-allowlisted envVars fails closed", () =
   }
 });
 
-test("readActiveAuthority falls back to fixture when cc-profile-switch absent", () => {
+test("readActiveAuthority uses fixture only when explicitly selected", () => {
   const home = makeTempDir(); // empty — no cc-profile-switch
   const configDir = makeTempDir();
   try {
     writeActiveProfileFixture(configDir, SAMPLE_FIXTURE);
-    const profile = readActiveAuthority({ env: isolatedEnv(home, configDir) });
+    const profile = readActiveAuthority({ env: isolatedEnv(home, configDir, "active-profile-fixture") });
     assert.ok(profile);
     assert.equal(profile.projection.sourceKind, "active-profile-fixture");
     assert.equal(profile.projection.profileIdentity, "test-profile");
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+test("unsupported explicit fallback adapter fails closed", () => {
+  const home = makeTempDir();
+  const configDir = makeTempDir();
+  try {
+    assert.throws(
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir, "anything-else") }),
+      /unsupported value/i,
+    );
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(configDir, { recursive: true, force: true });
@@ -1581,7 +1641,7 @@ test("symlinked Claude settings.json escaping config dir fails closed", () => {
     const symlinkPath = path.join(configDir, "settings.json");
     fs.symlinkSync(outsideSettings, symlinkPath);
     assert.throws(
-      () => readActiveAuthority({ env: isolatedEnv(makeTempDir(), configDir) }),
+      () => readActiveAuthority({ env: isolatedEnv(makeTempDir(), configDir, "claude-settings") }),
       /escapes the authority root|symlink/i
     );
   } finally {
@@ -1606,7 +1666,7 @@ test("symlinked active-profile.json escaping config dir fails closed", () => {
     const symlinkPath = path.join(configDir, "active-profile.json");
     fs.symlinkSync(outsideProfile, symlinkPath);
     assert.throws(
-      () => readActiveAuthority({ env: isolatedEnv(makeTempDir(), configDir) }),
+      () => readActiveAuthority({ env: isolatedEnv(makeTempDir(), configDir, "active-profile-fixture") }),
       /escapes the authority root|symlink/i
     );
   } finally {

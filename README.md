@@ -72,6 +72,8 @@ codex plugin add cc-plugin-codex
 - **native**：如 `deepseek-v4-pro` / `glm-5.2`，原样透传
 - 不明确的模型家族描述会被拒绝（fail closed），不猜测不 fallback
 
+默认 authority 为 cc-profile-switch，且每次分派都会重新读取 active profile；切换 Provider 后下一次任务会使用新映射。没有 cc-profile-switch 时默认回到 bare inherit，不会静默采用残留本地文件。仅在兼容/测试场景显式设置 `CC_COMPANION_AUTHORITY_ADAPTER=claude-settings` 或 `active-profile-fixture` 后，才会读取对应 fallback 配置。
+
 通过 `effort` 参数指定推理强度。使用 `cc_resolve_route` 可在不发起模型调用的前提下预览模型路由解析结果。
 
 ### 查看状态
@@ -145,11 +147,11 @@ codex plugin add cc-plugin-codex
     │       ├── git.mjs            # Git 集成（diff、review context）
     │       ├── job-log.mjs        # Job 日志和阶段追踪
     │       ├── process.mjs        # 进程管理
-    │       ├── state.mjs          # Job 状态、writer lease 与保留策略（schema v5）
+    │       ├── state.mjs          # Job 状态、writer lease 与保留策略（schema v6）
     │       ├── model-evidence.mjs # 模型证据模块统一出口
     │       ├── model-evidence-collector.mjs # 有界 transcript 采集
     │       ├── model-evidence-formatter.mjs # 统一安全展示
-    │       ├── model-evidence-migration.mjs # v3 → v4 → v5 迁移
+    │       ├── model-evidence-migration.mjs # 模型证据迁移（状态 schema 迁移由 state.mjs 管理）
     │       ├── model-evidence-shared.mjs # 常量与规范化
     │       └── workspace.mjs      # 工作区解析
     ├── skills/                    # Codex skill 定义

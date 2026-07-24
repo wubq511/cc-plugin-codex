@@ -175,7 +175,7 @@ function taskLeakFragments(marker) {
  * catches both ASCII and Unicode task chunks while keeping the policy
  * deterministic and deliberately conservative.
  */
-function taskBearingLeakDetected(redacted, taskMarkers) {
+function taskBearingLeakDetected(redacted, taskMarkers, { failSafeShortMarkers = true } = {}) {
   const comparableRedacted = taskLeakComparable(redacted);
   for (const marker of taskMarkers) {
     if (typeof marker !== "string") continue;
@@ -185,7 +185,7 @@ function taskBearingLeakDetected(redacted, taskMarkers) {
     // Never attempt to preserve an arbitrary diagnostic for a short or
     // non-comparable task. The actual task is known sensitive input, unlike a
     // caller-supplied heuristic marker, so this conservative choice is safe.
-    if (m.length < MIN_TASK_MARKER_LEN || comparableMarker.length < MIN_TASK_MARKER_LEN) return true;
+    if (failSafeShortMarkers && (m.length < MIN_TASK_MARKER_LEN || comparableMarker.length < MIN_TASK_MARKER_LEN)) return true;
     if (
       comparableRedacted.includes(comparableMarker)
       // A CLI can label each emitted chunk (for example, "chunk: <token>").
@@ -230,10 +230,14 @@ function boundedFailSafe(originalText, maxBytes) {
  *
  * @param {string} text - The text to redact
  * @param {number} maxBytes - Maximum bytes to retain (default MAX_TAIL_BYTES)
- * @param {string[]} [taskMarkers=[]] - Task text fragments to redact
+ * @param {string[]} [taskMarkers=[]] - Sensitive text fragments to redact;
+ *   this includes the task plus runtime-only profile credential values
+ * @param {{ failSafeShortMarkers?: boolean }} [options] - Diagnostics retain
+ *   the conservative default; a successful result may opt out only after
+ *   literal replacement, so ordinary output for a short task is preserved.
  * @returns {string} Redacted, bounded text
  */
-export function redactText(text, maxBytes = MAX_TAIL_BYTES, taskMarkers = []) {
+export function redactText(text, maxBytes = MAX_TAIL_BYTES, taskMarkers = [], options = {}) {
   if (!text || typeof text !== "string") return "";
 
   let redacted = text;
@@ -276,7 +280,7 @@ export function redactText(text, maxBytes = MAX_TAIL_BYTES, taskMarkers = []) {
 
   // Fail-safe: replace the entire output with a bounded marker when a
   // task-bearing leak cannot be reliably removed from the persisted slice.
-  if (taskBearingLeakDetected(bounded, taskMarkers)) {
+  if (taskBearingLeakDetected(bounded, taskMarkers, options)) {
     return boundedFailSafe(text, maxBytes);
   }
 
