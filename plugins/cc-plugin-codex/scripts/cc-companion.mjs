@@ -369,9 +369,32 @@ function redactDiagnosticValue(value, markers) {
   if (typeof value === "string") return redactText(value, 2048, markers);
   if (Array.isArray(value)) return value.map((entry) => redactDiagnosticValue(entry, markers));
   if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, redactDiagnosticValue(entry, markers)]));
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => {
+      // `stage` is a plugin-owned enum, not Provider text. Preserve a valid
+      // value so a short user task cannot erase the diagnostic classification;
+      // any unexpected value remains subject to normal redaction.
+      if (key === "stage" && Object.values(FAILURE_STAGES).includes(entry)) {
+        return [key, entry];
+      }
+      return [key, redactDiagnosticValue(entry, markers)];
+    }));
   }
   return value;
+}
+
+/**
+ * Convert untrusted Provider wording into a bounded, non-verbatim reason.
+ * This supports remediation without exposing task text, credentials, or an
+ * arbitrary server response through a private artifact or an MCP summary.
+ */
+function classifySafeProviderReason(value) {
+  const text = String(value || "").toLowerCase();
+  if (/max[-_ ]?budget|budget.*(?:exceed|limit)|spend.*(?:cap|limit)/.test(text)) return "budget_rejected";
+  if (/unauthori[sz]ed|forbidden|authentication|api[_ -]?key|auth[_ -]?token|\b401\b|\b403\b/.test(text)) return "authentication_rejected";
+  if (/rate.?limit|too many requests|\b429\b|quota/.test(text)) return "rate_limited";
+  if (/(?:model|deployment).*(?:not found|unavailable|unsupported|invalid)|unknown model|\b404\b/.test(text)) return "model_unavailable";
+  if (/timeout|timed out|network|connect|dns|temporar/.test(text)) return "provider_unavailable";
+  return "unclassified";
 }
 
 function boundedTouchedFiles(files) {
@@ -2096,6 +2119,9 @@ async function handleSetup(params) {
           ? probeResult.cost
           : null;
         const costProvenance = honestCost != null ? "provider_reported" : "unknown";
+        const safeProviderReason = probeResult.ok
+          ? null
+          : classifySafeProviderReason(probeResult.error || probeResult.diagnostics?.errorDetail);
 
         // Persist a private, bounded, auditable liveness evidence artifact.
         // This is the ONLY place where detailed probe evidence is stored.
@@ -2111,6 +2137,7 @@ async function handleSetup(params) {
           duration: probeDurationSec,
           exitCode: probeResult.exitCode ?? null,
           failureStage: probeResult.failureStage || null,
+          safeProviderReason,
           cost: honestCost,
           costProvenance,
           usageModelKeys: probeUsageModelKeys,
@@ -2132,6 +2159,7 @@ async function handleSetup(params) {
           const probeStage = probeResult.failureStage || FAILURE_STAGES.PROVIDER_RESPONSE;
           lines.push(`❌ Provider liveness probe failed in ${probeDurationLabel}s`);
           lines.push(`- **Stage:** ${probeStage}`);
+          lines.push(`- **Failure reason:** ${safeProviderReason}`);
           lines.push(`- **Safe summary:** ${boundedText(buildSafeErrorMessage(probeStage, probeResult.error || "Unknown"), 500)}`);
           lines.push(`- **Route status:** ${describeRouteStatus(probeRouteStatus)}`);
           lines.push(`- **Private evidence:** artifact ${probeJobId} (route snapshot, model evidence, diagnostics)`);

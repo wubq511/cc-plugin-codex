@@ -2639,6 +2639,37 @@ test("liveness probe reports unknown cost (never $0.00) when telemetry is missin
   assert.ok(artifact.modelEvidence);
 });
 
+test("liveness probe preserves its plugin-owned stage while redacting short-task diagnostics", async (t) => {
+  const ccpsHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-probe-stage-"));
+  makeProbeProfile(ccpsHome);
+  t.after(async () => { await safeRmDir(ccpsHome); });
+
+  const server = startServer(t, {
+    env: {
+      CC_PROFILE_SWITCH_HOME: ccpsHome,
+      FAKE_CLAUDE_HELP_BUDGET_GUARD: "1",
+      FAKE_CLAUDE_MODE: "nonzero",
+    },
+  });
+
+  const response = await server.send(239, "cc_setup", {
+    livenessProbe: true,
+    timeoutSeconds: 10,
+    maxBudgetUsd: 0.05,
+  });
+  const text = response.result.content[0].text;
+  assert.match(text, /Stage:\*\* provider_response/i);
+  assert.match(text, /Failure reason:\*\* unclassified/i);
+
+  const probeId = text.match(/Probe ID:\*\* (probe-[a-z0-9-]+)/i)?.[1];
+  assert.ok(probeId);
+  const artifact = readResultArtifact(server.workspace, probeId);
+  assert.equal(artifact.failureStage, "provider_response");
+  assert.equal(artifact.safeProviderReason, "unclassified");
+  assert.equal(artifact.diagnostics.stage, "provider_response");
+  assert.doesNotMatch(JSON.stringify(artifact.diagnostics), /Reply with exactly: OK/);
+});
+
 test("liveness probe preserves an explicit Provider-reported zero cost", async (t) => {
   const ccpsHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-probe-zero-cost-"));
   t.after(async () => { await safeRmDir(ccpsHome); });
