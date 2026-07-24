@@ -555,9 +555,10 @@ function readCcProfileSwitch(home) {
   // Authority schema version check — unknown future versions fail closed
   // before any profile path is resolved or Claude is spawned.
   if (config.version === undefined || config.version !== 1) {
-    throw configError(
-      `cc-profile-switch config.json has unsupported version (expected 1, found ${JSON.stringify(config.version)})`
-    );
+    // Treat configuration as untrusted input: do not include a malformed or
+    // attacker-controlled version value in an error that may reach a private
+    // diagnostic artifact.
+    throw configError("cc-profile-switch config.json has an unsupported version");
   }
 
   const lastUsedProfile = config.lastUsedProfile;
@@ -727,7 +728,10 @@ function readActiveProfileFixture(claudeConfigDir) {
   assertFileSafe(profilePath, claudeConfigDir, "active-profile.json");
   const parsed = readJsonFile(profilePath, "active-profile.json");
 
-  const profileIdentity = validateStringField(parsed, "profileIdentity");
+  const profileIdentity = validateProfileIdentity(
+    validateStringField(parsed, "profileIdentity"),
+    "active-profile.json profileIdentity",
+  );
   const fixtureAliasMappings = validateStringMap(parsed, "aliasMappings");
   const fixtureNativeDisplayNames = validateStringMap(parsed, "nativeDisplayNames");
   const rawEnvVars = validateStringMap(parsed, "envVars");
@@ -864,14 +868,34 @@ function validateStringMap(obj, name) {
  */
 function validateProfileName(name) {
   if (typeof name !== "string" || !name.length || name.length > MAX_PROFILE_NAME_LEN) {
-    throw configError(`Invalid cc-profile-switch profile name: ${JSON.stringify(name)}`);
+    throw configError("Invalid cc-profile-switch profile name");
   }
-  if (/[\\/\0]/.test(name)) {
-    throw configError(`cc-profile-switch profile name must not contain path separators: ${JSON.stringify(name)}`);
+  if (/[\\/\0]/.test(name) || /[\x00-\x1f\x7f]/.test(name)) {
+    throw configError("cc-profile-switch profile name contains unsafe path characters");
   }
   if (name === "." || name === ".." || name.startsWith(".")) {
-    throw configError(`cc-profile-switch profile name must not be a dot-relative segment: ${JSON.stringify(name)}`);
+    throw configError("cc-profile-switch profile name must not be dot-relative");
   }
+  if (SECRET_LIKE_RE.test(name)) {
+    throw configError("cc-profile-switch profile name looks like a secret and was rejected");
+  }
+}
+
+/**
+ * Validate a profile label that may be displayed in a route snapshot. Unlike
+ * `validateProfileName`, a fixture identity is not a filesystem segment, but
+ * it is still untrusted configuration and must never carry a secret or a
+ * control character into diagnostics/MCP output.
+ */
+function validateProfileIdentity(value, label) {
+  if (value === null) return null;
+  if (typeof value !== "string" || !value.trim() || /[\x00-\x1f\x7f]/.test(value)) {
+    throw configError(`${label} is invalid`);
+  }
+  if (SECRET_LIKE_RE.test(value)) {
+    throw configError(`${label} looks like a secret and was rejected`);
+  }
+  return value;
 }
 
 // ─── Authority Dispatcher ────────────────────────────────────────────────────

@@ -57,7 +57,7 @@ import {
   readActiveAuthority, ProfileResolutionError
 } from "./lib/routing.mjs";
 import {
-  buildSafeErrorMessage, buildSafeErrorSummary, FAILURE_STAGES, buildFailureEnvelope
+  buildSafeErrorMessage, buildSafeErrorSummary, FAILURE_STAGES, buildFailureEnvelope, redactText
 } from "./lib/diagnostics.mjs";
 import {
   computeRouteStatus, ROUTE_STATUSES, describeRouteStatus
@@ -959,8 +959,12 @@ async function handleDelegate(params, context = {}) {
     });
 
     // Store full result as separate artifact
+    // A successful Provider result can quote or repeat the delegated task.
+    // Apply the same task-aware, fail-safe redaction before *any* persistence
+    // or MCP presentation, not only on the failure-diagnostics path.
+    const safeResult = redactText(result.result, Number.POSITIVE_INFINITY, [task]);
     const resultArtifactPath = writeResultArtifact(workspaceRoot, jobId, {
-      result: result.result,
+      result: safeResult,
       sessionId: result.sessionId,
       cost: result.cost,
       duration: result.duration,
@@ -975,8 +979,8 @@ async function handleDelegate(params, context = {}) {
     });
 
     // Build truncation metadata
-    const presentation = truncateForPresentation(result.result);
-    const metadataPresentation = truncateForPresentation(result.result, MAX_JOB_RESULT_BYTES);
+    const presentation = truncateForPresentation(safeResult);
+    const metadataPresentation = truncateForPresentation(safeResult, MAX_JOB_RESULT_BYTES);
     const truncation = presentation.truncated
       ? { originalSize: presentation.originalSize, presentationLimit: MAX_MCP_RESULT_BYTES }
       : null;
@@ -1054,8 +1058,8 @@ async function handleDelegate(params, context = {}) {
     const failureArtifactPath = writeResultArtifact(workspaceRoot, jobId, {
       result: null,
       sessionId: result.sessionId || null,
-      cost: result.cost || null,
-      duration: result.duration || null,
+      cost: result.cost ?? null,
+      duration: result.duration ?? null,
       usageModelKeys: result.usageModelKeys || [],
       exitCode: result.exitCode,
       requestedModel: storedRequestedModel,
@@ -1874,7 +1878,8 @@ async function handleSetup(params) {
       profileResolvable = true;
     }
   } catch (err) {
-    lines.push(`❌ Active authority is corrupt or unreadable: ${err.message}`);
+    lines.push(`❌ Active authority is corrupt or unreadable.`);
+    lines.push(`   ${buildSafeErrorSummary(FAILURE_STAGES.CONFIGURATION, err.message)}`);
     lines.push(`   No fallback profile is used. Fix the configuration or remove it for bare inheritance.`);
   }
 
@@ -1934,9 +1939,10 @@ async function handleSetup(params) {
       // All prerequisites met — resolve the route (with model selector if provided)
       // and run the probe with the budget guard.
       const probeJobId = generateJobId("probe");
+      let probeRoute = null;
+      let probeStartedAt = null;
       try {
         const claudeConfigDir = resolveClaudeConfigDir();
-        let probeRoute;
         try {
           probeRoute = resolveRoute({
             claudeConfigDir,
@@ -1976,11 +1982,31 @@ async function handleSetup(params) {
 
         const probeTask = "Reply with exactly: OK";
         const probeStart = Date.now();
+        probeStartedAt = new Date(probeStart).toISOString();
         if (probeRoute.selector.kind !== "inherited") {
           lines.push(`- **Model selector:** ${probeRoute.selector.kind} → ${probeRoute.selector.cliArg || "(inherited)"}`);
         }
         lines.push(`- **Budget guard:** --max-budget-usd ${probeMaxBudgetUsd}`);
         lines.push(`- **Probe ID:** ${probeJobId}`);
+
+        // Create the audit record before a paid Provider call. If a later
+        // runner/collection step throws, the route and explicit budget remain
+        // auditable rather than disappearing with the exception.
+        writeResultArtifact(workspaceRoot, probeJobId, {
+          probeId: probeJobId,
+          timestamp: probeStartedAt,
+          phase: "started",
+          ok: null,
+          routeSnapshot: probeRoute.snapshot,
+          routeStatus: null,
+          modelEvidence: { status: "unavailable", executedModels: [], usageModelKeys: [], warnings: ["probe-started"] },
+          duration: null,
+          exitCode: null,
+          failureStage: null,
+          cost: null,
+          costProvenance: "unknown",
+          usageKeyIsNotExecutionProof: true,
+        });
 
         const probeExecution = runClaude(probeTask, {
           cwd: workspaceRoot,
@@ -2031,9 +2057,9 @@ async function handleSetup(params) {
           usageModelKeys: probeModelEvidence.usageModelKeys,
         });
 
-        // Honest cost: null when telemetry is missing or zero. Never
-        // display "$0.00" for a probe — that would imply the probe was free.
-        const honestCost = (probeResult.cost != null && Number.isFinite(probeResult.cost) && probeResult.cost > 0)
+        // Honest cost: explicit Provider-reported zero is still evidence and
+        // must remain zero. Only missing/invalid telemetry is unknown.
+        const honestCost = (probeResult.cost != null && Number.isFinite(probeResult.cost))
           ? probeResult.cost
           : null;
         const costProvenance = honestCost != null ? "provider_reported" : "unknown";
@@ -2075,7 +2101,44 @@ async function handleSetup(params) {
           lines.push(`- **Private evidence:** artifact ${probeJobId} (route snapshot, model evidence, diagnostics)`);
         }
       } catch (err) {
-        // Req 5: don't echo raw error text in the summary line.
+        // Req 5: don't echo raw error text in the summary line. Best-effort
+        // finalization preserves a pre-created artifact when execution failed
+        // after the explicit budget was accepted.
+        try {
+          const duration = probeStartedAt ? Math.max(0, (Date.now() - Date.parse(probeStartedAt)) / 1000) : 0;
+          writeResultArtifact(workspaceRoot, probeJobId, {
+            probeId: probeJobId,
+            timestamp: new Date().toISOString(),
+            phase: "infrastructure_error",
+            ok: false,
+            routeSnapshot: probeRoute?.snapshot || null,
+            routeStatus: probeRoute?.snapshot ? ROUTE_STATUSES.REJECTED : null,
+            modelEvidence: { status: "unavailable", executedModels: [], usageModelKeys: [], warnings: ["probe-exception"] },
+            duration,
+            exitCode: null,
+            failureStage: FAILURE_STAGES.PROVIDER_RESPONSE,
+            cost: null,
+            costProvenance: "unknown",
+            usageKeyIsNotExecutionProof: true,
+            diagnostics: buildFailureEnvelope({
+              stage: FAILURE_STAGES.PROVIDER_RESPONSE,
+              requestedSelector: null,
+              effort: "low",
+              cliVersion,
+              exitCode: null,
+              signal: null,
+              durationMs: Math.round(duration * 1000),
+              structuredError: false,
+              sessionId: null,
+              usageKey: null,
+              transcriptFound: false,
+              errorDetail: err?.message || "liveness probe infrastructure error",
+              stdout: "",
+              stderr: "",
+              taskMarkers: ["Reply with exactly: OK"],
+            }),
+          });
+        } catch { /* the pre-call artifact remains if finalization itself fails */ }
         lines.push(`❌ Liveness probe error (probe ID: ${probeJobId}).`);
         lines.push(`   ${buildSafeErrorSummary(FAILURE_STAGES.PROVIDER_RESPONSE, err.message)}`);
       }

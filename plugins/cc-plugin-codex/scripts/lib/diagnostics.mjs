@@ -39,9 +39,7 @@ const VALID_STAGES = new Set(Object.values(FAILURE_STAGES));
 
 const MAX_TAIL_BYTES = 2048; // 2 KiB per stream tail
 const MAX_SAFE_ERROR_BYTES = 4096; // 4 KiB for safe error message
-const MIN_TASK_MARKER_LEN = 8; // shorter markers are not exact-redacted (false-positive risk)
-const TASK_FRAGMENT_LEN = 12; // distinctive alphanumeric fragment triggering fail-safe if it survives
-const TASK_SPAN_WINDOW = 20; // contiguous-span length used to detect chunked prose echoes
+const MIN_TASK_MARKER_LEN = 8;
 const TASK_BEARING_REDACTED_MARKER = "[TASK_BEARING_OUTPUT_REDACTED]";
 
 // ─── Redaction Patterns ──────────────────────────────────────────────────────
@@ -109,6 +107,12 @@ function taskRedactionVariants(marker) {
       .replace(/\r/g, "\\n")
       .replace(/\t/g, "\\t")
   );
+  // Some JSON encoders escape non-ASCII code units even though
+  // JSON.stringify() normally preserves them. Include that representation so
+  // a Chinese/Japanese/etc. prompt cannot evade the JSON-escaped path.
+  variants.add(marker.replace(/[\u0080-\uFFFF]/g, (char) => (
+    `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`
+  )));
   const collapsed = marker.replace(/\s+/g, " ").trim();
   variants.add(collapsed);
   try {
@@ -121,6 +125,43 @@ function taskRedactionVariants(marker) {
   return variants;
 }
 
+/**
+ * Convert text to the conservative comparison form used only to detect a
+ * possible task leak. Removing separators catches task chunks emitted with
+ * punctuation, line breaks, or spacing inserted between pieces. It is not a
+ * semantic matcher: false positives merely select the safe generic marker.
+ */
+function taskLeakComparable(value) {
+  if (typeof value !== "string") return "";
+  return value
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+/** Return true when every character of needle appears in haystack in order. */
+function isOrderedSubsequence(needle, haystack) {
+  let offset = 0;
+  for (const char of haystack) {
+    if (char === needle[offset]) offset += 1;
+    if (offset === needle.length) return true;
+  }
+  return false;
+}
+
+/**
+ * Return long task identifier fragments while retaining `_`/`-` inside a
+ * token. A provider may echo only a distinctive identifier from a larger
+ * task, so whole-task matching alone is insufficient.
+ */
+function taskLeakFragments(marker) {
+  if (typeof marker !== "string") return [];
+  return marker
+    .split(/[^\p{L}\p{N}_-]+/gu)
+    .map(taskLeakComparable)
+    .filter((fragment) => fragment.length >= MIN_TASK_MARKER_LEN);
+}
+
 // ─── Fail-Safe Leak Detection ────────────────────────────────────────────────
 
 /**
@@ -128,46 +169,32 @@ function taskRedactionVariants(marker) {
  * remove. Returns true when the output cannot be safely rendered and must be
  * replaced with the generic fail-safe marker.
  *
- * Triggers:
- *   1. A short task marker (< MIN_TASK_MARKER_LEN) appears verbatim in the
- *      redacted text. Short markers cannot be removed without false-positive
- *      risk, so any verbatim presence forces a fail-safe.
- *   2. A distinctive long alphanumeric fragment (>= TASK_FRAGMENT_LEN) of a
- *      long marker survives — indicates a chunked or partially-escaped echo
- *      that variant matching missed.
- *   3. A long contiguous span (>= TASK_SPAN_WINDOW) of a long marker with
- *      enough alpha content survives — catches chunked prose echoes.
+ * A real short delegated task has too little entropy to distinguish safely
+ * from ordinary diagnostics, so diagnostics for it always fail safe. For
+ * longer tasks, compare letters/numbers after separators are removed. This
+ * catches both ASCII and Unicode task chunks while keeping the policy
+ * deterministic and deliberately conservative.
  */
-function taskBearingLeakDetected(redacted, taskMarkers, shortTaskPresent) {
-  if (shortTaskPresent) {
-    for (const marker of taskMarkers) {
-      if (typeof marker !== "string") continue;
-      const m = marker.trim();
-      if (m.length > 0 && m.length < MIN_TASK_MARKER_LEN && redacted.includes(m)) {
-        return true;
-      }
-    }
-  }
+function taskBearingLeakDetected(redacted, taskMarkers) {
+  const comparableRedacted = taskLeakComparable(redacted);
   for (const marker of taskMarkers) {
     if (typeof marker !== "string") continue;
     const m = marker.trim();
-    if (m.length < MIN_TASK_MARKER_LEN) continue;
-    const normMarker = m.replace(/\s+/g, " ").trim();
-    const normRedacted = redacted.replace(/\s+/g, " ");
-    // Distinctive alphanumeric fragment survival (chunked identifier echo).
-    const re = new RegExp(`[A-Za-z0-9_]{${TASK_FRAGMENT_LEN},}`, "g");
-    let match;
-    while ((match = re.exec(normMarker)) !== null) {
-      if (normRedacted.includes(match[0])) return true;
-    }
-    // Long contiguous span survival (chunked prose echo). The window must
-    // contain a run of alpha characters long enough to be distinctive.
-    if (normMarker.length >= TASK_SPAN_WINDOW) {
-      for (let i = 0; i + TASK_SPAN_WINDOW <= normMarker.length; i++) {
-        const win = normMarker.slice(i, i + TASK_SPAN_WINDOW);
-        if (/[A-Za-z]{8,}/.test(win) && normRedacted.includes(win)) return true;
-      }
-    }
+    if (!m) continue;
+    const comparableMarker = taskLeakComparable(m);
+    // Never attempt to preserve an arbitrary diagnostic for a short or
+    // non-comparable task. The actual task is known sensitive input, unlike a
+    // caller-supplied heuristic marker, so this conservative choice is safe.
+    if (m.length < MIN_TASK_MARKER_LEN || comparableMarker.length < MIN_TASK_MARKER_LEN) return true;
+    if (
+      comparableRedacted.includes(comparableMarker)
+      // A CLI can label each emitted chunk (for example, "chunk: <token>").
+      // Exact normalized containment misses that form, but ordered
+      // subsequence detection remains bounded and conservatively replaces the
+      // whole diagnostic rather than risking task disclosure.
+      || isOrderedSubsequence(comparableMarker, comparableRedacted)
+    ) return true;
+    if (taskLeakFragments(m).some((fragment) => comparableRedacted.includes(fragment))) return true;
   }
   return false;
 }
@@ -210,19 +237,14 @@ export function redactText(text, maxBytes = MAX_TAIL_BYTES, taskMarkers = []) {
   if (!text || typeof text !== "string") return "";
 
   let redacted = text;
-  let shortTaskPresent = false;
   const longVariants = [];
 
   for (const marker of taskMarkers) {
     if (typeof marker !== "string") continue;
     const m = marker.trim();
     if (!m) continue;
-    if (m.length < MIN_TASK_MARKER_LEN) {
-      shortTaskPresent = true;
-      continue;
-    }
     for (const v of taskRedactionVariants(marker)) {
-      if (v.length >= MIN_TASK_MARKER_LEN) longVariants.push(v);
+      if (v.length > 0) longVariants.push(v);
     }
   }
 
@@ -254,7 +276,7 @@ export function redactText(text, maxBytes = MAX_TAIL_BYTES, taskMarkers = []) {
 
   // Fail-safe: replace the entire output with a bounded marker when a
   // task-bearing leak cannot be reliably removed from the persisted slice.
-  if (taskBearingLeakDetected(bounded, taskMarkers, shortTaskPresent)) {
+  if (taskBearingLeakDetected(bounded, taskMarkers)) {
     return boundedFailSafe(text, maxBytes);
   }
 

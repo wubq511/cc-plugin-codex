@@ -330,9 +330,28 @@ export function reconcileOrphans(cwd) {
  * Idempotent — v6 jobs pass through unchanged.
  */
 function migrateJob(job) {
-  if (!job || job.version >= STATE_VERSION) return job;
+  if (!job) return job;
 
-  let migrated = job;
+  // Jobs written before explicit per-job schema tagging are v3-era records.
+  // Treat absent, malformed, and older values as the oldest supported schema
+  // so the v5→v6 task-content scrub always runs. Never trust a future or
+  // current version label to exempt a record that still carries task fields.
+  const declaredVersion = Number.isInteger(job.version) && job.version >= 3
+    ? job.version
+    : 3;
+  let migrated = declaredVersion === job.version ? job : { ...job, version: declaredVersion };
+
+  if (declaredVersion >= STATE_VERSION) {
+    if (Object.prototype.hasOwnProperty.call(migrated, "task") || Object.prototype.hasOwnProperty.call(migrated, "taskPreview")) {
+      migrated = { ...migrated };
+      delete migrated.task;
+      delete migrated.taskPreview;
+      if (migrated.taskRef === undefined) {
+        migrated.taskRef = migrated.taskHash ? `sha256:${String(migrated.taskHash).slice(0, 12)}` : null;
+      }
+    }
+    return migrated;
+  }
 
   // v3 → v4: model evidence restructure
   if (migrated.version < 4) {
@@ -431,7 +450,7 @@ export function listJobs(cwd) {
         // Migrate v3 → v4 on read
         const migrated = migrateV3Job(job);
         // Atomic write-back: persist v4 migration to disk so observedModel is removed
-        if (migrated.version !== job.version) {
+        if (migrated !== job) {
           try { writeJobFile(cwd, job.id, migrated); } catch { /* best effort */ }
         }
         jobs.push(migrated);
@@ -632,6 +651,11 @@ export function cleanupOldJobs(cwd) {
     }
   }
 
+  // Liveness probes are intentionally auditable even if the watchdog never
+  // creates a normal job. They therefore need their own retention pass: they
+  // must not outlive the same 30-day private-evidence window as terminal jobs.
+  pruneStandaloneProbeArtifacts(jobsDir, now, maxAgeMs);
+
   // Prune by count (oldest terminal jobs first, after 30-day age pruning)
   const remaining = listJobs(cwd);
   if (remaining.length > MAX_JOBS) {
@@ -692,6 +716,42 @@ function enforceTotalArtifactCap(cwd) {
       } catch { /* already absent */ }
     }
   }
+
+  // A probe artifact has no mutable job record by design, so it is safe to
+  // prune only after every eligible terminal job bundle has been considered.
+  // This keeps active/orphaned job evidence protected while still making the
+  // global 100 MiB cap truthful for all files in the private jobs directory.
+  if (totalBytes > MAX_TOTAL_ARTIFACTS_BYTES) {
+    const probes = listStandaloneProbeArtifacts(jobsDir);
+    for (const probe of probes) {
+      if (totalBytes <= MAX_TOTAL_ARTIFACTS_BYTES) break;
+      removeFileIfExists(probe.path);
+      totalBytes -= probe.size;
+    }
+  }
+}
+
+function listStandaloneProbeArtifacts(jobsDir) {
+  if (!fs.existsSync(jobsDir)) return [];
+  try {
+    return fs.readdirSync(jobsDir)
+      .filter((name) => /^probe-[a-z0-9-]+\.result\.json$/i.test(name))
+      .map((name) => {
+        const probePath = path.join(jobsDir, name);
+        const stat = fs.statSync(probePath);
+        return { path: probePath, mtimeMs: stat.mtimeMs, size: stat.size };
+      })
+      .filter((entry) => Number.isFinite(entry.mtimeMs) && Number.isFinite(entry.size))
+      .sort((a, b) => a.mtimeMs - b.mtimeMs);
+  } catch {
+    return [];
+  }
+}
+
+function pruneStandaloneProbeArtifacts(jobsDir, now, maxAgeMs) {
+  for (const probe of listStandaloneProbeArtifacts(jobsDir)) {
+    if ((now - probe.mtimeMs) > maxAgeMs) removeFileIfExists(probe.path);
+  }
 }
 
 // ─── Backward Compat (used by existing tests) ───────────────────────────────
@@ -705,8 +765,8 @@ export function readJobFile(filePath) {
 }
 
 export function writeJobFileDirect(cwd, jobId, payload) {
-  ensureStateDir(cwd);
-  const jobFile = resolveJobFile(cwd, jobId);
-  writeFileAtomic(jobFile, JSON.stringify(payload, null, 2));
-  return jobFile;
+  // Compatibility helper used by tests must obey the same privacy choke point
+  // as production writers.
+  writeJobFile(cwd, jobId, payload);
+  return resolveJobFile(cwd, jobId);
 }

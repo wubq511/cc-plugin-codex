@@ -482,6 +482,24 @@ test("profile name starting with dot fails closed", () => {
   }
 });
 
+test("legacy fixture profile identity rejects secret-like values before projection", () => {
+  const home = makeTempDir();
+  const configDir = makeTempDir();
+  try {
+    fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify({
+      profileIdentity: "sk-fixture-secret-1234567890",
+      envVars: { ANTHROPIC_DEFAULT_OPUS_MODEL: "deepseek-v4-pro" },
+    }));
+    assert.throws(
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir) }),
+      /looks like a secret/i,
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
 test("missing profile directory fails closed", () => {
   const home = makeTempDir();
   const configDir = makeTempDir();

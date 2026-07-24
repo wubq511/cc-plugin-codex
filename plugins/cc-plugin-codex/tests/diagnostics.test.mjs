@@ -9,6 +9,7 @@ import {
   buildSafeErrorSummary,
   buildSafeErrorMessage,
   isValidStage,
+  TASK_BEARING_REDACTED,
 } from "../scripts/lib/diagnostics.mjs";
 
 // ─── Failure Stage Enum ──────────────────────────────────────────────────────
@@ -305,14 +306,14 @@ test("redactText without taskMarkers retains ordinary text", () => {
   assert.match(redacted, /model not found/);
 });
 
-test("redactText does not false-fail-safe when a short marker is absent from output", () => {
-  // A short task marker that does NOT appear in the diagnostic must not
-  // trigger a fail-safe — ordinary diagnostics remain useful.
+test("redactText fails safe for every short delegated task", () => {
+  // A real short task has insufficient entropy to distinguish safely from an
+  // ordinary diagnostic. The conservative policy never stores raw tails.
   const shortMarker = "short";
   const text = `Error: model not found (HTTP 404)`;
   const redacted = redactText(text, 2048, [shortMarker]);
-  assert.match(redacted, /model not found/);
-  assert.doesNotMatch(redacted, /\[TASK_BEARING_OUTPUT_REDACTED\]/);
+  assert.match(redacted, /\[TASK_BEARING_OUTPUT_REDACTED\]/);
+  assert.doesNotMatch(redacted, /model not found/);
 });
 
 test("redactText fail-safes when a short task marker is echoed verbatim", () => {
@@ -334,6 +335,28 @@ test("redactText handles regex-special characters in task markers safely", () =>
   const redacted = redactText(stderr, 2048, [taskMarker]);
   assert.doesNotMatch(redacted, /\[sanitize\]/);
   assert.match(redacted, /\[TASK_REDACTED\]/);
+});
+
+test("redactText fails safe for a short JSON-escaped task", () => {
+  const task = "a\nb";
+  const output = `Provider error: ${JSON.stringify(task)}`;
+  const redacted = redactText(output, 2048, [task]);
+  assert.equal(redacted.startsWith(TASK_BEARING_REDACTED), true);
+  assert.doesNotMatch(redacted, /a\\nb/);
+});
+
+test("redactText fails safe for separator-chunked ASCII and Unicode tasks", () => {
+  const asciiTask = "ROUTEPRIVACYMARKER2026";
+  const asciiOutput = asciiTask.match(/.{1,5}/g).join("|");
+  const asciiRedacted = redactText(`Provider error: ${asciiOutput}`, 2048, [asciiTask]);
+  assert.equal(asciiRedacted.startsWith(TASK_BEARING_REDACTED), true);
+  assert.doesNotMatch(asciiRedacted, /ROUTEPRIVACYMARKER2026/);
+
+  const unicodeTask = "请修复路由隐私边界测试";
+  const unicodeOutput = unicodeTask.match(/.{1,4}/g).join("|");
+  const unicodeRedacted = redactText(`Provider error: ${unicodeOutput}`, 2048, [unicodeTask]);
+  assert.equal(unicodeRedacted.startsWith(TASK_BEARING_REDACTED), true);
+  assert.doesNotMatch(unicodeRedacted, /请修复路由隐私边界测试/);
 });
 
 test("buildFailureEnvelope with taskMarkers redacts task text from all tails", () => {

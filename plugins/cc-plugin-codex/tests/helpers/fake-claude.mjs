@@ -35,6 +35,7 @@
  *                         ECHO_TASK_ENCODING (raw|json|escaped-newline|whitespace-normalized|chunked|short),
  *                         exit non-zero (tests multi-encoding task redaction + fail-safe)
  *   success-no-cost     — return fake result with NO total_cost_usd (tests honest null cost)
+ *   success-reported-zero-cost — return fake result with explicit total_cost_usd=0
  */
 
 const args = process.argv.slice(2);
@@ -190,6 +191,15 @@ function handleMode(mode) {
     process.stdout.write(JSON.stringify({
       result: "OK",
       session_id: "fake-session-no-cost",
+      duration_ms: 15,
+      modelUsage: { [execModel]: {} }
+    }));
+  } else if (mode === "success-reported-zero-cost") {
+    const execModel = process.env.EXEC_MODEL || "mimo-v2.5";
+    process.stdout.write(JSON.stringify({
+      result: "OK",
+      session_id: "fake-session-reported-zero-cost",
+      total_cost_usd: 0,
       duration_ms: 15,
       modelUsage: { [execModel]: {} }
     }));

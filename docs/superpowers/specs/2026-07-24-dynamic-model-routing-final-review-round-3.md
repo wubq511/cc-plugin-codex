@@ -1,8 +1,8 @@
 # Dynamic Model Routing — Final Review Round 3
 
-> Status: **required rework before merge**.
+> Status: **implemented and locally verified; awaiting merge/install and an explicitly authorized paid liveness probe**.
 >
-> Reviewed branch: `glm/dynamic-model-routing@b392b52`
+> Reviewed branch: `glm/dynamic-model-routing@93ad3c2`, with final closeout fixes pending commit.
 >
 > Baseline: `main@9871d75`
 >
@@ -19,6 +19,19 @@ It nevertheless leaves two P0 secret/prompt-boundary violations and several
 evidence-contract defects. This is a focused third rework on the same branch,
 not a new architecture or a new ticket. Do not merge, push, reinstall the
 plugin, change global Provider configuration, or run a paid liveness probe.
+
+## Local closure update
+
+The required third rework was implemented at `93ad3c2`; the final local
+closeout additionally verifies the success-output prompt boundary, migrates
+unversioned legacy state through the v6 privacy scrubber, preserves an explicit
+Provider-reported zero cost as evidence, validates fixture profile identities,
+and applies the private retention policy to standalone liveness artifacts.
+
+Offline tests and source verification are the merge gate. A real liveness
+probe remains deliberately unrun: it is cost-bearing and requires post-install
+explicit authorization. Neither a successful offline fake-Claude run nor a
+usage key is claimed as proof of a paid Provider execution.
 
 ## Verified evidence
 

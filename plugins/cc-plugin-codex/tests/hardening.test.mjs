@@ -380,8 +380,8 @@ test("workspace changes are observed via before/after fingerprint comparison", a
 // ─── P0: is_error Handling ───────────────────────────────────────────────────
 
 test("Claude is_error JSON produces failed job even with exit code zero", async (t) => {
-  const server = startServer(t);
-  const result = await server.send(1, "cc_delegate", { task: "is_error" });
+  const server = startServer(t, { env: { FAKE_CLAUDE_MODE: "is_error" } });
+  const result = await server.send(1, "cc_delegate", { task: "exercise structured error handling safely" });
   assert.match(result.result.content[0].text, /Task Failed/);
   // MCP output shows safe summary, not raw error detail
   assert.match(result.result.content[0].text, /\[provider_response\]/);
@@ -931,6 +931,20 @@ test("artifact cap never removes active job diagnostics", async (t) => {
   cleanupOldJobs(workspace);
   assert.ok(listJobs(workspace).some((job) => job.id === "cc-active-large"));
   assert.equal(fs.existsSync(artifact), true);
+});
+
+test("standalone liveness probe artifacts obey the private-evidence retention window", async (t) => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-probe-retention-"));
+  t.after(async () => {
+    await safeRmDir(resolveStateDir(workspace));
+    await safeRmDir(workspace);
+  });
+  const artifact = writeResultArtifact(workspace, "probe-old-evidence", { ok: false, probeId: "probe-old-evidence" });
+  const old = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000);
+  fs.utimesSync(artifact, old, old);
+
+  cleanupOldJobs(workspace);
+  assert.equal(fs.existsSync(artifact), false);
 });
 
 // ─── P2: Corrupt State Quarantine ────────────────────────────────────────────
@@ -1927,8 +1941,8 @@ test("delegate records selectorKind and routeSnapshot in job state (v5)", async 
 });
 
 test("delegate failure stores diagnostics in artifact but shows only safe summary in MCP output", async (t) => {
-  const server = startServer(t);
-  const result = await server.send(212, "cc_delegate", { task: "nonzero", model: "glm-5.2-pro" });
+  const server = startServer(t, { env: { FAKE_CLAUDE_MODE: "nonzero" } });
+  const result = await server.send(212, "cc_delegate", { task: "exercise nonzero failure diagnostics safely", model: "glm-5.2-pro" });
   const text = result.result.content[0].text;
   // MCP output must show a safe error with stage prefix
   assert.match(text, /\[provider_response\]/);
@@ -2237,6 +2251,31 @@ test("black-box completed job stores taskRef, never task content, in state and c
   assert.match(allText, /sha256:[0-9a-f]{12}/);
 });
 
+test("successful Claude output that echoes the task is redacted before artifact, state, and MCP presentation", async (t) => {
+  // stdin-prompt returns the entire stdin task as a successful result, which
+  // exercises the path that failure-only diagnostics cannot protect.
+  const server = startServer(t, { env: { FAKE_CLAUDE_MODE: "stdin-prompt" } });
+  const marker = "SUCCESS_ECHO_TASK_MARKER_8842";
+  const task = `Implement the handler for ${marker} with tests.`;
+  const delegateResult = await server.send(235, "cc_delegate", { task });
+  const delegateText = delegateResult.result.content[0].text;
+  assert.doesNotMatch(delegateText, /SUCCESS_ECHO_TASK_MARKER_8842/);
+  assert.match(delegateText, /\[TASK_REDACTED\]/);
+
+  const job = listJobs(server.workspace).find((entry) => entry.status === "completed");
+  assert.ok(job);
+  assert.doesNotMatch(JSON.stringify(job), /SUCCESS_ECHO_TASK_MARKER_8842/);
+  assert.match(String(job.result), /\[TASK_REDACTED\]/);
+
+  const artifact = readResultArtifact(server.workspace, job.id);
+  assert.ok(artifact);
+  assert.doesNotMatch(JSON.stringify(artifact), /SUCCESS_ECHO_TASK_MARKER_8842/);
+  assert.match(String(artifact.result), /\[TASK_REDACTED\]/);
+
+  const checkResult = await server.send(236, "cc_check", { job: job.id });
+  assert.doesNotMatch(checkResult.result.content[0].text, /SUCCESS_ECHO_TASK_MARKER_8842/);
+});
+
 // ─── Req 1 (structural): upsertJob strips task content even when passed ──────
 // The privacy boundary is structural at the write chokepoint, not convention-
 // based. Even a caller that accidentally passes `task`/`taskPreview` must not
@@ -2319,6 +2358,35 @@ test("upsertJob merging a patch with task content strips it from the merged reco
   } finally {
     fs.rmSync(workspace, { recursive: true, force: true });
   }
+});
+
+test("unversioned persisted jobs migrate and scrub task content before cc_check", async (t) => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-unversioned-task-"));
+  const server = startServer(t, { workspace });
+  const marker = "UNVERSIONED_TASK_LEAK_MARKER_5531";
+  const jobsDir = resolveJobsDir(workspace);
+  fs.mkdirSync(jobsDir, { recursive: true });
+  fs.writeFileSync(path.join(jobsDir, "cc-unversioned.json"), JSON.stringify({
+    id: "cc-unversioned",
+    status: "completed",
+    phase: "completed",
+    task: `legacy task ${marker}`,
+    taskPreview: `legacy preview ${marker}`,
+    taskHash: "a".repeat(64),
+    updatedAt: new Date().toISOString(),
+  }), "utf8");
+
+  const job = listJobs(workspace).find((entry) => entry.id === "cc-unversioned");
+  assert.ok(job);
+  assert.equal(job.version, 6);
+  assert.doesNotMatch(JSON.stringify(job), /UNVERSIONED_TASK_LEAK_MARKER_5531/);
+  assert.equal(job.taskRef, "sha256:aaaaaaaaaaaa");
+
+  const persisted = fs.readFileSync(path.join(jobsDir, "cc-unversioned.json"), "utf8");
+  assert.doesNotMatch(persisted, /UNVERSIONED_TASK_LEAK_MARKER_5531/);
+
+  const check = await server.send(237, "cc_check", { job: "cc-unversioned" });
+  assert.doesNotMatch(check.result.content[0].text, /UNVERSIONED_TASK_LEAK_MARKER_5531/);
 });
 
 // ─── Req 6: Preflight route failure creates an auditable rejected job ────────
@@ -2511,6 +2579,50 @@ test("liveness probe reports unknown cost (never $0.00) when telemetry is missin
   assert.equal(artifact.usageKeyIsNotExecutionProof, true);
   assert.ok(artifact.routeSnapshot);
   assert.ok(artifact.modelEvidence);
+});
+
+test("liveness probe preserves an explicit Provider-reported zero cost", async (t) => {
+  const ccpsHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-probe-zero-cost-"));
+  t.after(async () => { await safeRmDir(ccpsHome); });
+  makeProbeProfile(ccpsHome);
+  const server = startServer(t, {
+    env: {
+      CC_PROFILE_SWITCH_HOME: ccpsHome,
+      FAKE_CLAUDE_MODE: "success-reported-zero-cost",
+      FAKE_CLAUDE_HELP_BUDGET_GUARD: "1",
+    },
+  });
+  const response = await server.send(240, "cc_setup", {
+    livenessProbe: true,
+    timeoutSeconds: 30,
+    maxBudgetUsd: 0.25,
+  });
+  const text = response.result.content[0].text;
+  assert.match(text, /Cost:\*\* \$0\.0000 \(provenance: provider_reported\)/);
+  const probeId = text.match(/Probe ID:\*\* (probe-[a-z0-9-]+)/i)?.[1];
+  assert.ok(probeId);
+  const artifact = readResultArtifact(server.workspace, probeId);
+  assert.equal(artifact.cost, 0);
+  assert.equal(artifact.costProvenance, "provider_reported");
+});
+
+test("cc_setup never reflects a secret-like active profile identity", async (t) => {
+  const ccpsHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-secret-profile-name-"));
+  t.after(async () => { await safeRmDir(ccpsHome); });
+  fs.writeFileSync(
+    path.join(ccpsHome, "config.json"),
+    JSON.stringify({ version: 1, lastUsedProfile: "sk-profile-secret-0123456789" }),
+    "utf8",
+  );
+  const server = startServer(t, { env: { CC_PROFILE_SWITCH_HOME: ccpsHome } });
+  const setup = await server.send(241, "cc_setup", {});
+  const setupText = setup.result.content[0].text;
+  assert.doesNotMatch(setupText, /sk-profile-secret-0123456789/);
+  assert.match(setupText, /Active authority is corrupt or unreadable/);
+
+  const resolve = await server.send(242, "cc_resolve_route", { selector: "Opus" });
+  assert.doesNotMatch(resolve.result.content[0].text, /sk-profile-secret-0123456789/);
+  assert.equal(resolve.result.isError, true);
 });
 
 test("liveness probe with explicit Opus selector records alias claim in route snapshot", async (t) => {
