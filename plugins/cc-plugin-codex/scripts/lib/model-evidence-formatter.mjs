@@ -25,6 +25,7 @@ import {
   normalizeModelIdForStorage,
   escapeModelIdForMarkdown,
 } from "./model-evidence-shared.mjs";
+import { isValidRouteStatus } from "./route-status.mjs";
 
 // ─── Output-boundary sanitization ────────────────────────────────────────────
 
@@ -66,12 +67,11 @@ function safeStatus(status) {
  * @param {string|null} options.requestedModel - User's explicit model override
  * @param {string} options.requestMode - 'explicit' or 'inherited'
  * @param {object} options.modelEvidence - The modelEvidence structure
- * @param {object|null} options.routeSnapshot - Non-secret route snapshot (v5)
- * @param {string|null} options.routeStatus - Route status (v5)
- * @param {string|null} options.selectorKind - Selector kind (v5)
+ * @param {string|null} options.routeStatus - Route status (v7)
+ * @param {string|null} options.selectorKind - Selector kind (v7)
  * @returns {string} Formatted model evidence lines
  */
-export function formatModelEvidence({ requestedModel, requestMode, modelEvidence, routeSnapshot, routeStatus, selectorKind }) {
+export function formatModelEvidence({ requestedModel, requestMode, modelEvidence, routeStatus, selectorKind }) {
   if (!modelEvidence) {
     // Legacy/fallback — should not happen in v4 but be safe
     if (requestedModel) {
@@ -82,7 +82,7 @@ export function formatModelEvidence({ requestedModel, requestMode, modelEvidence
 
   const lines = [];
 
-  // Request line — show selector kind when available (v5)
+  // Request line — show selector kind when available (v7)
   if (selectorKind === "alias" && requestedModel) {
     lines.push(`**Requested model:** ${safeModelIdForDisplay(requestedModel)} (alias)`);
   } else if (selectorKind === "native" && requestedModel) {
@@ -93,23 +93,18 @@ export function formatModelEvidence({ requestedModel, requestMode, modelEvidence
     lines.push(`**Model request:** inherited from Claude Code configuration`);
   }
 
-  // Route snapshot — non-secret configuration claim (v5)
-  if (routeSnapshot && routeSnapshot.profileIdentity) {
-    const aliasClaim = routeSnapshot.aliasClaim
-      ? ` — alias claim: ${escapeModelIdForMarkdown(routeSnapshot.aliasClaim.alias)} → ${safeModelIdForDisplay(routeSnapshot.aliasClaim.nativeId)}`
-      : "";
-    lines.push(`**Route snapshot:** profile ${escapeModelIdForMarkdown(routeSnapshot.profileIdentity)} (fingerprint: ${escapeModelIdForMarkdown(routeSnapshot.profileFingerprint || "—")})${aliasClaim}`);
-  }
-
-  // Route status — honest post-execution verification (v5)
-  if (routeStatus) {
+  // Route status — honest post-execution verification (v7)
+  if (routeStatus && isValidRouteStatus(routeStatus)) {
     const statusLabels = {
       resolved: "resolved (claim confirmed by execution evidence)",
-      accepted_but_unverified: "accepted but unverified (no transcript evidence)",
+      accepted_but_unverified: "accepted but unverified (specific native model not confirmed)",
       model_drift_possible: "model drift possible (claim and evidence disagree)",
       rejected: "rejected (CLI or Provider failure)",
+      cancelled: "cancelled before route verification completed",
     };
-    lines.push(`**Route status:** ${statusLabels[routeStatus] || routeStatus}`);
+    lines.push(`**Route status:** ${statusLabels[routeStatus]}`);
+  } else if (routeStatus) {
+    lines.push(`**Route status:** unavailable`);
   }
 
   // Execution models — re-sanitize at output boundary

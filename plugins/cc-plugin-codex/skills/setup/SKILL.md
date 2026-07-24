@@ -7,7 +7,7 @@ description: Use when you want to check if Claude Code is installed and ready, o
 
 ## Overview
 
-Verify that Claude Code is installed and the plugin is ready to use. Performs static checks (zero model calls): CLI protocol verification, companion compatibility, active authority routing resolvability, source-vs-cache comparison, and state schema health. An optional cost-bearing liveness probe can be enabled with explicit authorization and a budget guard.
+Verify that Claude Code is installed and the plugin is ready to use. Performs static checks (zero model calls): CLI protocol verification, source-vs-cache comparison, model routing classifier status, and state schema health. An optional cost-bearing liveness probe can be enabled with explicit authorization and a budget guard.
 
 ## Workflow
 
@@ -20,7 +20,6 @@ Verify that Claude Code is installed and the plugin is ready to use. Performs st
    - **Node.js not available**: Suggest installing from https://nodejs.org/
    - **Git not found**: Review features need git — suggest installing git
    - **CLI protocol mismatch**: The installed Claude Code may not support print-mode JSON (`--print --input-format text --output-format json`). Suggest updating Claude Code to 2.1.208+.
-   - **Active authority corrupt or unreadable**: The active cc-profile-switch profile (or an explicitly selected fallback authority) could not be safely resolved — corrupt config, missing profile, path traversal, or symlink escape. No fallback profile is used. Fix the config or remove the explicit adapter selection for bare inheritance.
    - **Source/cache mismatch**: The installed plugin cache differs from the running source. Reinstall the plugin to align the cache.
    - **Claude Code not authenticated**: Suggest running `claude auth` or setting `ANTHROPIC_API_KEY`
 
@@ -28,15 +27,15 @@ Verify that Claude Code is installed and the plugin is ready to use. Performs st
 
 - **Claude Code CLI availability and version**
 - **CLI protocol verification**: confirms `--print`, `--input-format`, and `--output-format` flags are supported (print-mode JSON capability)
-- **Companion compatibility**: server version, state schema v6, watchdog protocol
-- **Active authority routing resolvability**: reads the active cc-profile-switch profile (default) — `${CC_PROFILE_SWITCH_HOME:-~/.cc-profile-switch}/config.json` → `lastUsedProfile` → `profiles/<name>/claude-home/settings.json` + common `api-settings.json` — and verifies it can be safely resolved. If cc-profile-switch is absent, bare inheritance is the default; set `CC_COMPANION_AUTHORITY_ADAPTER=claude-settings` to opt into `<CLAUDE_CONFIG_DIR>/settings.json`, or `active-profile-fixture` for the legacy test/compat fixture. Reports source kind, profile identity, fingerprint, alias mapping count, and native display name count. Does NOT display secrets, tokens, or env var values. The authority is re-read fresh on every call — a profile switch takes effect without restarting Codex.
+- **Companion compatibility**: server version, state schema v7, watchdog protocol
+- **Model routing**: the selector classifier (inherited/alias/native) is active. Model selection is inherited from the parent environment or explicitly supplied via `model` selector. The plugin does not read, write, or modify any external routing configuration.
 - **Source/cache compatibility**: performs a real comparison between the running plugin source and the installed cache directory (reports `match`, `differ`, or `not-installed` when running from source). Never prints a green compatibility claim without an actual comparison.
 - **Node.js availability and version**
 - **Git availability and version**
 - **Workspace root detection**
 - **Default branch detection (main/master)**
 - **Current session ID**
-- **State schema version (v6 with task privacy boundary, dynamic model routing, route snapshots, failure diagnostics)**
+- **State schema version (v7 with task privacy boundary, native-Claude routing, route snapshots, failure diagnostics)**
 - **State health** (orphaned job count, active job count)
 
 ## Optional Liveness Probe (Cost-Bearing)
@@ -49,7 +48,7 @@ When the user explicitly asks for a real Provider liveness check, call `cc_setup
 
 This makes **one real model call** and incurs a cost. It is NOT a free check. The probe runs a trivial task ("Reply with exactly: OK") and reports the result, cost, and duration. It is blocked if any static check fails.
 
-**Honest cost + private evidence:** When telemetry is missing the probe reports cost as `unknown` (never `$0.00`); an explicit Provider-reported zero remains `$0.00` with `provider_reported` provenance. A private, bounded, auditable artifact is created before the Provider call and finalized afterward with the route snapshot, route status, execution/model evidence, duration, exit/failure classification, a non-verbatim safe reason code, and cost. Standalone probe artifacts share the private 30-day/100MiB retention policy. A usage key is never treated as execution proof — only transcript evidence is. The MCP output links only to the probe ID and a safe summary; it must not expose Provider text, task content, or profile values.
+**Honest cost + private evidence:** When telemetry is missing the probe reports cost as `unknown` (never `$0.00`). A private, bounded, auditable artifact is persisted under the probe ID recording the route snapshot, route status, execution/model evidence, duration, exit/failure classification, and cost with explicit provenance. A usage key is never treated as execution proof — only transcript evidence is. The MCP output links only to the probe ID and a safe summary.
 
 **Budget guard (fail-closed):** Before the probe spawns Claude Code, the setup verifies that the installed CLI supports the `--max-budget-usd` flag (inspected via `claude --help`). If the flag is unsupported, the probe fails closed — **no Provider call is made**. The probe also fails closed if `livenessProbe` is not literally `true`, if `timeoutSeconds` is missing or non-positive, or if `maxBudgetUsd` is missing or non-positive.
 

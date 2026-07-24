@@ -671,6 +671,18 @@ test("extractUsageModelKeys: multiple keys all preserved", () => {
 
 // ─── Formatter Security Tests ────────────────────────────────────────────────
 
+test("SECURITY: unknown persisted route status is rendered as a safe placeholder", () => {
+  const text = formatModelEvidence({
+    requestedModel: "Opus",
+    requestMode: "explicit",
+    selectorKind: "alias",
+    routeStatus: "unknown\n#injected",
+    modelEvidence: { status: "complete", executedModels: [], usageModelKeys: [], usageSource: "claude-result-modelUsage", warnings: [] },
+  });
+  assert.match(text, /Route status:\*\* unavailable/);
+  assert.doesNotMatch(text, /#injected/);
+});
+
 test("SECURITY: full control chars in requested model → no injection, never raw", () => {
   const text = formatModelEvidence({
     requestedModel: "evil\n#injected\rmodel",

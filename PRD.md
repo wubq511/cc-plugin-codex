@@ -54,7 +54,7 @@ cc-plugin-codex/
 
 - **MCP Server（stdio）**：Codex 作为 MCP client，启动 `cc-companion.mjs` 作为子进程
 - **Claude CLI 调用**：watchdog 通过 `claude --print --input-format text --output-format json` 非交互调用 Claude Code；任务只经 stdin 传递
-- **Job 追踪**：schema v6 以原子 per-job 文件持久化到 `${os.tmpdir()}/cc-companion/<workspace-slug-hash>/jobs/`，目录和文件分别限制为 `0700`/`0600`；任务正文不进入 state
+- **Job 追踪**：schema v7 以原子 per-job 文件持久化到 `${os.tmpdir()}/cc-companion/<workspace-slug-hash>/jobs/`，目录和文件分别限制为 `0700`/`0600`；任务正文不进入 state，旧路由实现留下的 route 字段会在迁移时清空
 
 ### 3.3 Codex 插件清单（plugin.json）
 
@@ -271,7 +271,7 @@ cc-plugin-codex/
 1. 检测 `claude` CLI 是否可用（`claude --version`）
 2. 检测 Claude Code 版本
 3. 检测 `node` 是否可用
-4. 静态检查 active authority、source/cache 一致性与 state schema（零模型调用）
+4. 静态检查模型选择器、source/cache 一致性与 state schema（零模型调用）
 5. 仅在用户明确授权、`livenessProbe=true`、timeout/budget 均有效且 CLI 支持 `--max-budget-usd` 时，执行一次受限 Provider liveness probe；失败时保存私有制品并返回安全 stage/reason，不回显 Provider 原文
 
 **输出：**
@@ -295,7 +295,7 @@ cc-plugin-codex/
 
 1. 调用 `cc_delegate`，传入 task（model 和 effort 可选）
    - 默认不传 model，Claude Code 继承当前 Provider 配置
-   - 用户明确指定模型时，传入 alias、active profile 的精确 display name，或经过语法验证的 native ID；歧义值 fail closed
+   - 用户明确指定模型时，传入 alias 或经过语法验证的 native ID；歧义值 fail closed。插件不读取任何外部路由配置，也不猜测 alias 的底层模型
    - effort 与 model 独立，不耦合
 2. 等待结果返回
 3. 向用户展示结果摘要（分开标注请求模型、Claude-recorded execution model 和 Provider usage key）

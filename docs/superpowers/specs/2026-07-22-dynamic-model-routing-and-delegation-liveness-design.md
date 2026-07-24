@@ -1,5 +1,7 @@
 # Dynamic Model Routing and Delegation Liveness
 
+> Historical design — superseded by [Remove cc-profile-switch Coupling](2026-07-25-remove-cc-profile-switch-coupling-design.md). It does not describe the current runtime and must not be used as implementation or user-operation guidance.
+
 > Status: approved design; implementation requires the [final review round 2 repairs](2026-07-24-dynamic-model-routing-final-review.md) before merge.
 >
 > Date: 2026-07-22

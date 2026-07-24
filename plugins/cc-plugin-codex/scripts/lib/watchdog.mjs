@@ -130,14 +130,12 @@ async function main() {
     maxCaptureBytes = DEFAULT_MAX_CAPTURE,
     command = "claude",
     childEnv = null,
-    sensitiveMarkers = [],
     routeSnapshot = null,
     cliVersion = null,
     maxBudgetUsd = null
   } = config;
 
   maxCapture = maxCaptureBytes;
-  const redactionMarkers = [task, ...sensitiveMarkers.filter((value) => typeof value === "string")];
 
   if (!task) {
     process.stderr.write("[watchdog] Missing task\n");
@@ -180,7 +178,7 @@ async function main() {
 
   // ── Phase 4: Spawn Claude with stdin=pipe ──
   // Task is written to Claude stdin, never appears in argv.
-  // Use the child env from the active profile (strips stale ANTHROPIC_*, injects profile vars).
+  // Use the inherited child environment unchanged; native Claude owns its configuration.
   const startTime = Date.now();
   try {
     const resolved = resolveCommandForSpawn(command, args);
@@ -214,7 +212,7 @@ async function main() {
         stdout: "",
         stderr: err.message,
         structuredError: false,
-        taskMarkers: redactionMarkers,
+        taskMarkers: [task],
       }),
     });
     exitWith(1);
@@ -254,7 +252,7 @@ async function main() {
         stdout: Buffer.concat(stdoutChunks).toString("utf8"),
         stderr: Buffer.concat(stderrChunks).toString("utf8"),
         structuredError: false,
-        taskMarkers: redactionMarkers,
+        taskMarkers: [task],
       }),
     });
     exitWith(1);
@@ -299,7 +297,7 @@ async function main() {
           errorDetail,
           stdout,
           stderr,
-          taskMarkers: redactionMarkers,
+          taskMarkers: [task],
         }),
       };
     }
@@ -341,7 +339,7 @@ async function main() {
           stdout,
           stderr,
           structuredError: false,
-          taskMarkers: redactionMarkers,
+          taskMarkers: [task],
         }),
       });
       exitWith(4);

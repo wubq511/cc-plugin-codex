@@ -47,7 +47,6 @@ export function runClaude(task, options = {}) {
     maxCaptureBytes,
     command,
     childEnv: options.childEnv || null,
-    sensitiveMarkers: Array.isArray(options.sensitiveMarkers) ? options.sensitiveMarkers : [],
     routeSnapshot: options.routeSnapshot || null,
     cliVersion: options.cliVersion || null,
     maxBudgetUsd: options.maxBudgetUsd || null

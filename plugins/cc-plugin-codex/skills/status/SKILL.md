@@ -24,7 +24,7 @@ Check the status and results of Claude Code tasks. Shows phase tracking, recent 
    - Recent log entries showing progress
    - Session ID for the job
    - Route status (resolved / accepted_but_unverified / model_drift_possible / rejected / cancelled)
-   - Task reference: a short, non-reversible SHA-256 hash prefix (never the task content itself — task text enters only the Claude child stdin stream; even a successful output that echoes the task is redacted before storage or presentation)
+   - Task reference: a short, non-reversible SHA-256 hash prefix (never the task content itself — task text enters only the Claude child stdin stream)
    - For failed/cancelled/rejected jobs: a bounded, doubly-redacted diagnostic summary (failure stage, duration, structured-error flag). Raw error excerpts, stdout/stderr, session IDs, usage keys, and task content are never exposed in MCP output — they live only in the private job artifact.
 
 ## Phase Tracking

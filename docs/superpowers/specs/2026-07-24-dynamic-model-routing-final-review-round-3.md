@@ -1,5 +1,7 @@
 # Dynamic Model Routing — Final Review Round 3
 
+> Historical review — superseded by [Remove cc-profile-switch Coupling](2026-07-25-remove-cc-profile-switch-coupling-design.md). It does not describe the current runtime and must not be used as implementation or user-operation guidance.
+
 > Status: **implemented, installed locally, and verified through the Provider boundary**. The final external result is an honest `rate_limited` response, not a synthetic pass.
 >
 > Reviewed branch: `glm/dynamic-model-routing`, including the privacy, authority, cache-install, and liveness-evidence closeout commits.
