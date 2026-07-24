@@ -65,11 +65,11 @@ function isolatedEnv(ccpsHome, claudeConfigDir) {
  *   <home>/profiles/<name>/claude-home/
  *   <home>/profiles/<name>/claude-home/settings.json  (optional, profile env — higher precedence)
  */
-function makeCcpsHome(home, { lastUsedProfile, commonEnv, profileEnv } = {}) {
+function makeCcpsHome(home, { lastUsedProfile, commonEnv, profileEnv, version = 1 } = {}) {
   fs.mkdirSync(home, { recursive: true });
   fs.writeFileSync(
     path.join(home, "config.json"),
-    JSON.stringify({ lastUsedProfile }),
+    JSON.stringify({ version, lastUsedProfile }),
     "utf8"
   );
   if (commonEnv) {
@@ -92,9 +92,12 @@ function makeCcpsHome(home, { lastUsedProfile, commonEnv, profileEnv } = {}) {
   return home;
 }
 
-/** Write a config.json with arbitrary content (for fail-closed tests). */
+/** Write a config.json with arbitrary content (for fail-closed tests).
+ *  Includes version:1 by default so tests targeting other fields (profile
+ *  name, lastUsedProfile, etc.) pass the version gate. Override with
+ *  { version: N, ... } to test the version check itself. */
 function writeCcpsConfig(home, obj) {
-  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify(obj), "utf8");
+  fs.writeFileSync(path.join(home, "config.json"), JSON.stringify({ version: 1, ...obj }), "utf8");
 }
 
 /** Write raw content to config.json (for corrupt-JSON tests). */
@@ -724,7 +727,7 @@ test("display-name case-fold collision fails closed at config stage", () => {
     });
     assert.throws(
       () => readActiveAuthority({ env: isolatedEnv(home, configDir) }),
-      /case-fold collision/i
+      /Display-name collision.*different native models/i
     );
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
@@ -1407,4 +1410,269 @@ test("resolveCcProfileSwitchHome respects CC_PROFILE_SWITCH_HOME env var", () =>
 test("resolveCcProfileSwitchHome falls back to ~/.cc-profile-switch when env not set", () => {
   const result = resolveCcProfileSwitchHome({});
   assert.ok(result.endsWith(".cc-profile-switch"));
+});
+
+// ─── Req 1: Shared-model display name coalescence ───────────────────────────
+
+test("shared display names with same native ID coalesce (Fable/Sonnet shared target)", () => {
+  const home = makeTempDir();
+  const configDir = makeTempDir();
+  try {
+    // Fable and Sonnet both declare GLM 5.2 → glm-5.1 (same native ID).
+    // This is a valid shared-target configuration.
+    makeCcpsHome(home, {
+      lastUsedProfile: "alpha",
+      profileEnv: {
+        ANTHROPIC_DEFAULT_FABLE_MODEL: "glm-5.1",
+        ANTHROPIC_DEFAULT_FABLE_MODEL_NAME: "GLM 5.2",
+        ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.1",
+        ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: "GLM 5.2",
+      },
+    });
+    const profile = readActiveAuthority({ env: isolatedEnv(home, configDir) });
+    assert.ok(profile);
+    // The display name "glm 5.2" should resolve to native ID "glm-5.1"
+    assert.equal(profile.projection.nativeDisplayNames["glm 5.2"], "glm-5.1");
+    // Both aliases should map to the same native ID
+    assert.equal(profile.projection.aliasMappings.fable, "glm-5.1");
+    assert.equal(profile.projection.aliasMappings.sonnet, "glm-5.1");
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+test("display names differing only in case with same native ID coalesce", () => {
+  const home = makeTempDir();
+  const configDir = makeTempDir();
+  try {
+    makeCcpsHome(home, {
+      lastUsedProfile: "alpha",
+      profileEnv: {
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "kimi-k2",
+        ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: "Kimi",
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: "kimi-k2",
+        ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME: "kimi",
+      },
+    });
+    const profile = readActiveAuthority({ env: isolatedEnv(home, configDir) });
+    assert.ok(profile);
+    // "kimi" and "Kimi" canonicalize to the same key; same native ID → coalesce
+    assert.equal(Object.keys(profile.projection.nativeDisplayNames).length, 1);
+    assert.equal(profile.projection.nativeDisplayNames["kimi"], "kimi-k2");
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+test("conflicting display names with different native IDs fail closed", () => {
+  const home = makeTempDir();
+  const configDir = makeTempDir();
+  try {
+    // Same canonical display name but different native IDs → must fail
+    makeCcpsHome(home, {
+      lastUsedProfile: "alpha",
+      profileEnv: {
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "glm-5.1",
+        ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: "GLM",
+        ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.2",
+        ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: "glm",
+      },
+    });
+    assert.throws(
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir) }),
+      /Display-name collision.*different native models/i
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+test("shared-target fixture does not print config values or secrets", () => {
+  const home = makeTempDir();
+  const configDir = makeTempDir();
+  try {
+    makeCcpsHome(home, {
+      lastUsedProfile: "alpha",
+      profileEnv: {
+        ANTHROPIC_DEFAULT_FABLE_MODEL: "glm-5.1",
+        ANTHROPIC_DEFAULT_FABLE_MODEL_NAME: "GLM 5.2",
+        ANTHROPIC_DEFAULT_SONNET_MODEL: "glm-5.1",
+        ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: "GLM 5.2",
+        ANTHROPIC_API_KEY: "sk-shared-target-secret-key-98765",
+      },
+    });
+    const profile = readActiveAuthority({ env: isolatedEnv(home, configDir) });
+    assert.ok(profile);
+    const projectionStr = JSON.stringify(profile.projection);
+    // Secrets must not appear in the projection
+    assert.doesNotMatch(projectionStr, /sk-shared-target-secret-key-98765/);
+    // Fable and Sonnet both resolve via shared native target
+    assert.equal(profile.projection.aliasMappings.fable, "glm-5.1");
+    assert.equal(profile.projection.aliasMappings.sonnet, "glm-5.1");
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+// ─── Req 4: Fallback symlink containment ─────────────────────────────────────
+
+test("symlinked Claude settings.json escaping config dir fails closed", () => {
+  const configDir = makeTempDir();
+  const outsideDir = makeTempDir();
+  try {
+    // Create a settings.json outside the config dir
+    const outsideSettings = path.join(outsideDir, "evil-settings.json");
+    fs.writeFileSync(outsideSettings, JSON.stringify({
+      env: { ANTHROPIC_API_KEY: "sk-symlink-escape-secret" }
+    }), "utf8");
+    // Symlink settings.json inside configDir to the outside file
+    const symlinkPath = path.join(configDir, "settings.json");
+    fs.symlinkSync(outsideSettings, symlinkPath);
+    assert.throws(
+      () => readActiveAuthority({ env: isolatedEnv(makeTempDir(), configDir) }),
+      /escapes the authority root|symlink/i
+    );
+  } finally {
+    fs.rmSync(configDir, { recursive: true, force: true });
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test("symlinked active-profile.json escaping config dir fails closed", () => {
+  const configDir = makeTempDir();
+  const outsideDir = makeTempDir();
+  try {
+    // Create an active-profile.json outside the config dir
+    const outsideProfile = path.join(outsideDir, "evil-profile.json");
+    fs.writeFileSync(outsideProfile, JSON.stringify({
+      profileIdentity: "evil",
+      aliasMappings: {},
+      nativeDisplayNames: {},
+      envVars: { ANTHROPIC_API_KEY: "sk-symlink-escape-secret" }
+    }), "utf8");
+    // Symlink active-profile.json inside configDir to the outside file
+    const symlinkPath = path.join(configDir, "active-profile.json");
+    fs.symlinkSync(outsideProfile, symlinkPath);
+    assert.throws(
+      () => readActiveAuthority({ env: isolatedEnv(makeTempDir(), configDir) }),
+      /escapes the authority root|symlink/i
+    );
+  } finally {
+    fs.rmSync(configDir, { recursive: true, force: true });
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
+// ─── Req 5: Native selector validation ───────────────────────────────────────
+
+test("valid native IDs with slash, colon, dot, underscore, hyphen pass validation", () => {
+  const validIds = [
+    "deepseek-v4-pro",
+    "glm-5.2",
+    "anthropic/claude-opus-4",
+    "kimi:k2.6",
+    "model_v2.1",
+    "provider/model:1.0",
+  ];
+  for (const id of validIds) {
+    // classifySelector with no projection → heuristic native path
+    const result = classifySelector(id, null);
+    assert.equal(result.kind, "native", `Expected native for ${id}`);
+    assert.equal(result.cliArg, id, `Expected cliArg=${id}`);
+  }
+});
+
+test("native selector with control character is rejected", () => {
+  assert.throws(
+    () => classifySelector("glm-5.2\x00evil", null),
+    AmbiguousSelectorError
+  );
+  assert.throws(
+    () => classifySelector("glm\x1b-5.2", null),
+    AmbiguousSelectorError
+  );
+});
+
+test("native selector with whitespace is rejected", () => {
+  assert.throws(
+    () => classifySelector("glm-5.2 rm -rf", null),
+    AmbiguousSelectorError
+  );
+  assert.throws(
+    () => classifySelector("glm\t-5.2", null),
+    AmbiguousSelectorError
+  );
+});
+
+test("overlong native selector is rejected", () => {
+  const longId = "a".repeat(129);
+  // Must contain a digit to reach the heuristic-native path
+  const longIdWithDigit = longId.slice(0, 128) + "1";
+  assert.throws(
+    () => classifySelector(longIdWithDigit, null),
+    AmbiguousSelectorError
+  );
+});
+
+test("native selector with disallowed characters is rejected", () => {
+  // Backtick, semicolon, pipe, parentheses are not in the allowlist
+  assert.throws(() => classifySelector("glm-5.2;rm", null), AmbiguousSelectorError);
+  assert.throws(() => classifySelector("glm-5.2|cat", null), AmbiguousSelectorError);
+  assert.throws(() => classifySelector("glm-5.2$(whoami)", null), AmbiguousSelectorError);
+});
+
+// ─── Req 7: Authority schema version check ───────────────────────────────────
+
+test("cc-profile-switch config without version field fails closed", () => {
+  const home = makeTempDir();
+  const configDir = makeTempDir();
+  try {
+    writeCcpsConfigRaw(home, JSON.stringify({ lastUsedProfile: "alpha" }));
+    assert.throws(
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir) }),
+      /unsupported version/i
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+test("cc-profile-switch config with unknown version fails closed", () => {
+  const home = makeTempDir();
+  const configDir = makeTempDir();
+  try {
+    writeCcpsConfig(home, { version: 2, lastUsedProfile: "alpha" });
+    assert.throws(
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir) }),
+      /unsupported version/i
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+test("cc-profile-switch config with version 1 resolves successfully", () => {
+  const home = makeTempDir();
+  const configDir = makeTempDir();
+  try {
+    makeCcpsHome(home, {
+      lastUsedProfile: "alpha",
+      profileEnv: {
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "glm-5.2",
+      },
+    });
+    const profile = readActiveAuthority({ env: isolatedEnv(home, configDir) });
+    assert.ok(profile);
+    assert.equal(profile.projection.sourceKind, "cc-profile-switch");
+    assert.equal(profile.projection.aliasMappings.opus, "glm-5.2");
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
 });

@@ -57,7 +57,7 @@ import {
   readActiveAuthority, ProfileResolutionError
 } from "./lib/routing.mjs";
 import {
-  buildSafeErrorMessage, FAILURE_STAGES, isValidStage, redactText
+  buildSafeErrorMessage, buildSafeErrorSummary, FAILURE_STAGES, buildFailureEnvelope
 } from "./lib/diagnostics.mjs";
 import {
   computeRouteStatus, ROUTE_STATUSES, describeRouteStatus
@@ -402,7 +402,7 @@ const TOOLS = [
         task: { type: "string", description: "The coding task to delegate to Claude Code" },
         write: { type: "boolean", description: "Allow Claude Code to write files (default: true)" },
         background: { type: "boolean", description: "DEPRECATED AND REJECTED. background=true is no longer supported. Default foreground delegation waits silently without polling. This parameter exists only for backward compatibility and will always produce an error if set to true." },
-        model: { type: "string", description: "Explicit model override for this delegation. When omitted, Claude Code uses its current configured default. Accepts any non-empty identifier — the plugin does not validate model names because model resolution is owned by Claude Code and its Provider." },
+        model: { type: "string", description: "Explicit model override for this delegation. When omitted, Claude Code uses its current configured default (inherited). Accepts a Claude alias (opus, fable, sonnet, haiku — case-insensitive), a display name declared in the active profile, or a bounded native model ID (e.g., deepseek-v4-pro, glm-5.2). Ambiguous selectors are rejected — the plugin does not guess or silently fall back." },
         effort: { type: "string", description: "Reasoning effort level", enum: ["low", "medium", "high", "xhigh", "max"] },
         dangerouslySkipPermissions: { type: "boolean", description: "Skip permission prompts (default: false, set true to allow Claude Code to write without confirmation)" },
         timeoutSeconds: { type: "integer", description: "Optional hard timeout in seconds. When omitted, the task runs until it completes, fails, is cancelled, or the server shuts down. Must be an integer in 1..604800 if supplied." },
@@ -611,29 +611,111 @@ async function handleDelegate(params, context = {}) {
       env: process.env
     });
   } catch (err) {
-    if (err instanceof AmbiguousSelectorError) {
-      return {
-        content: [{
-          type: "text",
-          text: `## Ambiguous Model Selector\n\nCould not safely resolve \`${model}\` to a Claude alias or native model ID.\n\n**Reason:** ${err.message}\n\nTo resolve:\n- Use a Claude alias: \`opus\`, \`fable\`, \`sonnet\`, \`haiku\` (case-insensitive)\n- Use a full native model ID with version (e.g., \`deepseek-v4-pro\`, \`glm-5.2\`)\n- Use a display name declared in the active profile\n\nOmit \`model\` entirely for inherited (default) behavior. No fallback model is selected.`
-        }],
-        isError: true
-      };
-    }
-    if (err instanceof ProfileResolutionError) {
-      return {
-        content: [{
-          type: "text",
-          text: `## Configuration Error\n\nThe active profile authority could not be safely resolved and no fallback profile is used.\n\n**Reason:** ${err.message}\n\nThe active authority (cc-profile-switch or Claude settings) must resolve before any delegation. Fix the configuration or remove it to use bare inheritance.`
-        }],
-        isError: true
-      };
-    }
-    // Unexpected error — fail closed, no fallback
+    // Preflight route failure: create a bounded rejected job for auditability.
+    // Claude is never spawned. No fake route snapshot is persisted.
+    // MCP exposes only the safe category, generic summary, and job ID.
+    const rejectedJobId = generateJobId("cc");
+    const rejectedNow = new Date().toISOString();
+    const rejectedStage = FAILURE_STAGES.CONFIGURATION;
+    const rejectedCategory = err instanceof AmbiguousSelectorError
+      ? "ambiguous-selector"
+      : "configuration";
+    const rejectedSafeError = buildSafeErrorMessage(rejectedStage, err.message);
+
+    const rejectedDiagnostics = buildFailureEnvelope({
+      stage: rejectedStage,
+      requestedSelector: model ? { kind: "unknown", value: model } : null,
+      effort: effort || null,
+      cliVersion: null,
+      exitCode: null,
+      signal: null,
+      durationMs: 0,
+      structuredError: false,
+      sessionId: null,
+      usageKey: null,
+      transcriptFound: false,
+      errorDetail: err.message,
+      stdout: "",
+      stderr: "",
+      taskMarkers: [task],
+    });
+
+    const rejectedArtifactPath = writeResultArtifact(workspaceRoot, rejectedJobId, {
+      result: null,
+      sessionId: null,
+      cost: null,
+      duration: null,
+      usageModelKeys: [],
+      exitCode: null,
+      requestedModel: storedRequestedModel,
+      requestMode: model ? "explicit" : "inherited",
+      selectorKind: null,
+      routeSnapshot: null,
+      routeStatus: ROUTE_STATUSES.REJECTED,
+      modelEvidence: {
+        status: "unavailable",
+        executedModels: [],
+        usageModelKeys: [],
+        usageSource: "claude-result-modelUsage",
+        warnings: ["preflight-route-failure"]
+      },
+      diagnostics: rejectedDiagnostics,
+      failureStage: rejectedStage,
+    });
+
+    updateJob(workspaceRoot, {
+      id: rejectedJobId,
+      status: "rejected",
+      phase: "rejected",
+      taskPreview: taskPreview(task.trim()),
+      taskHash: taskHashSync(task.trim()),
+      requestedModel: storedRequestedModel,
+      requestMode: model ? "explicit" : "inherited",
+      selectorKind: null,
+      routeSnapshot: null,
+      routeStatus: ROUTE_STATUSES.REJECTED,
+      modelEvidence: {
+        status: "unavailable",
+        executedModels: [],
+        usageModelKeys: [],
+        usageSource: "claude-result-modelUsage",
+        warnings: ["preflight-route-failure"]
+      },
+      effort,
+      write,
+      dangerouslySkipPermissions: skipPerms,
+      background: false,
+      resume,
+      resumeSession: null,
+      ownerServerId: SESSION_ID,
+      claudeSessionId: null,
+      pid: null,
+      logFile: null,
+      createdAt: rejectedNow,
+      updatedAt: rejectedNow,
+      startedAt: rejectedNow,
+      completedAt: rejectedNow,
+      result: null,
+      resultArtifact: rejectedArtifactPath,
+      cost: null,
+      duration: null,
+      touchedFiles: [],
+      workspaceChanges: null,
+      errorMessage: boundedText(rejectedSafeError, MAX_ERROR_MESSAGE_BYTES),
+      truncation: null
+    });
+
+    appendLogLine(workspaceRoot, rejectedJobId, `Rejected (${rejectedCategory}): ${boundedText(rejectedSafeError, MAX_ERROR_MESSAGE_BYTES)}`);
+    cleanupOldJobs(workspaceRoot);
+
+    const guidance = err instanceof AmbiguousSelectorError
+      ? `\n\nTo resolve:\n- Use a Claude alias: \`opus\`, \`fable\`, \`sonnet\`, \`haiku\` (case-insensitive)\n- Use a full native model ID with version (e.g., \`deepseek-v4-pro\`, \`glm-5.2\`)\n- Use a display name declared in the active profile\n- Omit \`model\` entirely for inherited (default) behavior`
+      : `\n\nThe active authority (cc-profile-switch or Claude settings) must resolve before any delegation. Fix the configuration or remove it to use bare inheritance.`;
+
     return {
       content: [{
         type: "text",
-        text: `## Configuration Error\n\nThe active profile could not be safely resolved and no fallback profile is used.\n\n**Reason:** ${err.message}\n\nFix the active profile file or remove it to use bare inheritance.`
+        text: `## ${err instanceof AmbiguousSelectorError ? "Ambiguous Model Selector" : "Configuration Error"}\n\n**Job ID:** ${rejectedJobId}\n**Category:** ${rejectedCategory}\n\n${buildSafeErrorSummary(rejectedStage, err.message)}${guidance}`
       }],
       isError: true
     };
@@ -1045,7 +1127,7 @@ function handleListModels(params = {}) {
     "When `model` is omitted from `cc_delegate`, Claude Code uses its current configured default. No model is selected or injected by the plugin.",
     "",
     "### Explicit Override",
-    "Supply any non-empty `model` identifier to `cc_delegate` to override the default for a single delegation. The value is passed through exactly — the plugin does not rewrite or validate model names.",
+    "Supply a `model` selector to `cc_delegate` to override the default for a single delegation. Accepted forms: a Claude alias (opus, fable, sonnet, haiku — case-insensitive), a display name declared in the active profile, or a bounded native model ID (e.g., deepseek-v4-pro, glm-5.2). Ambiguous selectors are rejected — the plugin does not guess or silently fall back.",
     "",
     "### Effort",
     "`effort` is an independent Claude CLI control (low, medium, high, xhigh, max). It is not coupled to any specific model.",
@@ -1225,14 +1307,14 @@ async function handleCheck(params) {
     } catch { /* use truncated result from metadata */ }
   }
 
-  // Bounded, redacted diagnostic summary for failed jobs (requirement #11).
-  // The private artifact contains a full failure envelope; we surface only
-  // the stage and a doubly-redacted, byte-bounded error detail. Secrets,
-  // stdout/stderr tails, session IDs, and usage keys are NOT exposed.
+  // Bounded, redacted diagnostic summary for failed jobs.
+  // The private artifact contains a full failure envelope; cc_check exposes
+  // only the stage, duration, and structured-error flag. Raw error excerpts
+  // (which may contain echoed prompt text) are NOT exposed in MCP output.
   let diagnosticSection = "";
-  if ((job.status === "failed" || job.status === "cancelled") && artifact?.diagnostics) {
+  if ((job.status === "failed" || job.status === "cancelled" || job.status === "rejected") && artifact?.diagnostics) {
     const diag = artifact.diagnostics;
-    const diagLines = ["### Diagnostic Summary (redacted, bounded)"];
+    const diagLines = ["### Diagnostic Summary (safe)"];
     if (diag.stage) {
       diagLines.push(`- **Failure stage:** ${diag.stage}`);
     }
@@ -1241,11 +1323,6 @@ async function handleCheck(params) {
     }
     if (diag.structuredError != null) {
       diagLines.push(`- **Structured CLI error:** ${diag.structuredError ? "yes" : "no"}`);
-    }
-    if (diag.errorDetail) {
-      // Second-layer redaction (belt-and-suspenders) + bound to 500 bytes
-      const redactedDetail = redactText(diag.errorDetail, 500);
-      diagLines.push(`- **Error detail (redacted):** ${redactedDetail}`);
     }
     diagnosticSection = diagLines.join("\n");
   }
@@ -1286,7 +1363,7 @@ async function handleCheck(params) {
   return {
     content: [{
       type: "text",
-      text: `## Job: ${job.id}\n\n**Status:** ${job.status}\n**Phase:** ${phase} (${phaseDescription(phase)})\n**Task:** ${job.taskPreview || job.task || "—"}\n${modelLine}\n**Effort:** ${job.effort || "—"}\n**Duration:** ${formatDuration(job.duration ? job.duration * 1000 : null)}\n**Cost:** ${formatCost(job.cost)}\n**Owner Session:** ${job.ownerServerId || "—"}\n**Claude Session:** ${job.claudeSessionId || "—"}\n${elapsedSection}**Started:** ${job.startedAt || job.createdAt || "—"}\n**Completed:** ${job.completedAt || "—"}\n\n${resultSection}${truncationNote}\n\n${filesSection}\n\n${progressSection}\n\n${diagnosticSection}`
+      text: `## Job: ${job.id}\n\n**Status:** ${job.status}\n**Phase:** ${phase} (${phaseDescription(phase)})\n**Task:** ${job.taskPreview || job.task || "—"}\n${modelLine}\n**Effort:** ${job.effort || "—"}\n**Duration:** ${formatDuration(job.duration ? job.duration * 1000 : null)}\n**Cost:** ${formatCost(job.cost)}\n${elapsedSection}**Started:** ${job.startedAt || job.createdAt || "—"}\n**Completed:** ${job.completedAt || "—"}\n\n${resultSection}${truncationNote}\n\n${filesSection}\n\n${progressSection}\n\n${diagnosticSection}`
     }]
   };
 }
@@ -1706,7 +1783,10 @@ async function handleSetup(params) {
   lines.push(`✅ Watchdog protocol: --print --input-format text --output-format json (task via stdin, never argv)`);
 
   let sourceCacheOk = false;
-  const pluginDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)));
+  // Compare plugin root with cache root (not scripts/ with cache root).
+  // cc-companion.mjs lives in <pluginRoot>/scripts/, so go up one level.
+  const scriptsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)));
+  const pluginDir = path.dirname(scriptsDir);
   try {
     const activeCache = resolveActiveCache("cc-plugin-codex", {
       execFn: (cmd) => {

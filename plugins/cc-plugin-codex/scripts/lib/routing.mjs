@@ -91,6 +91,15 @@ const MAX_PROFILE_NAME_LEN = 128;
 const MAX_ENV_KEY_LEN = 128;
 const MAX_ENV_VAL_LEN = 8192;
 const MAX_ENV_ENTRIES = 128;
+const MAX_NATIVE_SELECTOR_LEN = 128;
+
+/**
+ * Allowed characters for a native model selector: letters, digits,
+ * underscore, hyphen, dot, colon, slash. Rejects control characters,
+ * whitespace, and any other character class before the value enters
+ * snapshot, structuredContent, or CLI argv.
+ */
+const NATIVE_SELECTOR_RE = /^[a-zA-Z0-9_\-.:/]+$/;
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
@@ -370,9 +379,16 @@ function deriveAliasMappings(env) {
     if (typeof nameVal === "string" && nameVal.trim() && typeof modelVal === "string" && modelVal.trim()) {
       const canon = nameVal.trim().toLowerCase();
       if (Object.prototype.hasOwnProperty.call(nativeDisplayNames, canon)) {
-        throw configError(
-          `Display-name case-fold collision: "${nameVal}" canonicalizes to a name already declared`
-        );
+        // Same display name → same native ID is valid (shared target):
+        // coalesce silently. Only fail closed when one display name maps
+        // to two different native IDs.
+        if (nativeDisplayNames[canon] !== modelVal) {
+          throw configError(
+            `Display-name collision: "${nameVal}" maps to different native models ` +
+            `(${nativeDisplayNames[canon]} vs ${modelVal})`
+          );
+        }
+        continue;
       }
       nativeDisplayNames[canon] = modelVal;
     }
@@ -423,6 +439,14 @@ function readCcProfileSwitch(home) {
     return null;
   }
   const config = readJsonFile(configPath, "cc-profile-switch config.json");
+
+  // Authority schema version check — unknown future versions fail closed
+  // before any profile path is resolved or Claude is spawned.
+  if (config.version === undefined || config.version !== 1) {
+    throw configError(
+      `cc-profile-switch config.json has unsupported version (expected 1, found ${JSON.stringify(config.version)})`
+    );
+  }
 
   const lastUsedProfile = config.lastUsedProfile;
   if (typeof lastUsedProfile !== "string" || !lastUsedProfile.trim()) {
@@ -512,6 +536,9 @@ function readCcProfileSwitch(home) {
 function readClaudeSettingsAdapter(claudeConfigDir) {
   const settingsPath = path.join(claudeConfigDir, "settings.json");
   if (!pathExists(settingsPath)) return null;
+  // Realpath + containment check: a symlinked settings.json must not
+  // escape the claude config dir. Fail closed before reading.
+  assertFileSafe(settingsPath, claudeConfigDir, "Claude settings.json");
   let stat;
   try {
     stat = fs.lstatSync(settingsPath);
@@ -576,6 +603,9 @@ function readClaudeSettingsAdapter(claudeConfigDir) {
 function readActiveProfileFixture(claudeConfigDir) {
   const profilePath = path.join(claudeConfigDir, ACTIVE_PROFILE_FILENAME);
   if (!pathExists(profilePath)) return null;
+  // Realpath + containment check: a symlinked active-profile.json must
+  // not escape the claude config dir. Fail closed before reading.
+  assertFileSafe(profilePath, claudeConfigDir, "active-profile.json");
   const parsed = readJsonFile(profilePath, "active-profile.json");
 
   const profileIdentity = validateStringField(parsed, "profileIdentity");
@@ -592,15 +622,20 @@ function readActiveProfileFixture(claudeConfigDir) {
     );
   }
 
-  // Canonicalize display names and reject case-fold collisions.
+  // Canonicalize display names. Same display name → same native ID is a
+  // valid shared target and coalesces silently. Different native IDs for
+  // one canonical display name fail closed.
   const nativeDisplayNames = {};
   if (fixtureNativeDisplayNames) {
     for (const [displayName, nativeId] of Object.entries(fixtureNativeDisplayNames)) {
       const canon = displayName.trim().toLowerCase();
       if (Object.prototype.hasOwnProperty.call(nativeDisplayNames, canon)) {
-        throw configError(
-          `active-profile.json display-name case-fold collision on "${displayName}"`
-        );
+        if (nativeDisplayNames[canon] !== nativeId) {
+          throw configError(
+            `active-profile.json display-name collision: "${displayName}" maps to different native models`
+          );
+        }
+        continue;
       }
       nativeDisplayNames[canon] = nativeId;
     }
@@ -770,6 +805,7 @@ export function classifySelector(input, projection = null) {
   if (projection?.nativeDisplayNames) {
     const nativeId = projection.nativeDisplayNames[lower];
     if (nativeId !== undefined) {
+      validateNativeSelector(nativeId);
       return { kind: "native", requestedValue: trimmed, cliArg: nativeId, canonicalAlias: null, resolvedFrom: "display-name" };
     }
   }
@@ -781,12 +817,14 @@ export function classifySelector(input, projection = null) {
       for (const nid of Object.values(projection.nativeDisplayNames)) knownIds.add(nid);
     }
     if (knownIds.has(trimmed)) {
+      validateNativeSelector(trimmed);
       return { kind: "native", requestedValue: trimmed, cliArg: trimmed, canonicalAlias: null, resolvedFrom: "profile-known-native" };
     }
   }
 
   // 4. Heuristic native ID: contains a digit (version indicator), no spaces.
   if (looksLikeNativeId(trimmed)) {
+    validateNativeSelector(trimmed);
     return { kind: "native", requestedValue: trimmed, cliArg: trimmed, canonicalAlias: null, resolvedFrom: "heuristic-native" };
   }
 
@@ -803,6 +841,34 @@ function looksLikeNativeId(input) {
   if (input.includes(" ")) return false;
   if (!/\d/.test(input)) return false;
   return true;
+}
+
+/**
+ * Validate a native model selector before it enters a route snapshot,
+ * structuredContent, or CLI argv. Rejects control characters, whitespace,
+ * overlong values, and characters outside the allowlist. Legitimate native
+ * IDs like deepseek-v4-pro, glm-5.2, anthropic/claude-opus-4 are preserved.
+ *
+ * @param {string} selector - The native selector to validate
+ * @throws {AmbiguousSelectorError} when the selector contains disallowed
+ *   characters, is empty, or exceeds the length bound.
+ */
+function validateNativeSelector(selector) {
+  if (typeof selector !== "string" || selector.length === 0) {
+    throw new AmbiguousSelectorError(String(selector));
+  }
+  if (selector.length > MAX_NATIVE_SELECTOR_LEN) {
+    throw new AmbiguousSelectorError(selector);
+  }
+  if (/[\x00-\x1f\x7f]/.test(selector)) {
+    throw new AmbiguousSelectorError(selector);
+  }
+  if (/\s/.test(selector)) {
+    throw new AmbiguousSelectorError(selector);
+  }
+  if (!NATIVE_SELECTOR_RE.test(selector)) {
+    throw new AmbiguousSelectorError(selector);
+  }
 }
 
 // ─── Route Snapshot Construction ─────────────────────────────────────────────

@@ -39,6 +39,15 @@ const VALID_STAGES = new Set(Object.values(FAILURE_STAGES));
 
 const MAX_TAIL_BYTES = 2048; // 2 KiB per stream tail
 const MAX_SAFE_ERROR_BYTES = 4096; // 4 KiB for safe error message
+const MIN_TASK_MARKER_LEN = 8; // shorter strings are not redacted as task markers
+
+/**
+ * Escape a string for safe use in a RegExp. Prevents regex injection from
+ * task content (which is untrusted user input).
+ */
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 // ─── Redaction Patterns ──────────────────────────────────────────────────────
 
@@ -73,16 +82,28 @@ const REDACTION_PATTERNS = [
 
 /**
  * Redact sensitive content from a text string.
- * Applies all redaction patterns, then bounds the size.
+ * First redacts task markers (prompt text echoed by CLI/Provider), then
+ * applies secret redaction patterns, then bounds the size.
  *
  * @param {string} text - The text to redact
  * @param {number} maxBytes - Maximum bytes to retain (default MAX_TAIL_BYTES)
+ * @param {string[]} [taskMarkers=[]] - Task text fragments to redact
  * @returns {string} Redacted, bounded text
  */
-export function redactText(text, maxBytes = MAX_TAIL_BYTES) {
+export function redactText(text, maxBytes = MAX_TAIL_BYTES, taskMarkers = []) {
   if (!text || typeof text !== "string") return "";
 
   let redacted = text;
+
+  // Redact task markers first — the CLI or Provider may echo prompt text
+  // in error messages. Only markers above a minimum length are redacted
+  // to avoid false positives on short common substrings.
+  for (const marker of taskMarkers) {
+    if (typeof marker === "string" && marker.length >= MIN_TASK_MARKER_LEN) {
+      const escaped = escapeRegExp(marker);
+      redacted = redacted.replace(new RegExp(escaped, "g"), "[TASK_REDACTED]");
+    }
+  }
 
   for (const { pattern, replacement } of REDACTION_PATTERNS) {
     redacted = redacted.replace(pattern, replacement);
@@ -250,10 +271,12 @@ export function classifyFailureStage(signals) {
  * @param {boolean} options.transcriptFound - Whether a transcript was found
  * @param {string} options.stdout - Raw stdout
  * @param {string} options.stderr - Raw stderr
+ * @param {string[]} [options.taskMarkers=[]] - Task text fragments to redact from diagnostics
  * @returns {object} Bounded, redacted failure envelope
  */
 export function buildFailureEnvelope(options) {
   const stage = VALID_STAGES.has(options.stage) ? options.stage : FAILURE_STAGES.PROVIDER_RESPONSE;
+  const taskMarkers = options.taskMarkers || [];
 
   return {
     stage,
@@ -267,9 +290,9 @@ export function buildFailureEnvelope(options) {
     sessionId: options.sessionId || null,
     usageKey: options.usageKey || null,
     transcriptFound: options.transcriptFound || false,
-    errorDetail: options.errorDetail ? redactText(options.errorDetail, MAX_TAIL_BYTES) : null,
-    stdoutTail: redactText(options.stdout, MAX_TAIL_BYTES),
-    stderrTail: redactText(options.stderr, MAX_TAIL_BYTES),
+    errorDetail: options.errorDetail ? redactText(options.errorDetail, MAX_TAIL_BYTES, taskMarkers) : null,
+    stdoutTail: redactText(options.stdout, MAX_TAIL_BYTES, taskMarkers),
+    stderrTail: redactText(options.stderr, MAX_TAIL_BYTES, taskMarkers),
     timestamp: new Date().toISOString(),
   };
 }

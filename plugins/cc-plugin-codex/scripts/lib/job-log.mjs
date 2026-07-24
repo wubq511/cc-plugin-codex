@@ -161,7 +161,7 @@ export function deleteLog(cwd, jobId) {
 
 // ─── Phase Tracking ──────────────────────────────────────────────────────────
 
-const PHASES = ["starting", "executing", "reviewing", "editing", "verifying", "finalizing", "completed", "failed", "cancelled"];
+const PHASES = ["starting", "executing", "reviewing", "editing", "verifying", "finalizing", "completed", "failed", "cancelled", "rejected"];
 
 /**
  * Validate and return the next allowed phases from a given phase.
@@ -177,6 +177,7 @@ export function allowedTransitions(from) {
     case "completed":   return [];
     case "failed":      return [];
     case "cancelled":   return [];
+    case "rejected":    return [];
     default:            return [];
   }
 }
@@ -202,6 +203,7 @@ export function phaseDescription(phase) {
     case "completed":   return "Task completed successfully";
     case "failed":      return "Task failed";
     case "cancelled":   return "Task cancelled by user";
+    case "rejected":    return "Task rejected before execution";
     default:            return phase;
   }
 }

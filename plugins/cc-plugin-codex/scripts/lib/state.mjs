@@ -1,5 +1,5 @@
 /**
- * Job state management — schema v4, atomic per-job persistence.
+ * Job state management — schema v5, atomic per-job persistence.
  *
  * Each job lives in its own JSON file under <stateDir>/jobs/.
  * All writes use tmp+rename for atomicity. Configuration metadata is separate

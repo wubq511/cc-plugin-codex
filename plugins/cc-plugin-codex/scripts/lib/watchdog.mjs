@@ -212,6 +212,7 @@ async function main() {
         stdout: "",
         stderr: err.message,
         structuredError: false,
+        taskMarkers: [task],
       }),
     });
     exitWith(1);
@@ -251,6 +252,7 @@ async function main() {
         stdout: Buffer.concat(stdoutChunks).toString("utf8"),
         stderr: Buffer.concat(stderrChunks).toString("utf8"),
         structuredError: false,
+        taskMarkers: [task],
       }),
     });
     exitWith(1);
@@ -295,6 +297,7 @@ async function main() {
           errorDetail,
           stdout,
           stderr,
+          taskMarkers: [task],
         }),
       };
     }
@@ -336,6 +339,7 @@ async function main() {
           stdout,
           stderr,
           structuredError: false,
+          taskMarkers: [task],
         }),
       });
       exitWith(4);

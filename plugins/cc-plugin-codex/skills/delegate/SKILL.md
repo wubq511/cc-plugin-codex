@@ -14,7 +14,7 @@ Send a coding task to Claude Code for execution. Claude Code runs in a separate 
 1. **Delegate the task** by calling `cc_delegate`:
    - `cwd` (required): absolute path to the user's current workspace
    - `task` (required): the coding task description
-   - `model` (optional): explicit model override for this delegation. When omitted, Claude Code uses its current configured default (inherited from the user's Provider). Accepts any non-empty identifier — the plugin does not validate model names.
+   - `model` (optional): explicit model override for this delegation. When omitted, Claude Code uses its current configured default (inherited from the user's Provider). Accepts a Claude alias (Opus, Fable, Sonnet, Haiku — case-insensitive), a display name declared in the active profile, or a bounded native model ID (e.g., `deepseek-v4-pro`, `glm-5.2`). Ambiguous selectors are rejected — the plugin does not guess or silently fall back.
    - `effort` (optional): reasoning effort level (low, medium, high, xhigh, max)
    - `write`: set to `true` (default) to allow file writes, `false` for read-only analysis (strictly limits tools to Read, Glob, Grep)
    - `background`: DEPRECATED AND REJECTED. Do not pass `background=true` — it will always produce an error. Default foreground delegation waits silently without polling.
@@ -123,4 +123,4 @@ Resume is an explicit conversation-preservation operation, not the default conti
 - Only one write-enabled delegation can run per workspace at a time (writer lease). Read-only delegations can run concurrently.
 - Resume=true resolves to the latest completed plugin job with a claudeSessionId in the same workspace, not a global resume-last.
 - Do not use `--fork-session` as a context-cost optimization: it creates a new session ID while retaining the resumed conversation history.
-- On failure, the MCP output shows only a safe summary with a stage prefix (e.g., `[provider_response]`). `cc_check` additionally exposes a bounded, doubly-redacted diagnostic summary (failure stage, duration, structured-error flag, and a 500-byte error-detail excerpt) for failed/cancelled jobs. Full diagnostics (redacted stdout/stderr tails, exit code, session ID, usage key) live only in the private job artifact — MCP output never exposes raw stdout/stderr, session IDs, or usage keys.
+- On failure, the MCP output shows only a safe summary with a stage prefix (e.g., `[provider_response]`). `cc_check` additionally exposes a safe diagnostic summary (failure stage, duration, structured-error flag) for failed/cancelled/rejected jobs. Full diagnostics (redacted stdout/stderr tails, error detail, exit code, session ID, usage key) live only in the private job artifact — MCP output never exposes raw stdout/stderr, error excerpts, session IDs, or usage keys.

@@ -13,6 +13,7 @@ import {
   resetMigrationFlag, writeResultArtifact, readResultArtifact, cleanupOldJobs
 } from "../scripts/lib/state.mjs";
 import { resolveReviewTarget, collectReviewContext, isSensitivePath } from "../scripts/lib/git.mjs";
+import { readLog } from "../scripts/lib/job-log.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(here, "..");
@@ -2044,4 +2045,134 @@ test("no implicit Opus → Fable auto-downgrade on failure", async (t) => {
   assert.doesNotMatch(text, /fable/i);
   // Must show the failure
   assert.match(text, /\[provider_response\]/);
+});
+
+// ─── Req 2: Black-box task-text leakage test ─────────────────────────────────
+// A CLI/Provider error that echoes the task prompt must not leak the task
+// marker into the diagnostics artifact, job log, cc_delegate output, or
+// cc_check output. Uses the echo-task-error fake-claude mode via env var so
+// the task content (carrying a unique marker) is echoed in stderr.
+
+test("black-box echo: task text echoed by CLI never leaks into diagnostics, logs, or MCP output", async (t) => {
+  // FAKE_CLAUDE_MODE selects echo-task-error mode; the unique marker rides
+  // in the actual task text written to Claude's stdin. The task is padded
+  // past the 4 KiB taskPreview limit so the marker only appears in the
+  // CLI/Provider echo (stderr), never in the plugin's bounded taskPreview —
+  // isolating the redaction concern from the intentional preview field.
+  const server = startServer(t, { env: { FAKE_CLAUDE_MODE: "echo-task-error" } });
+  const uniqueMarker = "UNIQUE_ECHO_MARKER_7x9q2k_SECRET_PROMPT_2026";
+  const task = "Review the boundary module for input validation checks. ".repeat(100) + uniqueMarker;
+  const delegateResult = await server.send(220, "cc_delegate", { task, model: "glm-5.2-pro" });
+  const delegateText = delegateResult.result.content[0].text;
+
+  // 1. cc_delegate MCP output must not contain the echoed task marker.
+  //    Only a safe stage-prefixed summary is exposed.
+  assert.doesNotMatch(delegateText, /UNIQUE_ECHO_MARKER_7x9q2k/);
+  assert.match(delegateText, /\[provider_response\]/);
+
+  const jobs = listJobs(server.workspace);
+  const job = jobs.find((j) => j.status === "failed");
+  assert.ok(job, "echo-task-error must produce a failed job");
+  // Sanity: the marker is beyond the preview truncation point.
+  assert.doesNotMatch(String(job.taskPreview || ""), /UNIQUE_ECHO_MARKER_7x9q2k/);
+
+  // 2. Job state errorMessage must not carry the echoed task marker.
+  assert.doesNotMatch(String(job.errorMessage || ""), /UNIQUE_ECHO_MARKER_7x9q2k/);
+
+  // 3. Diagnostics artifact: the echoed stderr must be redacted.
+  const artifact = readResultArtifact(server.workspace, job.id);
+  assert.ok(artifact, "failed job must have a result artifact");
+  const artifactJson = JSON.stringify(artifact);
+  assert.doesNotMatch(artifactJson, /UNIQUE_ECHO_MARKER_7x9q2k/);
+  // The redaction marker proves the task text was present and scrubbed.
+  assert.match(artifactJson, /\[TASK_REDACTED\]/);
+
+  // 4. Job log must not contain the echoed task marker.
+  const logContent = JSON.stringify(readLog(server.workspace, job.id));
+  assert.doesNotMatch(logContent, /UNIQUE_ECHO_MARKER_7x9q2k/);
+
+  // 5. cc_check output must not expose the marker or any raw error excerpt
+  //    that could carry echoed prompt text.
+  const checkResult = await server.send(221, "cc_check", { job: job.id });
+  const checkText = checkResult.result.content[0].text;
+  assert.doesNotMatch(checkText, /UNIQUE_ECHO_MARKER_7x9q2k/);
+  assert.doesNotMatch(checkText, /Error processing request/);
+  assert.doesNotMatch(checkText, /Context:/);
+  // cc_check shows only a safe diagnostic summary (stage, duration, structured-error flag).
+  assert.match(checkText, /Diagnostic Summary \(safe\)/);
+  assert.match(checkText, /provider_response/);
+});
+
+// ─── Req 6: Preflight route failure creates an auditable rejected job ────────
+// Authority/selector failure must create a bounded rejected job with ID,
+// configuration diagnostic, and private artifact. MCP exposes only the safe
+// category, generic summary, and job ID. Claude is never spawned.
+
+test("preflight ambiguous-selector failure creates a rejected job without spawning Claude", async (t) => {
+  const server = startServer(t);
+  // "deepseek" is ambiguous (no version digit, not a known alias, no profile
+  // display name) — fails closed at the preflight route stage.
+  const result = await server.send(222, "cc_delegate", { task: "do work", model: "deepseek" });
+  const text = result.result.content[0].text;
+
+  // MCP output must show the category, a job ID, and a safe summary — never
+  // the raw error message or a spawned-process failure.
+  assert.match(text, /Ambiguous Model Selector/);
+  assert.match(text, /Job ID:\*\* cc-/);
+  assert.match(text, /Category:\*\* ambiguous-selector/);
+  // Must not expose a provider_response stage (that would imply Claude ran).
+  assert.doesNotMatch(text, /\[provider_response\]/);
+  assert.doesNotMatch(text, /\[spawn\]/);
+
+  // A rejected job must exist in job state.
+  const jobs = listJobs(server.workspace);
+  const job = jobs.find((j) => j.status === "rejected");
+  assert.ok(job, "preflight failure must create a rejected job");
+  assert.equal(job.routeStatus, "rejected");
+  // Claude was never spawned — no pid, no session.
+  assert.equal(job.pid, null);
+  assert.equal(job.claudeSessionId, null);
+  assert.equal(job.routeSnapshot, null);
+
+  // A private artifact with configuration diagnostics must exist.
+  const artifact = readResultArtifact(server.workspace, job.id);
+  assert.ok(artifact, "rejected job must have a result artifact");
+  assert.equal(artifact.routeStatus, "rejected");
+  assert.equal(artifact.routeSnapshot, null);
+  assert.ok(artifact.diagnostics, "rejected job must carry a diagnostics envelope");
+  assert.equal(artifact.diagnostics.stage, "configuration");
+
+  // The job must be visible via cc_check with a safe diagnostic summary.
+  const checkResult = await server.send(223, "cc_check", { job: job.id });
+  const checkText = checkResult.result.content[0].text;
+  assert.match(checkText, /rejected/);
+  assert.match(checkText, /Diagnostic Summary \(safe\)/);
+  assert.match(checkText, /configuration/);
+  // No raw error detail in MCP output.
+  assert.doesNotMatch(checkText, /Error detail/i);
+});
+
+test("preflight configuration failure (corrupt authority) creates a rejected job", async (t) => {
+  const ccpsHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-reject-cfg-"));
+  t.after(async () => { await safeRmDir(ccpsHome); });
+  // Corrupt config.json — valid JSON but missing lastUsedProfile.
+  fs.writeFileSync(path.join(ccpsHome, "config.json"), JSON.stringify({ version: 1 }), "utf8");
+
+  const server = startServer(t, { env: { CC_PROFILE_SWITCH_HOME: ccpsHome } });
+  const result = await server.send(224, "cc_delegate", { task: "do work" });
+  const text = result.result.content[0].text;
+
+  // Configuration error → rejected job, category "configuration".
+  assert.match(text, /Configuration Error/);
+  assert.match(text, /Job ID:\*\* cc-/);
+  assert.match(text, /Category:\*\* configuration/);
+
+  const jobs = listJobs(server.workspace);
+  const job = jobs.find((j) => j.status === "rejected");
+  assert.ok(job);
+  assert.equal(job.pid, null);
+  assert.equal(job.claudeSessionId, null);
+  const artifact = readResultArtifact(server.workspace, job.id);
+  assert.ok(artifact);
+  assert.equal(artifact.diagnostics.stage, "configuration");
 });

@@ -30,6 +30,7 @@
  *   stdin-prompt        — read from stdin, echo it back
  *   multi-usage-keys    — return multiple usage model keys
  *   exec-model          — return a specific execution model in modelUsage (via EXEC_MODEL env)
+ *   echo-task-error     — read task from stdin, echo it in stderr, exit non-zero (tests task redaction)
  */
 
 const args = process.argv.slice(2);
@@ -186,6 +187,18 @@ function handleMode(mode) {
       duration_ms: 50,
       modelUsage: { "mimo-v2.5": {}, "glm-5.1": {} }
     }));
+  } else if (mode === "echo-task-error") {
+    // Read the task from stdin, then echo it back in stderr as if the
+    // CLI/Provider echoed prompt text in an error message. Tests that
+    // task markers are redacted from diagnostics, job state, and MCP output.
+    let input = "";
+    process.stdin.on("data", (chunk) => { input += chunk; });
+    process.stdin.on("end", () => {
+      process.stderr.write(`Error processing request: task="${input.trim()}" failed\n`);
+      process.stderr.write(`Context: ${input.trim()}\n`);
+      process.exitCode = 7;
+    });
+    return;
   } else {
     success();
   }

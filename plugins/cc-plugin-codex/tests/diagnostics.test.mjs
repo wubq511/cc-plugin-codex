@@ -288,3 +288,63 @@ test("buildSafeErrorMessage for cancelled returns cancelled message", () => {
   assert.match(msg, /^\[cancelled\]/);
   assert.match(msg, /cancelled/i);
 });
+
+// ─── Task Marker Redaction (Req 2: task text leakage) ────────────────────────
+
+test("redactText with taskMarkers redacts echoed prompt text", () => {
+  const taskMarker = "UNIQUE_TASK_MARKER_abc123xyz this is a secret prompt";
+  const stderr = `Error: failed to process. task="${taskMarker}" retry needed`;
+  const redacted = redactText(stderr, 2048, [taskMarker]);
+  assert.doesNotMatch(redacted, /UNIQUE_TASK_MARKER_abc123xyz/);
+  assert.match(redacted, /\[TASK_REDACTED\]/);
+});
+
+test("redactText without taskMarkers retains ordinary text", () => {
+  const text = "Error: model not found (HTTP 404)";
+  const redacted = redactText(text, 2048, []);
+  assert.match(redacted, /model not found/);
+});
+
+test("redactText ignores short task markers below minimum length", () => {
+  const shortMarker = "short";
+  const text = `Error: short failed`;
+  const redacted = redactText(text, 2048, [shortMarker]);
+  // Short markers should not be redacted to avoid false positives
+  assert.match(redacted, /short/);
+  assert.doesNotMatch(redactText(text, 2048, [shortMarker]), /\[TASK_REDACTED\]/);
+});
+
+test("redactText handles regex-special characters in task markers safely", () => {
+  const taskMarker = "Task: [sanitize] this (input) {now} *star* +plus+ ?q?";
+  const stderr = `Processing: ${taskMarker}`;
+  const redacted = redactText(stderr, 2048, [taskMarker]);
+  assert.doesNotMatch(redacted, /\[sanitize\]/);
+  assert.match(redacted, /\[TASK_REDACTED\]/);
+});
+
+test("buildFailureEnvelope with taskMarkers redacts task text from all tails", () => {
+  const taskMarker = "PROMPT_TEXT_LEAK_MARKER_98765 secret instructions here";
+  const envelope = buildFailureEnvelope({
+    stage: FAILURE_STAGES.PROVIDER_RESPONSE,
+    stdout: `stdout echoing: ${taskMarker}`,
+    stderr: `stderr echoing: ${taskMarker}`,
+    errorDetail: `error detail with: ${taskMarker}`,
+    taskMarkers: [taskMarker],
+  });
+  assert.doesNotMatch(envelope.stdoutTail, /PROMPT_TEXT_LEAK_MARKER_98765/);
+  assert.doesNotMatch(envelope.stderrTail, /PROMPT_TEXT_LEAK_MARKER_98765/);
+  assert.doesNotMatch(envelope.errorDetail, /PROMPT_TEXT_LEAK_MARKER_98765/);
+  assert.match(envelope.stderrTail, /\[TASK_REDACTED\]/);
+});
+
+test("buildFailureEnvelope without taskMarkers does not redact ordinary text", () => {
+  const envelope = buildFailureEnvelope({
+    stage: FAILURE_STAGES.PROVIDER_RESPONSE,
+    stdout: "model not found",
+    stderr: "rate limit exceeded",
+    errorDetail: "HTTP 429",
+  });
+  assert.match(envelope.stdoutTail, /model not found/);
+  assert.match(envelope.stderrTail, /rate limit/);
+  assert.match(envelope.errorDetail, /429/);
+});
