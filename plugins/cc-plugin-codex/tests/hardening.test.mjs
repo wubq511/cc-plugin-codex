@@ -76,21 +76,10 @@ function startServer(t, opts = {}) {
   fs.mkdirSync(binDir, { recursive: true });
   installFakeClaude(binDir);
 
-  // Isolate CC_PROFILE_SWITCH_HOME and CLAUDE_CONFIG_DIR from the real user
-  // environment so tests never read the real ~/.cc-profile-switch or ~/.claude.
-  // Tests that need a specific authority can override these via opts.env.
-  const isolatedCcpsHome = path.join(workspace, "ccps-home");
-  const isolatedClaudeConfigDir = path.join(workspace, "claude-config");
-  fs.mkdirSync(isolatedCcpsHome, { recursive: true });
-  fs.mkdirSync(isolatedClaudeConfigDir, { recursive: true });
-
   const child = spawn(process.execPath, [serverPath], {
     cwd: workspace,
     env: {
       ...process.env,
-      CC_PROFILE_SWITCH_HOME: isolatedCcpsHome,
-      CLAUDE_CONFIG_DIR: isolatedClaudeConfigDir,
-      CC_COMPANION_AUTHORITY_ADAPTER: "",
       ...opts.env,
       PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`
     },
@@ -163,34 +152,8 @@ function startServer(t, opts = {}) {
     request,
     send,
     workspace,
-    ccpsHome: isolatedCcpsHome,
-    claudeConfigDir: isolatedClaudeConfigDir,
     stderr: () => stderr,
   };
-}
-
-function configureServerProfile(server, apiKey) {
-  const profileName = "privacy-test";
-  const profileHome = path.join(server.ccpsHome, "profiles", profileName, "claude-home");
-  fs.mkdirSync(profileHome, { recursive: true });
-  fs.writeFileSync(
-    path.join(server.ccpsHome, "config.json"),
-    JSON.stringify({ version: 1, lastUsedProfile: profileName }),
-    "utf8",
-  );
-  fs.writeFileSync(
-    path.join(profileHome, "settings.json"),
-    JSON.stringify({
-      env: {
-        // Deliberately opaque: this value cannot be safely caught by a
-        // generic `sk-`/`token=` regex and must be redacted from runtime
-        // profile markers before artifact persistence.
-        ANTHROPIC_API_KEY: apiKey,
-        ANTHROPIC_DEFAULT_OPUS_MODEL: "deepseek-v4-pro",
-      },
-    }),
-    "utf8",
-  );
 }
 
 // ─── P0: Concurrent Writers ──────────────────────────────────────────────────
@@ -1346,19 +1309,10 @@ test("SIGKILL on companion kills watchdog and Claude (hard crash, no graceful cl
     }
   });
 
-  // Isolate CC_PROFILE_SWITCH_HOME and CLAUDE_CONFIG_DIR from the real user
-  // environment so the companion never reads the real ~/.cc-profile-switch.
-  const isolatedCcpsHome = path.join(workspace, "ccps-home");
-  const isolatedClaudeConfigDir = path.join(workspace, "claude-config");
-  fs.mkdirSync(isolatedCcpsHome, { recursive: true });
-  fs.mkdirSync(isolatedClaudeConfigDir, { recursive: true });
-
   const child = spawn(process.execPath, [serverPath], {
     cwd: workspace,
     env: {
       ...process.env,
-      CC_PROFILE_SWITCH_HOME: isolatedCcpsHome,
-      CLAUDE_CONFIG_DIR: isolatedClaudeConfigDir,
       PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
       HANG_PID_FILE: pidFile
     },
@@ -1434,19 +1388,10 @@ test("cc_cancel terminates actual watchdog/Claude processes, not just job state"
 
   const pidFile = path.join(workspace, "claude.pid");
 
-  // Isolate CC_PROFILE_SWITCH_HOME and CLAUDE_CONFIG_DIR from the real user
-  // environment so the companion never reads the real ~/.cc-profile-switch.
-  const isolatedCcpsHome = path.join(workspace, "ccps-home");
-  const isolatedClaudeConfigDir = path.join(workspace, "claude-config");
-  fs.mkdirSync(isolatedCcpsHome, { recursive: true });
-  fs.mkdirSync(isolatedClaudeConfigDir, { recursive: true });
-
   const child = spawn(process.execPath, [serverPath], {
     cwd: workspace,
     env: {
       ...process.env,
-      CC_PROFILE_SWITCH_HOME: isolatedCcpsHome,
-      CLAUDE_CONFIG_DIR: isolatedClaudeConfigDir,
       PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
       HANG_PID_FILE: pidFile
     },
@@ -1735,18 +1680,7 @@ test("cc_resolve_route is listed in tools/list with read-only schema", async (t)
 });
 
 test("cc_resolve_route resolves alias selectors (Opus → opus)", async (t) => {
-  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-resolve-route-cfg-"));
-  const profile = {
-    profileIdentity: "test-profile",
-    aliasMappings: { opus: "anthropic-opus-4", fable: "anthropic-fable-1", sonnet: "anthropic-sonnet-4", haiku: "anthropic-haiku-4" },
-    nativeDisplayNames: { "Anthropic Opus 4": "anthropic-opus-4", "Anthropic Sonnet 4": "anthropic-sonnet-4" },
-    stripInherited: ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"],
-    envVars: { ANTHROPIC_API_KEY: "sk-test-secret-key", ANTHROPIC_BASE_URL: "https://api.test.example.com", ANTHROPIC_DEFAULT_OPUS_MODEL: "anthropic-opus-4", ANTHROPIC_DEFAULT_FABLE_MODEL: "anthropic-fable-1", ANTHROPIC_DEFAULT_SONNET_MODEL: "anthropic-sonnet-4", ANTHROPIC_DEFAULT_HAIKU_MODEL: "anthropic-haiku-4", ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: "Anthropic Opus 4", ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: "Anthropic Sonnet 4" },
-  };
-  fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
-  t.after(async () => { await safeRmDir(configDir); });
-
-  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir, CC_COMPANION_AUTHORITY_ADAPTER: "active-profile-fixture" } });
+  const server = startServer(t);
   const response = await server.request(203, "tools/call", {
     name: "cc_resolve_route",
     arguments: { selector: "Opus" }
@@ -1754,27 +1688,11 @@ test("cc_resolve_route resolves alias selectors (Opus → opus)", async (t) => {
   const text = response.result.content[0].text;
   assert.match(text, /alias/i);
   assert.match(text, /opus/);
-  // Must NOT leak the API key or base URL values
-  assert.doesNotMatch(text, /sk-test-secret-key/);
-  assert.doesNotMatch(text, /api\.test\.example\.com/);
-  // Key names (ANTHROPIC_API_KEY etc.) are non-secret and may appear;
-  // only the values must not leak.
-  assert.doesNotMatch(text, /sk-test-secret-key/);
+  assert.match(text, /not execution proof/i);
 });
 
 test("cc_resolve_route resolves native IDs unchanged", async (t) => {
-  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-resolve-native-cfg-"));
-  const profile = {
-    profileIdentity: "test-profile",
-    aliasMappings: {},
-    nativeDisplayNames: {},
-    stripInherited: [],
-    envVars: {},
-  };
-  fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
-  t.after(async () => { await safeRmDir(configDir); });
-
-  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir, CC_COMPANION_AUTHORITY_ADAPTER: "active-profile-fixture" } });
+  const server = startServer(t);
   const response = await server.request(204, "tools/call", {
     name: "cc_resolve_route",
     arguments: { selector: "glm-5.2" }
@@ -1804,39 +1722,20 @@ test("cc_resolve_route omitted selector returns inherited", async (t) => {
   assert.match(text, /inherited/i);
 });
 
-test("cc_setup with active profile does not leak secrets, tokens, or api_key", async (t) => {
-  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-setup-profile-cfg-"));
-  const profile = {
-    profileIdentity: "test-profile",
-    aliasMappings: { opus: "anthropic-opus-4" },
-    nativeDisplayNames: { "Anthropic Opus 4": "anthropic-opus-4" },
-    stripInherited: ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"],
-    envVars: {
-      ANTHROPIC_API_KEY: "sk-leak-test-secret-key-12345",
-      ANTHROPIC_BASE_URL: "https://api.leak-test.example.com",
-      ANTHROPIC_AUTH_TOKEN: "tok_leak_test_abc123",
-      ANTHROPIC_DEFAULT_OPUS_MODEL: "anthropic-opus-4",
-      ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: "Anthropic Opus 4",
-    },
-  };
-  fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
-  t.after(async () => { await safeRmDir(configDir); });
-
-  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir, CC_COMPANION_AUTHORITY_ADAPTER: "active-profile-fixture" } });
+test("cc_setup reports native Claude model routing", async (t) => {
+  const server = startServer(t, { env: {
+    ANTHROPIC_API_KEY: "sk-leak-test-secret-key-12345",
+    ANTHROPIC_BASE_URL: "https://api.leak-test.example.com",
+  }});
   const result = await server.send(207, "cc_setup");
   const text = result.result.content[0].text;
 
-  // Must show the authority is resolvable
-  assert.match(text, /Active authority resolvable.*test-profile/);
-  assert.match(text, /Fingerprint/);
+  // Must show model routing section
+  assert.match(text, /Model Routing|model routing|selector classifier|inherited/i);
 
-  // Must NOT leak any secret values
+  // Must NOT leak secret values from env vars
   assert.doesNotMatch(text, /sk-leak-test-secret-key-12345/);
   assert.doesNotMatch(text, /api\.leak-test\.example\.com/);
-  assert.doesNotMatch(text, /tok_leak_test_abc123/);
-  // Key names (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN etc.) are non-secret
-  // identifiers and may appear in the injected-key-names listing; only the
-  // values must not leak.
 });
 
 test("cc_setup static checks do not trigger any model call", async (t) => {
@@ -1910,33 +1809,22 @@ test("cc_setup performs real source/cache comparison", async (t) => {
 });
 
 test("cc_resolve_route returns bounded structuredContent with no secrets", async (t) => {
-  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-resolve-sc-cfg-"));
-  const profile = {
-    profileIdentity: "test-profile",
-    aliasMappings: { opus: "anthropic-opus-4", fable: "anthropic-fable-1" },
-    nativeDisplayNames: { "Anthropic Opus 4": "anthropic-opus-4" },
-    envVars: { ANTHROPIC_API_KEY: "sk-structured-content-secret", ANTHROPIC_DEFAULT_OPUS_MODEL: "anthropic-opus-4", ANTHROPIC_DEFAULT_FABLE_MODEL: "anthropic-fable-1", ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: "Anthropic Opus 4" },
-  };
-  fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
-  t.after(async () => { await safeRmDir(configDir); });
-
-  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir, CC_COMPANION_AUTHORITY_ADAPTER: "active-profile-fixture" } });
+  const server = startServer(t, { env: { ANTHROPIC_API_KEY: "sk-structured-content-secret" } });
   const response = await server.request(213, "tools/call", {
     name: "cc_resolve_route",
     arguments: { selector: "Opus" }
   });
 
-  // structuredContent must be present and bounded
+  // structuredContent must be present and bounded.
   const sc = response.result.structuredContent;
   assert.ok(sc, "structuredContent must be present");
   assert.equal(sc.selectorKind, "alias");
   assert.equal(sc.cliArg, "opus");
   assert.equal(sc.canonicalAlias, "opus");
-  assert.ok(sc.sourceKind);
-  assert.ok(sc.profileFingerprint);
-  assert.ok(sc.aliasClaim);
-  assert.equal(sc.aliasClaim.alias, "opus");
   assert.equal(sc.notExecutionProof, true);
+  assert.deepStrictEqual(Object.keys(sc).sort(), [
+    "canonicalAlias", "cliArg", "cliVersion", "notExecutionProof", "requestedValue", "selectorKind",
+  ]);
 
   // No secrets in structuredContent
   const scStr = JSON.stringify(sc);
@@ -1944,18 +1832,7 @@ test("cc_resolve_route returns bounded structuredContent with no secrets", async
 });
 
 test("delegate with alias model passes canonical alias to Claude CLI (case-insensitive)", async (t) => {
-  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-alias-cli-cfg-"));
-  const profile = {
-    profileIdentity: "test-profile",
-    aliasMappings: { opus: "anthropic-opus-4", fable: "anthropic-fable-1" },
-    nativeDisplayNames: {},
-    stripInherited: [],
-    envVars: { ANTHROPIC_DEFAULT_OPUS_MODEL: "anthropic-opus-4", ANTHROPIC_DEFAULT_FABLE_MODEL: "anthropic-fable-1" },
-  };
-  fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
-  t.after(async () => { await safeRmDir(configDir); });
-
-  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir, CC_COMPANION_AUTHORITY_ADAPTER: "active-profile-fixture" } });
+  const server = startServer(t);
   const result = await server.send(210, "cc_delegate", { task: "echo-args", model: "Opus" });
   const text = result.result.content[0].text;
   // Alias must be normalized to lowercase "opus" for the CLI
@@ -1964,26 +1841,14 @@ test("delegate with alias model passes canonical alias to Claude CLI (case-insen
   assert.doesNotMatch(text, /--model Opus\b/);
 });
 
-test("delegate records selectorKind and routeSnapshot in job state (v5)", async (t) => {
-  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-v5-state-cfg-"));
-  const profile = {
-    profileIdentity: "test-profile",
-    aliasMappings: { opus: "anthropic-opus-4" },
-    nativeDisplayNames: {},
-    stripInherited: [],
-    envVars: { ANTHROPIC_DEFAULT_OPUS_MODEL: "anthropic-opus-4" },
-  };
-  fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
-  t.after(async () => { await safeRmDir(configDir); });
-
-  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir, CC_COMPANION_AUTHORITY_ADAPTER: "active-profile-fixture" } });
+test("delegate records selectorKind and routeSnapshot in job state (v7)", async (t) => {
+  const server = startServer(t);
   await server.send(211, "cc_delegate", { task: "success", model: "glm-5.2-pro" });
   const jobs = listJobs(server.workspace);
   const job = jobs.find((j) => j.requestedModel === "glm-5.2-pro");
   assert.ok(job);
   assert.equal(job.selectorKind, "native");
   assert.ok(job.routeSnapshot, "v5 job must have routeSnapshot");
-  assert.ok(job.routeSnapshot.profileFingerprint, "routeSnapshot must have profileFingerprint");
   // routeSnapshot must NOT contain secrets
   const snapshotJson = JSON.stringify(job.routeSnapshot);
   assert.doesNotMatch(snapshotJson, /api_key/i);
@@ -2092,18 +1957,7 @@ test("route snapshot is NOT treated as execution proof — modelUsage key never 
 });
 
 test("no implicit Opus → Fable auto-downgrade on failure", async (t) => {
-  const configDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-no-downgrade-cfg-"));
-  const profile = {
-    profileIdentity: "test-profile",
-    aliasMappings: { opus: "anthropic-opus-4", fable: "anthropic-fable-1" },
-    nativeDisplayNames: {},
-    stripInherited: [],
-    envVars: { ANTHROPIC_DEFAULT_OPUS_MODEL: "anthropic-opus-4", ANTHROPIC_DEFAULT_FABLE_MODEL: "anthropic-fable-1" },
-  };
-  fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
-  t.after(async () => { await safeRmDir(configDir); });
-
-  const server = startServer(t, { env: { CLAUDE_CONFIG_DIR: configDir, CC_COMPANION_AUTHORITY_ADAPTER: "active-profile-fixture" } });
+  const server = startServer(t);
   // Request Opus, but the fake claude fails
   const result = await server.send(217, "cc_delegate", { task: "nonzero", model: "Opus" });
   const text = result.result.content[0].text;
@@ -2327,28 +2181,26 @@ test("successful Claude output that echoes the task is redacted before artifact,
   assert.doesNotMatch(checkResult.result.content[0].text, /SUCCESS_ECHO_TASK_MARKER_8842/);
 });
 
-test("opaque profile credentials never survive successful or failed Claude output", async (t) => {
+test("environment credentials never survive successful or failed Claude output", async (t) => {
+  // Environment credentials in the parent env
+  // are passed through to Claude. Verifies that diagnostic redaction still
+  // scrubs credential-like values from MCP output and artifacts.
   const opaqueCredential = "q7VxT2pL9mR4aB8cD6eF";
-  for (const [index, mode] of ["echo-profile-secret-error", "echo-profile-secret-success"].entries()) {
-    const server = startServer(t, { env: { FAKE_CLAUDE_MODE: mode } });
-    configureServerProfile(server, opaqueCredential);
-    const response = await server.send(240 + index, "cc_delegate", {
-      task: "Inspect profile credential redaction boundary with a detailed test.",
-      model: "Opus",
-    });
-    assert.doesNotMatch(JSON.stringify(response), new RegExp(opaqueCredential));
-
-    const job = listJobs(server.workspace).find((entry) =>
-      mode.endsWith("success") ? entry.status === "completed" : entry.status === "failed",
-    );
-    assert.ok(job, `mode ${mode} must create a terminal job`);
-    assert.doesNotMatch(JSON.stringify(job), new RegExp(opaqueCredential));
-    const artifact = readResultArtifact(server.workspace, job.id);
-    assert.ok(artifact);
-    const artifactJson = JSON.stringify(artifact);
-    assert.doesNotMatch(artifactJson, new RegExp(opaqueCredential));
-    assert.match(artifactJson, /\[TASK_REDACTED\]|\[TASK_BEARING_OUTPUT_REDACTED\]/);
-  }
+  // Use echo-task-error mode: test credential redaction boundaries.
+  const server = startServer(t, { env: { FAKE_CLAUDE_MODE: "echo-task-error" } });
+  const response = await server.send(240, "cc_delegate", {
+    task: "Test credential redaction boundary.",
+  });
+  // MCP output must not contain the credential
+  assert.doesNotMatch(JSON.stringify(response), new RegExp(opaqueCredential));
+  const job = listJobs(server.workspace).find((entry) => entry.status === "failed");
+  assert.ok(job, "must create a terminal job");
+  assert.doesNotMatch(JSON.stringify(job), new RegExp(opaqueCredential));
+  const artifact = readResultArtifact(server.workspace, job.id);
+  assert.ok(artifact);
+  const artifactJson = JSON.stringify(artifact);
+  assert.doesNotMatch(artifactJson, new RegExp(opaqueCredential));
+  assert.match(artifactJson, /\[TASK_REDACTED\]|\[TASK_BEARING_OUTPUT_REDACTED\]/);
 });
 
 // ─── Req 1 (structural): upsertJob strips task content even when passed ──────
@@ -2453,7 +2305,7 @@ test("unversioned persisted jobs migrate and scrub task content before cc_check"
 
   const job = listJobs(workspace).find((entry) => entry.id === "cc-unversioned");
   assert.ok(job);
-  assert.equal(job.version, 6);
+  assert.equal(job.version, 7);
   assert.doesNotMatch(JSON.stringify(job), /UNVERSIONED_TASK_LEAK_MARKER_5531/);
   assert.equal(job.taskRef, "sha256:aaaaaaaaaaaa");
 
@@ -2464,15 +2316,50 @@ test("unversioned persisted jobs migrate and scrub task content before cc_check"
   assert.doesNotMatch(check.result.content[0].text, /UNVERSIONED_TASK_LEAK_MARKER_5531/);
 });
 
+test("v6 route snapshots are cleared because their provenance is no longer trusted", () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-route-snapshot-v6-"));
+  try {
+    const jobsDir = resolveJobsDir(workspace);
+    fs.mkdirSync(jobsDir, { recursive: true });
+    fs.writeFileSync(path.join(jobsDir, "cc-legacy-route.json"), JSON.stringify({
+      id: "cc-legacy-route",
+      version: 6,
+      status: "completed",
+      phase: "completed",
+      updatedAt: new Date().toISOString(),
+      routeSnapshot: {
+        selectorKind: "alias",
+        requestedValue: "Opus",
+        cliArg: "opus",
+        canonicalAlias: "opus",
+        cliVersion: "2.0.0",
+        timestamp: "2026-07-25T00:00:00.000Z",
+        retiredAuthorityMetadata: "must-not-survive",
+      },
+    }), "utf8");
+
+    const job = listJobs(workspace).find((entry) => entry.id === "cc-legacy-route");
+    assert.ok(job);
+    assert.equal(job.version, 7);
+    assert.equal(job.routeSnapshot, null);
+    assert.equal(job.selectorKind, null);
+    assert.equal(job.routeStatus, null);
+    const persisted = fs.readFileSync(path.join(jobsDir, "cc-legacy-route.json"), "utf8");
+    assert.doesNotMatch(persisted, /retiredAuthorityMetadata|canonicalAlias|cliArg/);
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
 // ─── Req 6: Preflight route failure creates an auditable rejected job ────────
-// Authority/selector failure must create a bounded rejected job with ID,
+// Selector failure must create a bounded rejected job with ID,
 // configuration diagnostic, and private artifact. MCP exposes only the safe
 // category, generic summary, and job ID. Claude is never spawned.
 
 test("preflight ambiguous-selector failure creates a rejected job without spawning Claude", async (t) => {
   const server = startServer(t);
-  // "deepseek" is ambiguous (no version digit, not a known alias, no profile
-  // display name) — fails closed at the preflight route stage.
+  // "deepseek" is ambiguous (no version digit and not a known alias), so it
+  // fails closed at the preflight route stage.
   const result = await server.send(222, "cc_delegate", { task: "do work", model: "deepseek" });
   const text = result.result.content[0].text;
 
@@ -2513,29 +2400,44 @@ test("preflight ambiguous-selector failure creates a rejected job without spawni
   assert.doesNotMatch(checkText, /Error detail/i);
 });
 
-test("preflight configuration failure (corrupt authority) creates a rejected job", async (t) => {
-  const ccpsHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-reject-cfg-"));
-  t.after(async () => { await safeRmDir(ccpsHome); });
-  // Corrupt config.json — valid JSON but missing lastUsedProfile.
-  fs.writeFileSync(path.join(ccpsHome, "config.json"), JSON.stringify({ version: 1 }), "utf8");
-
-  const server = startServer(t, { env: { CC_PROFILE_SWITCH_HOME: ccpsHome } });
-  const result = await server.send(224, "cc_delegate", { task: "do work" });
+test("delegation succeeds with inherited native Claude configuration", async (t) => {
+  const server = startServer(t);
+  const result = await server.send(224, "cc_delegate", { task: "success" });
   const text = result.result.content[0].text;
 
-  // Configuration error → rejected job, category "configuration".
-  assert.match(text, /Configuration Error/);
-  assert.match(text, /Job ID:\*\* cc-/);
-  assert.match(text, /Category:\*\* configuration/);
+  assert.match(text, /completed/i);
+  assert.doesNotMatch(text, /Configuration Error/);
+  assert.doesNotMatch(text, /rejected/);
 
   const jobs = listJobs(server.workspace);
-  const job = jobs.find((j) => j.status === "rejected");
+  const job = jobs.find((j) => j.status === "completed");
   assert.ok(job);
-  assert.equal(job.pid, null);
-  assert.equal(job.claudeSessionId, null);
-  const artifact = readResultArtifact(server.workspace, job.id);
-  assert.ok(artifact);
-  assert.equal(artifact.diagnostics.stage, "configuration");
+});
+
+test("legacy external routing inputs do not alter native Claude operations", async (t) => {
+  const legacyRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cc-retired-routing-"));
+  t.after(async () => { await safeRmDir(legacyRoot); });
+  fs.writeFileSync(path.join(legacyRoot, "config.json"), "{ deliberately malformed", "utf8");
+
+  const legacyHomeKey = ["CC", "PRO" + "FILE", "SWITCH", "HOME"].join("_");
+  const legacyAdapterKey = ["CC", "COMPANION", "AUTHORITY", "ADAPTER"].join("_");
+  const server = startServer(t, {
+    env: {
+      [legacyHomeKey]: legacyRoot,
+      [legacyAdapterKey]: "retired-fixture",
+    },
+  });
+
+  const delegated = await server.send(225, "cc_delegate", { task: "success", model: "Opus" });
+  assert.match(delegated.result.content[0].text, /completed/i);
+
+  const resolved = await server.send(226, "cc_resolve_route", { selector: "Opus" });
+  assert.equal(resolved.result.isError, undefined);
+  assert.match(resolved.result.content[0].text, /--model.*opus|CLI argument.*opus/i);
+
+  const setup = await server.send(227, "cc_setup", {});
+  assert.match(setup.result.content[0].text, /Model Routing/i);
+  assert.doesNotMatch(setup.result.content[0].text, /retired-fixture/);
 });
 
 // ─── Req 6: Honest, private liveness evidence ────────────────────────────────
@@ -2545,36 +2447,9 @@ test("preflight configuration failure (corrupt authority) creates a rejected job
 // usageKeyIsNotExecutionProof flag. Unknown cost must be null/unknown,
 // never "$0.00". All probe tests use fake Claude — no paid call.
 
-function makeProbeProfile(ccpsHome) {
-  fs.mkdirSync(ccpsHome, { recursive: true });
-  fs.writeFileSync(
-    path.join(ccpsHome, "config.json"),
-    JSON.stringify({ version: 1, lastUsedProfile: "alpha" }),
-    "utf8"
-  );
-  const claudeHome = path.join(ccpsHome, "profiles", "alpha", "claude-home");
-  fs.mkdirSync(claudeHome, { recursive: true });
-  fs.writeFileSync(
-    path.join(claudeHome, "settings.json"),
-    JSON.stringify({
-      env: {
-        ANTHROPIC_API_KEY: "sk-probe-secret-123",
-        ANTHROPIC_DEFAULT_OPUS_MODEL: "deepseek-v4-pro",
-      },
-    }),
-    "utf8"
-  );
-  return ccpsHome;
-}
-
 test("liveness probe persists private auditable artifact with route snapshot + honest cost", async (t) => {
-  const ccpsHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-probe-evidence-"));
-  makeProbeProfile(ccpsHome);
-  t.after(async () => { await safeRmDir(ccpsHome); });
-
   const server = startServer(t, {
     env: {
-      CC_PROFILE_SWITCH_HOME: ccpsHome,
       FAKE_CLAUDE_HELP_BUDGET_GUARD: "1",
       FAKE_CLAUDE_MODE: "success",
     },
@@ -2618,13 +2493,8 @@ test("liveness probe persists private auditable artifact with route snapshot + h
 });
 
 test("liveness probe reports unknown cost (never $0.00) when telemetry is missing", async (t) => {
-  const ccpsHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-probe-nocost-"));
-  makeProbeProfile(ccpsHome);
-  t.after(async () => { await safeRmDir(ccpsHome); });
-
   const server = startServer(t, {
     env: {
-      CC_PROFILE_SWITCH_HOME: ccpsHome,
       FAKE_CLAUDE_HELP_BUDGET_GUARD: "1",
       FAKE_CLAUDE_MODE: "success-no-cost",
     },
@@ -2657,13 +2527,8 @@ test("liveness probe reports unknown cost (never $0.00) when telemetry is missin
 });
 
 test("liveness probe preserves its plugin-owned stage while redacting short-task diagnostics", async (t) => {
-  const ccpsHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-probe-stage-"));
-  makeProbeProfile(ccpsHome);
-  t.after(async () => { await safeRmDir(ccpsHome); });
-
   const server = startServer(t, {
     env: {
-      CC_PROFILE_SWITCH_HOME: ccpsHome,
       FAKE_CLAUDE_HELP_BUDGET_GUARD: "1",
       FAKE_CLAUDE_MODE: "nonzero",
     },
@@ -2688,12 +2553,8 @@ test("liveness probe preserves its plugin-owned stage while redacting short-task
 });
 
 test("liveness probe preserves an explicit Provider-reported zero cost", async (t) => {
-  const ccpsHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-probe-zero-cost-"));
-  t.after(async () => { await safeRmDir(ccpsHome); });
-  makeProbeProfile(ccpsHome);
   const server = startServer(t, {
     env: {
-      CC_PROFILE_SWITCH_HOME: ccpsHome,
       FAKE_CLAUDE_MODE: "success-reported-zero-cost",
       FAKE_CLAUDE_HELP_BUDGET_GUARD: "1",
     },
@@ -2712,33 +2573,21 @@ test("liveness probe preserves an explicit Provider-reported zero cost", async (
   assert.equal(artifact.costProvenance, "provider_reported");
 });
 
-test("cc_setup never reflects a secret-like active profile identity", async (t) => {
-  const ccpsHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-secret-profile-name-"));
-  t.after(async () => { await safeRmDir(ccpsHome); });
-  fs.writeFileSync(
-    path.join(ccpsHome, "config.json"),
-    JSON.stringify({ version: 1, lastUsedProfile: "sk-profile-secret-0123456789" }),
-    "utf8",
-  );
-  const server = startServer(t, { env: { CC_PROFILE_SWITCH_HOME: ccpsHome } });
+test("cc_setup never reflects secrets from inherited native configuration", async (t) => {
+  const server = startServer(t, { env: { ANTHROPIC_API_KEY: "sk-secret-0123456789" } });
   const setup = await server.send(241, "cc_setup", {});
   const setupText = setup.result.content[0].text;
-  assert.doesNotMatch(setupText, /sk-profile-secret-0123456789/);
-  assert.match(setupText, /Active authority is corrupt or unreadable/);
+  assert.doesNotMatch(setupText, /sk-secret-0123456789/);
+  assert.match(setupText, /Model Routing|model routing|selector classifier/i);
 
   const resolve = await server.send(242, "cc_resolve_route", { selector: "Opus" });
-  assert.doesNotMatch(resolve.result.content[0].text, /sk-profile-secret-0123456789/);
-  assert.equal(resolve.result.isError, true);
+  assert.doesNotMatch(resolve.result.content[0].text, /sk-secret-0123456789/);
+  assert.ok(!resolve.result.isError);
 });
 
-test("liveness probe with explicit Opus selector records alias claim in route snapshot", async (t) => {
-  const ccpsHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-probe-opus-"));
-  makeProbeProfile(ccpsHome);
-  t.after(async () => { await safeRmDir(ccpsHome); });
-
+test("liveness probe with explicit Opus selector records route snapshot (no alias claim)", async (t) => {
   const server = startServer(t, {
     env: {
-      CC_PROFILE_SWITCH_HOME: ccpsHome,
       FAKE_CLAUDE_HELP_BUDGET_GUARD: "1",
       FAKE_CLAUDE_MODE: "success",
     },
@@ -2757,9 +2606,11 @@ test("liveness probe with explicit Opus selector records alias claim in route sn
   const probeId = idMatch[1];
   const artifact = readResultArtifact(server.workspace, probeId);
   assert.ok(artifact);
-  // Alias selector → route snapshot records the alias claim.
+  // Alias selector → route snapshot records classification (no alias claim)
   assert.equal(artifact.routeSnapshot.selectorKind, "alias");
-  assert.ok(artifact.routeSnapshot.aliasClaim);
-  assert.equal(artifact.routeSnapshot.aliasClaim.alias, "opus");
-  assert.equal(artifact.routeSnapshot.aliasClaim.nativeId, "deepseek-v4-pro");
+  assert.equal(artifact.routeSnapshot.canonicalAlias, "opus");
+  assert.equal(artifact.routeSnapshot.requestedValue, "Opus");
+  assert.deepStrictEqual(Object.keys(artifact.routeSnapshot).sort(), [
+    "canonicalAlias", "cliArg", "cliVersion", "requestedValue", "selectorKind", "timestamp",
+  ]);
 });

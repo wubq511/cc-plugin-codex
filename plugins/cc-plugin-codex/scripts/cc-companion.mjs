@@ -3,7 +3,7 @@
 /**
  * Claude Code Companion — MCP Server for Codex
  *
- * Schema v6 with dynamic model routing, route snapshots, failure diagnostics,
+ * Schema v7 with native-Claude model routing, route snapshots, failure diagnostics,
  * atomic per-job persistence, watchdog-based execution, and comprehensive
  * safety hardening.
  *
@@ -16,7 +16,6 @@
  *     sensitive file exclusion, untrusted data framing, canonical review schema,
  *     EPIPE/fatal handling, cc_setup diagnostics.
  * P3: Dynamic model routing (inherited/alias/native), per-job route snapshots,
- *     active profile resolution with secret stripping, cc_resolve_route tool,
  *     structured failure envelopes with redaction, print-mode JSON protocol,
  *     optional cost-bearing liveness probe.
  */
@@ -52,9 +51,8 @@ import {
   normalizeModelIdForStorage, sanitizeModelId, extractUsageModelKeys
 } from "./lib/model-evidence.mjs";
 import {
-  resolveRoute, resolveRouteForDisplay, resolveClaudeConfigDir,
-  getClaudeVersion, classifySelector, AmbiguousSelectorError,
-  readActiveAuthority, ProfileResolutionError
+  resolveRoute, resolveRouteForDisplay,
+  getClaudeVersion, AmbiguousSelectorError
 } from "./lib/routing.mjs";
 import {
   buildSafeErrorMessage, buildSafeErrorSummary, FAILURE_STAGES, buildFailureEnvelope, redactText
@@ -362,7 +360,7 @@ function boundedText(value, maxBytes) {
  * Recursively apply the redaction boundary to an untrusted diagnostics object
  * before it crosses from the watchdog into a private result artifact. The
  * watchdog already redacts its failure envelope, but this second boundary
- * protects future result fields and opaque profile credentials without
+ * protects future result fields and opaque runtime credentials without
  * persisting runtime-only secret values.
  */
 function redactDiagnosticValue(value, markers) {
@@ -446,7 +444,7 @@ const TOOLS = [
         task: { type: "string", description: "The coding task to delegate to Claude Code" },
         write: { type: "boolean", description: "Allow Claude Code to write files (default: true)" },
         background: { type: "boolean", description: "DEPRECATED AND REJECTED. background=true is no longer supported. Default foreground delegation waits silently without polling. This parameter exists only for backward compatibility and will always produce an error if set to true." },
-        model: { type: "string", description: "Explicit model override for this delegation. When omitted, Claude Code uses its current configured default (inherited). Accepts a Claude alias (opus, fable, sonnet, haiku — case-insensitive), a display name declared in the active profile, or a bounded native model ID (e.g., deepseek-v4-pro, glm-5.2). Ambiguous selectors are rejected — the plugin does not guess or silently fall back." },
+        model: { type: "string", description: "Explicit model override for this delegation. When omitted, Claude Code uses its current configured default (inherited). Accepts a Claude alias (opus, fable, sonnet, haiku — case-insensitive) or a bounded native model ID (e.g., deepseek-v4-pro, glm-5.2). Ambiguous selectors are rejected — the plugin does not guess or silently fall back." },
         effort: { type: "string", description: "Reasoning effort level", enum: ["low", "medium", "high", "xhigh", "max"] },
         dangerouslySkipPermissions: { type: "boolean", description: "Skip permission prompts (default: false, set true to allow Claude Code to write without confirmation)" },
         timeoutSeconds: { type: "integer", description: "Optional hard timeout in seconds. When omitted, the task runs until it completes, fails, is cancelled, or the server shuts down. Must be an integer in 1..604800 if supplied." },
@@ -469,7 +467,7 @@ const TOOLS = [
   },
   {
     name: "cc_resolve_route",
-    description: "Read-only model route resolver. Use when the user explicitly names a model for delegation (e.g., Opus, Fable, DeepSeek V4 Pro, GLM 5.2, or a native model ID). Returns the selector kind (alias/native/inherited), the canonical CLI argument, the active profile fingerprint, and a non-secret alias claim if available. Does NOT enumerate Provider models, does NOT promise Provider acceptance, and does NOT make a model call. Unknown or ambiguous selectors are rejected with a clarification message. Omit the selector for inherited (default) behavior — no resolver call is needed.",
+    description: "Read-only model route resolver. Use when the user explicitly names a model for delegation (e.g., Opus, Fable, DeepSeek V4 Pro, GLM 5.2, or a native model ID). Returns the selector kind (alias/native/inherited), the canonical CLI argument, and a non-secret route snapshot. Does NOT enumerate Provider models, does NOT promise Provider acceptance, and does NOT make a model call. Unknown or ambiguous selectors are rejected with a clarification message. Omit the selector for inherited (default) behavior — no resolver call is needed.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -526,7 +524,7 @@ const TOOLS = [
   },
   {
     name: "cc_setup",
-    description: "Check if Claude Code is installed and ready to use. Performs static checks (zero model calls): CLI protocol verification (print-mode JSON support), real source-vs-cache comparison, active authority routing resolvability, and state schema health. Set livenessProbe=true to run a real Provider liveness probe — this makes one model call and incurs a cost. The probe accepts the same optional `model` selector as cc_delegate, requires a positive `timeoutSeconds`, a positive `maxBudgetUsd`, and a CLI budget-guard capability that is verified before the paid call. If the budget guard is unsupported the probe fails closed without a Provider call.",
+    description: "Check if Claude Code is installed and ready to use. Performs static checks (zero model calls): CLI protocol verification (print-mode JSON support), real source-vs-cache comparison, model routing classifier status, and state schema health. Set livenessProbe=true to run a real Provider liveness probe — this makes one model call and incurs a cost. The probe accepts the same optional `model` selector as cc_delegate, requires a positive `timeoutSeconds`, a positive `maxBudgetUsd`, and a CLI budget-guard capability that is verified before the paid call. If the budget guard is unsupported the probe fails closed without a Provider call.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -637,22 +635,16 @@ async function handleDelegate(params, context = {}) {
   }
 
   // P0: Dynamic route resolution — fresh snapshot per job, no cross-job caching.
-  // Resolves the selector kind (inherited/alias/native), builds a non-secret
-  // route snapshot, and constructs the child environment (strips stale
-  // ANTHROPIC_* vars, injects active profile secrets).
-  // The active authority is re-read fresh from cc-profile-switch (or fallback)
-  // on every call — a profile switch takes effect on the next delegation
-  // without restarting the companion.
+  // Classifies the selector kind (inherited/alias/native) and builds a
+  // non-secret route snapshot. No filesystem access or configuration reading.
+  // The child environment is passed through from the parent unchanged.
   let route;
   try {
-    const claudeConfigDir = resolveClaudeConfigDir();
     const cliVersion = getClaudeVersion(cwd);
     route = resolveRoute({
-      claudeConfigDir,
       selectorInput: model,
       cliVersion,
-      parentEnv: process.env,
-      env: process.env
+      parentEnv: process.env
     });
   } catch (err) {
     // Preflight route failure: create a bounded rejected job for auditability.
@@ -762,8 +754,8 @@ async function handleDelegate(params, context = {}) {
     cleanupOldJobs(workspaceRoot);
 
     const guidance = err instanceof AmbiguousSelectorError
-      ? `\n\nTo resolve:\n- Use a Claude alias: \`opus\`, \`fable\`, \`sonnet\`, \`haiku\` (case-insensitive)\n- Use a full native model ID with version (e.g., \`deepseek-v4-pro\`, \`glm-5.2\`)\n- Use a display name declared in the active profile\n- Omit \`model\` entirely for inherited (default) behavior`
-      : `\n\nThe active authority (cc-profile-switch or Claude settings) must resolve before any delegation. Fix the configuration or remove it to use bare inheritance.`;
+      ? `\n\nTo resolve:\n- Use a Claude alias: \`opus\`, \`fable\`, \`sonnet\`, \`haiku\` (case-insensitive)\n- Use a full native model ID with version (e.g., \`deepseek-v4-pro\`, \`glm-5.2\`)\n- Omit \`model\` entirely for inherited (default) behavior`
+      : `\n\nThe model selector could not be resolved. Fix the selector or omit it to use inherited (default) behavior.`;
 
     return {
       content: [{
@@ -782,7 +774,6 @@ async function handleDelegate(params, context = {}) {
   const selectorKind = route.selector.kind;
   const routeSnapshot = route.snapshot;
   const childEnv = route.childEnv;
-  const sensitiveMarkers = [task, ...(route.sensitiveMarkers || [])];
   const cliVersion = route.snapshot.cliVersion;
 
   // P0: Resume semantics — resolve resume=true to latest completed job
@@ -903,7 +894,6 @@ async function handleDelegate(params, context = {}) {
     resumeSession: resolvedResumeSession,
     timeout: timeoutMs,
     childEnv,
-    sensitiveMarkers: route.sensitiveMarkers,
     routeSnapshot,
     cliVersion
   });
@@ -1011,12 +1001,12 @@ async function handleDelegate(params, context = {}) {
     );
     // Task text may legitimately be short in a successful response, but an
     // opaque credential must always prefer fail-safe redaction. Keep the two
-    // marker classes separate so a chunked short profile secret cannot evade
+    // marker classes separate so a chunked short credential cannot evade
     // the task-friendly success-path policy above.
     const safeResult = redactText(
       taskSafeResult,
       Number.POSITIVE_INFINITY,
-      route.sensitiveMarkers || [],
+      [task],
     );
     const resultArtifactPath = writeResultArtifact(workspaceRoot, jobId, {
       result: safeResult,
@@ -1079,7 +1069,6 @@ async function handleDelegate(params, context = {}) {
       requestedModel: storedRequestedModel,
       requestMode: model ? "explicit" : "inherited",
       modelEvidence,
-      routeSnapshot,
       routeStatus,
       selectorKind
     });
@@ -1129,7 +1118,7 @@ async function handleDelegate(params, context = {}) {
         usageSource: "claude-result-modelUsage",
         warnings: []
       },
-      diagnostics: redactDiagnosticValue(result.diagnostics, sensitiveMarkers),
+      diagnostics: redactDiagnosticValue(result.diagnostics, [task]),
       failureStage
     });
 
@@ -1177,7 +1166,6 @@ function handleListModels(params = {}) {
         requestedModel: latest.requestedModel,
         requestMode: latest.requestMode || (latest.requestedModel ? "explicit" : "inherited"),
         modelEvidence: latest.modelEvidence,
-        routeSnapshot: latest.routeSnapshot || null,
         routeStatus: latest.routeStatus || null,
         selectorKind: latest.selectorKind || null
       });
@@ -1201,7 +1189,7 @@ function handleListModels(params = {}) {
     "When `model` is omitted from `cc_delegate`, Claude Code uses its current configured default. No model is selected or injected by the plugin.",
     "",
     "### Explicit Override",
-    "Supply a `model` selector to `cc_delegate` to override the default for a single delegation. Accepted forms: a Claude alias (opus, fable, sonnet, haiku — case-insensitive), a display name declared in the active profile, or a bounded native model ID (e.g., deepseek-v4-pro, glm-5.2). Ambiguous selectors are rejected — the plugin does not guess or silently fall back.",
+    "Supply a `model` selector to `cc_delegate` to override the default for a single delegation. Accepted forms: a Claude alias (opus, fable, sonnet, haiku — case-insensitive) or a bounded native model ID (e.g., deepseek-v4-pro, glm-5.2). Ambiguous selectors are rejected — the plugin does not guess or silently fall back.",
     "",
     "### Effort",
     "`effort` is an independent Claude CLI control (low, medium, high, xhigh, max). It is not coupled to any specific model.",
@@ -1214,19 +1202,15 @@ function handleListModels(params = {}) {
 // cc_resolve_route — read-only model route resolver
 function handleResolveRoute(params) {
   // cc_resolve_route is stateless — it does NOT require cwd.
-  // It resolves the selector against the active authority only.
-  // The authority is re-read fresh on every call.
-  const claudeConfigDir = resolveClaudeConfigDir();
+  // It classifies the selector against the routing classifier only.
   const cliVersion = getClaudeVersion();
   const selectorInput = params.selector ?? null;
 
   let resolution;
   try {
     resolution = resolveRouteForDisplay({
-      claudeConfigDir,
       selectorInput,
-      cliVersion,
-      env: process.env
+      cliVersion
     });
   } catch (err) {
     if (err instanceof AmbiguousSelectorError) {
@@ -1236,26 +1220,16 @@ function handleResolveRoute(params) {
       return {
         content: [{
           type: "text",
-          text: `## Ambiguous Model Selector\n\nThe supplied model selector could not be safely resolved to a Claude alias or native model ID.\n\n${buildSafeErrorSummary(FAILURE_STAGES.CONFIGURATION, err.message)}\n\nTo resolve:\n- Use a Claude alias: \`opus\`, \`fable\`, \`sonnet\`, \`haiku\` (case-insensitive)\n- Use a full native model ID with version (e.g., \`deepseek-v4-pro\`, \`glm-5.2\`)\n- Use a display name declared in the active profile\n\nOmit the selector entirely for inherited (default) behavior.`
+          text: `## Ambiguous Model Selector\n\nThe supplied model selector could not be safely resolved to a Claude alias or native model ID.\n\n${buildSafeErrorSummary(FAILURE_STAGES.CONFIGURATION, err.message)}\n\nTo resolve:\n- Use a Claude alias: \`opus\`, \`fable\`, \`sonnet\`, \`haiku\` (case-insensitive)\n- Use a full native model ID with version (e.g., \`deepseek-v4-pro\`, \`glm-5.2\`)\n\nOmit the selector entirely for inherited (default) behavior.`
         }],
         isError: true
       };
     }
-    if (err instanceof ProfileResolutionError) {
-      // Req 5: never echo raw configuration text or error strings.
-      return {
-        content: [{
-          type: "text",
-          text: `## Configuration Error\n\nThe active profile authority could not be safely resolved.\n\n${buildSafeErrorSummary(FAILURE_STAGES.CONFIGURATION, err.message)}\n\nNo fallback profile is used. Fix the configuration or remove it to use bare inheritance.`
-        }],
-        isError: true
-      };
-    }
-    // Corrupt or unreadable active profile — fail closed
+    // Any non-AmbiguousSelectorError is an unexpected configuration failure.
     return {
       content: [{
         type: "text",
-        text: `## Configuration Error\n\nThe active profile could not be safely resolved.\n\n${buildSafeErrorSummary(FAILURE_STAGES.CONFIGURATION, err.message)}\n\nNo fallback profile is used. Fix the profile file or remove it to use bare inheritance.`
+        text: `## Configuration Error\n\nThe model route could not be resolved.\n\n${buildSafeErrorSummary(FAILURE_STAGES.CONFIGURATION, err.message)}`
       }],
       isError: true
     };
@@ -1274,27 +1248,6 @@ function handleResolveRoute(params) {
   }
   if (resolution.resolvedFrom) {
     lines.push(`**Resolved from:** ${resolution.resolvedFrom}`);
-  }
-  if (resolution.sourceKind) {
-    lines.push(`**Authority source:** ${resolution.sourceKind}`);
-  }
-  if (resolution.profileIdentity) {
-    lines.push(`**Active profile:** ${resolution.profileIdentity}`);
-    lines.push(`**Profile fingerprint:** ${resolution.profileFingerprint || "—"}`);
-  } else {
-    lines.push(`**Active profile:** none (bare inheritance from parent environment)`);
-  }
-  if (resolution.injectedKeyNames && resolution.injectedKeyNames.length > 0) {
-    lines.push(`**Injected env keys:** ${resolution.injectedKeyNames.join(", ")} (values not displayed)`);
-  }
-  if (resolution.routingPolicy) {
-    const policyParts = [];
-    if (resolution.routingPolicy.bedrock) policyParts.push("Bedrock");
-    if (resolution.routingPolicy.vertex) policyParts.push("Vertex");
-    lines.push(`**Routing policy:** ${policyParts.length > 0 ? policyParts.join(" + ") : "Anthropic direct"}`);
-  }
-  if (resolution.aliasClaim) {
-    lines.push(`**Alias claim:** ${resolution.aliasClaim.alias} → ${resolution.aliasClaim.nativeId}`);
   }
   if (resolution.cliVersion) {
     lines.push(`**Claude CLI version:** ${resolution.cliVersion}`);
@@ -1429,7 +1382,6 @@ async function handleCheck(params) {
     requestedModel: job.requestedModel,
     requestMode: job.requestMode || (job.requestedModel ? "explicit" : "inherited"),
     modelEvidence: job.modelEvidence,
-    routeSnapshot: job.routeSnapshot || null,
     routeStatus: job.routeStatus || null,
     selectorKind: job.selectorKind || null
   });
@@ -1707,7 +1659,6 @@ function handleReview(params) {
     requestedModel: job.requestedModel,
     requestMode: job.requestMode || (job.requestedModel ? "explicit" : "inherited"),
     modelEvidence: job.modelEvidence,
-    routeSnapshot: job.routeSnapshot || null,
     routeStatus: job.routeStatus || null,
     selectorKind: job.selectorKind || null
   });
@@ -1777,7 +1728,7 @@ async function handleSetup(params) {
 
   // Version info (no secrets)
   lines.push(`**Plugin Version:** ${SERVER_VERSION}`);
-  lines.push(`**State Schema:** v6 (task privacy boundary, dynamic model routing, route snapshots, failure diagnostics)`);
+  lines.push(`**State Schema:** v7 (task privacy boundary, native-Claude routing, route snapshots, failure diagnostics)`);
 
   if (claudeStatus.available) {
     lines.push(`✅ Claude Code: ${claudeStatus.detail}`);
@@ -1863,7 +1814,7 @@ async function handleSetup(params) {
   } else {
     lines.push(`⚠️ Could not determine Claude CLI version (best-effort)`);
   }
-  lines.push(`✅ Companion server: v${SERVER_VERSION}, schema v6`);
+  lines.push(`✅ Companion server: v${SERVER_VERSION}, schema v7`);
   lines.push(`✅ Watchdog protocol: --print --input-format text --output-format json (task via stdin, never argv)`);
 
   let sourceCacheOk = false;
@@ -1910,39 +1861,12 @@ async function handleSetup(params) {
     sourceCacheOk = false;
   }
 
-  // ── Active Authority Routing Resolvability Check (zero model calls) ──
-  // Reads the active authority (cc-profile-switch, active-profile fixture, or
-  // Claude settings) and verifies it can be safely resolved. Does NOT make a
-  // model call. Does NOT display secrets.
-  lines.push(`\n### Active Authority Routing Resolvability (zero model calls)`);
-  let profileResolvable = false;
-  let profileIdentity = null;
-  let profileFingerprint = null;
-  try {
-    const profile = readActiveAuthority({ env: process.env });
-    if (profile === null) {
-      lines.push(`✅ No active authority found — bare inheritance from parent environment (no profile stripping)`);
-      profileResolvable = true;
-    } else {
-      const sourceKind = profile.projection.sourceKind || "unknown";
-      profileIdentity = profile.projection.profileIdentity || "(unnamed)";
-      profileFingerprint = profile.projection.profileFingerprint || "—";
-      lines.push(`✅ Active authority resolvable: ${sourceKind} → ${profileIdentity}`);
-      lines.push(`- **Fingerprint:** ${profileFingerprint}`);
-      const aliasCount = profile.projection.aliasMappings ? Object.keys(profile.projection.aliasMappings).length : 0;
-      const nativeCount = profile.projection.nativeDisplayNames ? Object.keys(profile.projection.nativeDisplayNames).length : 0;
-      lines.push(`- **Alias mappings:** ${aliasCount}`);
-      lines.push(`- **Native display names:** ${nativeCount}`);
-      lines.push(`- **Injected env keys:** ${(profile.projection.injectedKeyNames || []).join(", ") || "(none)"}`);
-      lines.push(`- **Routing policy:** bedrock=${profile.projection.routingPolicy?.bedrock || false}, vertex=${profile.projection.routingPolicy?.vertex || false}`);
-      lines.push(`- **Private env vars:** ${Object.keys(profile.secrets.envVars).length} (values not displayed)`);
-      profileResolvable = true;
-    }
-  } catch (err) {
-    lines.push(`❌ Active authority is corrupt or unreadable.`);
-    lines.push(`   ${buildSafeErrorSummary(FAILURE_STAGES.CONFIGURATION, err.message)}`);
-    lines.push(`   No fallback profile is used. Fix the configuration or remove it for bare inheritance.`);
-  }
+  // ── Model Routing (zero model calls) ──
+  // The plugin delegates to native Claude only. Model selection is inherited
+  // from native Claude configuration unless a validated selector is forwarded
+  // directly to `claude`.
+  lines.push(`\n### Model Routing (zero model calls)`);
+  lines.push(`✅ Model routing: selector classifier active (inherited / alias / native). No external routing configuration is read.`);
 
   const workspaceRoot = rememberWorkspaceRoot(cwd);
   let defaultBranch = "HEAD~1";
@@ -1979,7 +1903,7 @@ async function handleSetup(params) {
 
   // ── Optional Liveness Probe (cost-bearing, explicitly authorized) ──
   // Requires: livenessProbe=true, positive timeoutSeconds, positive maxBudgetUsd,
-  // CLI budget-guard support, CLI protocol ok, profile resolvable.
+  // CLI budget-guard support and CLI protocol availability.
   // Fails closed (no Provider call) if any prerequisite is unmet.
   if (livenessProbe) {
     lines.push(`\n### Provider Liveness Probe (COST-BEARING — one model call)`);
@@ -1990,8 +1914,6 @@ async function handleSetup(params) {
       lines.push(`❌ Probe refused (fail-closed): Claude CLI not available`);
     } else if (!cliProtocolOk) {
       lines.push(`❌ Probe refused (fail-closed): CLI protocol check failed`);
-    } else if (!profileResolvable) {
-      lines.push(`❌ Probe refused (fail-closed): active authority is not resolvable`);
     } else if (!budgetGuardSupported) {
       // Budget guard unsupported — MUST fail closed, no Provider call
       lines.push(`❌ Probe refused (fail-closed): CLI does not support --max-budget-usd budget guard.`);
@@ -2003,14 +1925,11 @@ async function handleSetup(params) {
       let probeRoute = null;
       let probeStartedAt = null;
       try {
-        const claudeConfigDir = resolveClaudeConfigDir();
         try {
           probeRoute = resolveRoute({
-            claudeConfigDir,
             selectorInput: probeModel,
             cliVersion,
-            parentEnv: process.env,
-            env: process.env
+            parentEnv: process.env
           });
         } catch (routeErr) {
           // Req 5: don't echo raw error text. Use safe category + summary.
@@ -2036,7 +1955,7 @@ async function handleSetup(params) {
           });
           lines.push(`- **Probe ID:** ${probeJobId} (private artifact persisted)`);
           // Skip the probe — route is not resolvable
-          const staticChecksOk = claudeStatus.available && nodeStatus.available && cliProtocolOk && profileResolvable && sourceCacheOk;
+          const staticChecksOk = claudeStatus.available && nodeStatus.available && cliProtocolOk && sourceCacheOk;
           lines.push("\n" + (staticChecksOk ? "✅ Static checks passed (zero model calls)" : "❌ Setup incomplete"));
           return { content: [{ type: "text", text: lines.join("\n") }] };
         }
@@ -2079,7 +1998,6 @@ async function handleSetup(params) {
           resumeSession: null,
           timeout: probeTimeoutSeconds * 1000,
           childEnv: probeRoute.childEnv,
-          sensitiveMarkers: probeRoute.sensitiveMarkers,
           routeSnapshot: probeRoute.snapshot,
           cliVersion,
           maxBudgetUsd: probeMaxBudgetUsd
@@ -2151,7 +2069,7 @@ async function handleSetup(params) {
           usageKeyIsNotExecutionProof: true,
           diagnostics: redactDiagnosticValue(
             probeResult.diagnostics,
-            [probeTask, ...(probeRoute.sensitiveMarkers || [])],
+            [probeTask],
           ),
         });
 
@@ -2205,7 +2123,7 @@ async function handleSetup(params) {
               errorDetail: err?.message || "liveness probe infrastructure error",
               stdout: "",
               stderr: "",
-              taskMarkers: ["Reply with exactly: OK", ...(probeRoute?.sensitiveMarkers || [])],
+              taskMarkers: ["Reply with exactly: OK"],
             }),
           });
         } catch { /* the pre-call artifact remains if finalization itself fails */ }
@@ -2216,7 +2134,7 @@ async function handleSetup(params) {
   }
 
   // ── Summary ──
-  const staticChecksOk = claudeStatus.available && nodeStatus.available && cliProtocolOk && profileResolvable && sourceCacheOk;
+  const staticChecksOk = claudeStatus.available && nodeStatus.available && cliProtocolOk && sourceCacheOk;
   if (staticChecksOk) {
     lines.push("\n✅ Static checks passed (zero model calls)\n");
     lines.push("Use `/claude:delegate` to start delegating tasks. Use `cc_resolve_route` to preview model routing.");
@@ -2236,9 +2154,6 @@ async function handleSetup(params) {
     }
     if (!cliProtocolOk) {
       lines.push("Update Claude Code to support print-mode JSON: `npm update -g @anthropic-ai/claude-code`");
-    }
-    if (!profileResolvable) {
-      lines.push("Fix or remove the corrupt active authority configuration (cc-profile-switch or Claude settings).");
     }
     if (!sourceCacheOk) {
       lines.push("Reinstall the plugin to sync source and cache: `codex plugin add cc-plugin-codex@cc-plugin-codex`");

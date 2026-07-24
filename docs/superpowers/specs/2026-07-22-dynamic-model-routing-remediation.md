@@ -1,5 +1,7 @@
 # Dynamic Model Routing — Final Review and Remediation
 
+> Historical remediation — superseded by [Remove cc-profile-switch Coupling](2026-07-25-remove-cc-profile-switch-coupling-design.md). It does not describe the current runtime and must not be used as implementation or user-operation guidance.
+
 > Status: superseded by [final review round 2](2026-07-24-dynamic-model-routing-final-review.md); additional rework is required before merge.
 >
 > Reviewed branch: `glm/dynamic-model-routing@ad8bcebbe39a97225a0fdbcbdef3d7473a421950`

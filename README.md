@@ -13,7 +13,7 @@
 ## 功能
 
 - **分派任务** — 把编码任务交给 Claude Code，可选传入任意模型标识和推理强度
-- **动态模型路由** — 支持 inherited/alias/native 三种选择器意图，按 job 重新解析 active profile，旧环境变量不污染新 profile
+- **动态模型路由** — 支持 inherited/alias/native 三种选择器意图；每次任务直接调用原生 Claude Code，不读取任何外部路由配置
 - **Provider 无关** — 默认继承用户当前 Claude Code 配置的 Provider 和模型，无需手动选择
 - **自动等待完成** — 所有任务保持一次 pending 调用，完成后自动返回，不需要轮询
 - **任务隐私** — 任务通过 stdin 传递，不出现在任何进程命令行中
@@ -72,7 +72,7 @@ codex plugin add cc-plugin-codex
 - **native**：如 `deepseek-v4-pro` / `glm-5.2`，原样透传
 - 不明确的模型家族描述会被拒绝（fail closed），不猜测不 fallback
 
-默认 authority 为 cc-profile-switch，且每次分派都会重新读取 active profile；切换 Provider 后下一次任务会使用新映射。没有 cc-profile-switch 时默认回到 bare inherit，不会静默采用残留本地文件。仅在兼容/测试场景显式设置 `CC_COMPANION_AUTHORITY_ADAPTER=claude-settings` 或 `active-profile-fixture` 后，才会读取对应 fallback 配置。
+插件不读取、不写入、也不调用任何外部配置管理工具。未指定 `model` 时，它不传 `--model`，完全继承原生 Claude Code 的当前配置；指定 `Opus`、`Fable`、`Sonnet` 或 `Haiku` 时只把规范化别名原样传给 `claude --model`；指定 `deepseek-v4-pro`、`glm-5.2` 等合法原生 ID 时直接透传。插件不会猜测别名实际指向的 Provider 模型，真实执行模型只以 Claude transcript 证据为准。
 
 通过 `effort` 参数指定推理强度。使用 `cc_resolve_route` 可在不发起模型调用的前提下预览模型路由解析结果。
 
@@ -158,7 +158,7 @@ liveness probe。
     │       ├── git.mjs            # Git 集成（diff、review context）
     │       ├── job-log.mjs        # Job 日志和阶段追踪
     │       ├── process.mjs        # 进程管理
-    │       ├── state.mjs          # Job 状态、writer lease 与保留策略（schema v6）
+    │       ├── state.mjs          # Job 状态、writer lease 与保留策略（schema v7）
     │       ├── model-evidence.mjs # 模型证据模块统一出口
     │       ├── model-evidence-collector.mjs # 有界 transcript 采集
     │       ├── model-evidence-formatter.mjs # 统一安全展示

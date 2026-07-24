@@ -239,7 +239,7 @@ function boundedFailSafe(originalText, maxBytes) {
  * @param {string} text - The text to redact
  * @param {number} maxBytes - Maximum bytes to retain (default MAX_TAIL_BYTES)
  * @param {string[]} [taskMarkers=[]] - Sensitive text fragments to redact;
- *   this includes the task plus runtime-only profile credential values
+ *   this includes the task plus any runtime-only credential markers
  * @param {{ failSafeShortMarkers?: boolean }} [options] - Diagnostics retain
  *   the conservative default; a successful result may opt out only after
  *   literal replacement, so ordinary output for a short task is preserved.
@@ -490,8 +490,8 @@ export function buildSafeErrorSummary(stage, fallbackMessage) {
   const messages = {
     [FAILURE_STAGES.SPAWN]: "Failed to start Claude Code. The CLI binary may be missing or not executable.",
     [FAILURE_STAGES.CLI_CONTRACT]: "Claude CLI protocol error. The installed CLI may not support print-mode JSON output. Try updating Claude Code.",
-    [FAILURE_STAGES.CONFIGURATION]: "Configuration error. The active profile could not be safely resolved.",
-    [FAILURE_STAGES.PROVIDER_HANDSHAKE]: "Provider authentication or authorization failed. Check API keys and profile configuration.",
+    [FAILURE_STAGES.CONFIGURATION]: "Configuration error. The model selector could not be safely resolved.",
+    [FAILURE_STAGES.PROVIDER_HANDSHAKE]: "Provider authentication or authorization failed. Check native Claude Code credentials and configuration.",
     [FAILURE_STAGES.PROVIDER_RESPONSE]: "Provider returned an error. The model may be unavailable, rate-limited, or rejected.",
     [FAILURE_STAGES.JSON_PROTOCOL]: "Claude CLI produced non-JSON output. The CLI version may be incompatible.",
     [FAILURE_STAGES.TIMEOUT]: "Claude task timed out and was terminated.",

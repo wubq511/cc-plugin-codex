@@ -1,5 +1,5 @@
 /**
- * Job state management — schema v6, atomic per-job persistence.
+ * Job state management — schema v7, atomic per-job persistence.
  *
  * Each job lives in its own JSON file under <stateDir>/jobs/.
  * All writes use tmp+rename for atomicity. Configuration metadata is separate
@@ -15,7 +15,7 @@ import path from "node:path";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 import { migrateV3ModelFields } from "./model-evidence.mjs";
 
-const STATE_VERSION = 6;
+const STATE_VERSION = 7;
 const CONFIG_FILE_NAME = "config.json";
 const LEASE_FILE_NAME = "lease.lock";
 const JOBS_DIR_NAME = "jobs";
@@ -32,6 +32,55 @@ const FILE_MODE = 0o600;
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+// A route snapshot is an audit record of the exact selector forwarded to
+// native Claude. Keep this whitelist at the persistence boundary so stale
+// versions of the plugin cannot keep arbitrary routing metadata in current
+// state files.
+const ROUTE_SNAPSHOT_FIELDS = Object.freeze([
+  "selectorKind",
+  "requestedValue",
+  "cliArg",
+  "canonicalAlias",
+  "cliVersion",
+  "timestamp",
+]);
+
+function sanitizeRouteSnapshot(snapshot) {
+  if (snapshot === null || snapshot === undefined) return snapshot;
+  if (typeof snapshot !== "object" || Array.isArray(snapshot)) return null;
+
+  const sanitized = {};
+  for (const field of ROUTE_SNAPSHOT_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(snapshot, field)) {
+      sanitized[field] = snapshot[field];
+    }
+  }
+
+  const originalKeys = Object.keys(snapshot);
+  if (originalKeys.length === Object.keys(sanitized).length
+    && originalKeys.every((key) => Object.prototype.hasOwnProperty.call(sanitized, key))) {
+    return snapshot;
+  }
+  return sanitized;
+}
+
+function sanitizeJobForStorage(jobData) {
+  const hasTask = Object.prototype.hasOwnProperty.call(jobData, "task");
+  const hasTaskPreview = Object.prototype.hasOwnProperty.call(jobData, "taskPreview");
+  const hasRouteSnapshot = Object.prototype.hasOwnProperty.call(jobData, "routeSnapshot");
+  const sanitizedSnapshot = hasRouteSnapshot
+    ? sanitizeRouteSnapshot(jobData.routeSnapshot)
+    : undefined;
+  const snapshotChanged = hasRouteSnapshot && sanitizedSnapshot !== jobData.routeSnapshot;
+  if (!hasTask && !hasTaskPreview && !snapshotChanged) return jobData;
+
+  const sanitized = { ...jobData };
+  delete sanitized.task;
+  delete sanitized.taskPreview;
+  if (hasRouteSnapshot) sanitized.routeSnapshot = sanitizedSnapshot;
+  return sanitized;
 }
 
 // ─── Path Resolution ─────────────────────────────────────────────────────────
@@ -261,9 +310,7 @@ function writeJobFile(cwd, jobId, jobData) {
   // dropped here. Only the non-reversible `taskRef` (short SHA-256 prefix) and
   // the full `taskHash` (irreversible, retained for migration derivation) may
   // be persisted. The full task enters only the Claude child stdin stream.
-  const sanitized = { ...jobData };
-  delete sanitized.task;
-  delete sanitized.taskPreview;
+  const sanitized = sanitizeJobForStorage(jobData);
   const serialized = JSON.stringify(sanitized, null, 2);
   const size = Buffer.byteLength(serialized, "utf8");
   if (size > MAX_JOB_METADATA_BYTES) {
@@ -318,7 +365,7 @@ export function reconcileOrphans(cwd) {
 // ─── V3 → V4 → V5 Migration ─────────────────────────────────────────────────
 
 /**
- * Migrate a job to the current schema version (v6).
+ * Migrate a job to the current schema version (v7).
  *
  * v3 → v4: model evidence restructure (observedModel → usageModelKeys).
  * v4 → v5: add selectorKind, routeSnapshot, routeStatus (additive null fields).
@@ -327,7 +374,10 @@ export function reconcileOrphans(cwd) {
  *          prefix) derived from the existing `taskHash` when available. Old
  *          records must never cause task content to be rendered.
  *
- * Idempotent — v6 jobs pass through unchanged.
+ * v6 → v7: clear route fields written by the retired routing implementation.
+ *          New v7 records use a fixed source-independent snapshot shape.
+ *
+ * Idempotent — v7 jobs pass through unchanged.
  */
 function migrateJob(job) {
   if (!job) return job;
@@ -341,11 +391,12 @@ function migrateJob(job) {
     : 3;
   let migrated = declaredVersion === job.version ? job : { ...job, version: declaredVersion };
 
+  // Defense-in-depth: even if declaredVersion >= STATE_VERSION, strip task
+  // content and unsupported route metadata from malformed current records.
   if (declaredVersion >= STATE_VERSION) {
-    if (Object.prototype.hasOwnProperty.call(migrated, "task") || Object.prototype.hasOwnProperty.call(migrated, "taskPreview")) {
-      migrated = { ...migrated };
-      delete migrated.task;
-      delete migrated.taskPreview;
+    const sanitized = sanitizeJobForStorage(migrated);
+    if (sanitized !== migrated) {
+      migrated = sanitized;
       if (migrated.taskRef === undefined) {
         migrated.taskRef = migrated.taskHash ? `sha256:${String(migrated.taskHash).slice(0, 12)}` : null;
       }
@@ -387,6 +438,19 @@ function migrateJob(job) {
     migrated.version = 6;
   }
 
+  // v6 → v7: every v6 route snapshot could contain a native selector inferred
+  // from retired external configuration. Its provenance cannot be reconstructed
+  // safely, so clear all derived route fields instead of preserving a claim.
+  if (migrated.version < 7) {
+    migrated = {
+      ...sanitizeJobForStorage(migrated),
+      selectorKind: null,
+      routeSnapshot: null,
+      routeStatus: null,
+    };
+    migrated.version = 7;
+  }
+
   return migrated;
 }
 
@@ -407,20 +471,18 @@ export function upsertJob(cwd, jobPatch) {
   // Privacy boundary: strip task content from the patch before merge so it
   // never enters the persisted record or the in-memory return value. The
   // structural chokepoint (writeJobFile) strips again as defense in depth.
-  const safePatch = { ...jobPatch };
-  delete safePatch.task;
-  delete safePatch.taskPreview;
+  const safePatch = sanitizeJobForStorage(jobPatch);
 
   const timestamp = nowIso();
   const existing = readJobFileSafe(cwd, jobPatch.id);
   if (existing) {
     // Migrate v3 → v4 if needed
     const migrated = migrateV3Job(existing);
-    const merged = { ...migrated, ...safePatch, updatedAt: timestamp };
+    const merged = sanitizeJobForStorage({ ...migrated, ...safePatch, updatedAt: timestamp });
     writeJobFile(cwd, jobPatch.id, merged);
     return merged;
   }
-  const newJob = { createdAt: timestamp, updatedAt: timestamp, version: STATE_VERSION, ...safePatch };
+  const newJob = sanitizeJobForStorage({ createdAt: timestamp, updatedAt: timestamp, version: STATE_VERSION, ...safePatch });
   writeJobFile(cwd, jobPatch.id, newJob);
   return newJob;
 }

@@ -119,7 +119,7 @@ test("classifyFailureStage returns TIMEOUT for timeout termination", () => {
 });
 
 test("classifyFailureStage returns CONFIGURATION for config errors", () => {
-  const stage = classifyFailureStage({ configError: "profile corrupt" });
+  const stage = classifyFailureStage({ configError: "configuration corrupt" });
   assert.equal(stage, FAILURE_STAGES.CONFIGURATION);
 });
 

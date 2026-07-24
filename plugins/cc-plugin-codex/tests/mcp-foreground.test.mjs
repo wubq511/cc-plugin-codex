@@ -52,20 +52,10 @@ function startServer(t, { env: extraEnv } = {}) {
   fs.copyFileSync(fakeClaudeSource, fakeClaude);
   fs.chmodSync(fakeClaude, 0o755);
 
-  // Isolate CC_PROFILE_SWITCH_HOME and CLAUDE_CONFIG_DIR from the real user
-  // environment so tests never read the real ~/.cc-profile-switch or ~/.claude.
-  // Tests that need a specific authority can override these via extraEnv.
-  const isolatedCcpsHome = path.join(workspace, "ccps-home");
-  const isolatedClaudeConfigDir = path.join(workspace, "claude-config");
-  fs.mkdirSync(isolatedCcpsHome, { recursive: true });
-  fs.mkdirSync(isolatedClaudeConfigDir, { recursive: true });
-
   const child = spawn(process.execPath, [serverPath], {
     cwd: workspace,
     env: {
       ...process.env,
-      CC_PROFILE_SWITCH_HOME: isolatedCcpsHome,
-      CLAUDE_CONFIG_DIR: isolatedClaudeConfigDir,
       PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
       ...extraEnv
     },
@@ -224,11 +214,11 @@ test("stateful tool schemas require the user's workspace cwd", async (t) => {
 });
 
 test("public cwd runs Claude in the user workspace rather than the MCP server cache", async (t) => {
-  const server = startServer(t);
+  const server = startServer(t, { env: { FAKE_CLAUDE_MODE: "cwd" } });
   const target = fs.mkdtempSync(path.join(os.tmpdir(), "cc-companion-target-"));
   t.after(async () => { await safeRmDir(target); });
 
-  const completed = await server.send(30, "cc_delegate", { cwd: target, task: "cwd" });
+  const completed = await server.send(30, "cc_delegate", { cwd: target, task: "print the current working directory path" });
   assert.match(completed.result.content[0].text, new RegExp(target.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.notEqual(target, server.workspace);
 });
@@ -503,9 +493,9 @@ test("cc_check shows requested model and usage key with new terminology", async 
 // ─── Model pass-through observation ────────────────────────────────────────
 
 test("delegate passes model identifier to claude CLI exactly unchanged", async (t) => {
-  const server = startServer(t);
+  const server = startServer(t, { env: { FAKE_CLAUDE_MODE: "args" } });
   const completed = await server.send(100, "cc_delegate", {
-    task: "args",
+    task: "echo the command line arguments please",
     model: "mimo-v2.5-pro"
   });
   assert.match(completed.result.content[0].text, /Task Completed/);

@@ -53,7 +53,7 @@ test("computeRouteStatus returns null when no route snapshot exists (pre-v5 job)
 
 // ─── Computation: Cancelled ──────────────────────────────────────────────────
 
-test("computeRouteStatus returns null for cancelled jobs", () => {
+test("computeRouteStatus persists cancelled for cancelled jobs", () => {
   const status = computeRouteStatus({
     routeSnapshot: { selectorKind: "inherited" },
     jobOk: false,
@@ -61,7 +61,7 @@ test("computeRouteStatus returns null for cancelled jobs", () => {
     executedModels: [],
     usageModelKeys: [],
   });
-  assert.equal(status, null);
+  assert.equal(status, ROUTE_STATUSES.CANCELLED);
 });
 
 // ─── Computation: Rejected ───────────────────────────────────────────────────
@@ -127,40 +127,31 @@ test("computeRouteStatus returns resolved for null selectorKind (legacy v5 migra
 
 // ─── Computation: Alias ──────────────────────────────────────────────────────
 
-test("computeRouteStatus returns resolved for alias when claim matches execution model", () => {
+test("computeRouteStatus keeps aliases unverified even with transcript model evidence", () => {
   const status = computeRouteStatus({
-    routeSnapshot: {
-      selectorKind: "alias",
-      aliasClaim: { alias: "opus", nativeId: "anthropic-opus-4" },
-    },
+    routeSnapshot: { selectorKind: "alias", cliArg: "opus" },
     jobOk: true,
     cancelled: false,
     executedModels: [{ id: "anthropic-opus-4", scopes: ["main"] }],
     usageModelKeys: ["anthropic-opus-4"],
   });
-  assert.equal(status, ROUTE_STATUSES.RESOLVED);
+  assert.equal(status, ROUTE_STATUSES.ACCEPTED_BUT_UNVERIFIED);
 });
 
-test("computeRouteStatus returns model_drift_possible for alias when claim does not match", () => {
+test("computeRouteStatus keeps aliases unverified when transcript evidence changes", () => {
   const status = computeRouteStatus({
-    routeSnapshot: {
-      selectorKind: "alias",
-      aliasClaim: { alias: "opus", nativeId: "anthropic-opus-4" },
-    },
+    routeSnapshot: { selectorKind: "alias", cliArg: "opus" },
     jobOk: true,
     cancelled: false,
     executedModels: [{ id: "anthropic-sonnet-4", scopes: ["main"] }],
     usageModelKeys: ["anthropic-sonnet-4"],
   });
-  assert.equal(status, ROUTE_STATUSES.MODEL_DRIFT_POSSIBLE);
+  assert.equal(status, ROUTE_STATUSES.ACCEPTED_BUT_UNVERIFIED);
 });
 
-test("computeRouteStatus returns accepted_but_unverified for alias with no claim", () => {
+test("computeRouteStatus returns accepted_but_unverified for aliases", () => {
   const status = computeRouteStatus({
-    routeSnapshot: {
-      selectorKind: "alias",
-      aliasClaim: null,
-    },
+    routeSnapshot: { selectorKind: "alias", cliArg: "opus" },
     jobOk: true,
     cancelled: false,
     executedModels: [{ id: "some-model", scopes: ["main"] }],
@@ -202,31 +193,25 @@ test("computeRouteStatus returns model_drift_possible for native when ID does no
 // ─── Usage Key ≠ Execution Model ─────────────────────────────────────────────
 
 test("usage model keys are never treated as execution models", () => {
-  // Even if usage keys match the claim, without executedModels it's unverified
+  // Even if usage keys look like an alias target, without execution evidence
+  // the requested route remains unverified.
   const status = computeRouteStatus({
-    routeSnapshot: {
-      selectorKind: "alias",
-      aliasClaim: { alias: "opus", nativeId: "anthropic-opus-4" },
-    },
+    routeSnapshot: { selectorKind: "alias", cliArg: "opus" },
     jobOk: true,
     cancelled: false,
     executedModels: [],
-    usageModelKeys: ["anthropic-opus-4"], // matches claim but is a usage key, not execution model
+    usageModelKeys: ["anthropic-opus-4"],
   });
   assert.equal(status, ROUTE_STATUSES.ACCEPTED_BUT_UNVERIFIED);
 });
 
-test("execution models and usage keys are semantically separate in drift detection", () => {
-  // Usage key matches claim but execution model differs → drift
+test("execution models and usage keys do not create an alias mapping", () => {
   const status = computeRouteStatus({
-    routeSnapshot: {
-      selectorKind: "alias",
-      aliasClaim: { alias: "opus", nativeId: "anthropic-opus-4" },
-    },
+    routeSnapshot: { selectorKind: "alias", cliArg: "opus" },
     jobOk: true,
     cancelled: false,
     executedModels: [{ id: "anthropic-sonnet-4", scopes: ["main"] }],
-    usageModelKeys: ["anthropic-opus-4"], // usage key matches claim, but execution model differs
+    usageModelKeys: ["anthropic-opus-4"],
   });
-  assert.equal(status, ROUTE_STATUSES.MODEL_DRIFT_POSSIBLE);
+  assert.equal(status, ROUTE_STATUSES.ACCEPTED_BUT_UNVERIFIED);
 });

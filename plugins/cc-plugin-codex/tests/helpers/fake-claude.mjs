@@ -34,10 +34,7 @@
  *   echo-task-encoded   — read task from stdin, echo it in stderr using the encoding selected by
  *                         ECHO_TASK_ENCODING (raw|json|escaped-newline|whitespace-normalized|chunked|short),
  *                         exit non-zero (tests multi-encoding task redaction + fail-safe)
- *   echo-profile-secret-error — echo the active profile API key in stderr and fail
- *   echo-profile-secret-success — echo the active profile API key in a successful result
  *   success-no-cost     — return fake result with NO total_cost_usd (tests honest null cost)
- *   success-reported-zero-cost — return fake result with explicit total_cost_usd=0
  */
 
 const args = process.argv.slice(2);
@@ -266,11 +263,6 @@ function handleMode(mode) {
       process.exitCode = 7;
     });
     return;
-  } else if (mode === "echo-profile-secret-error") {
-    process.stderr.write(`Provider rejected credential ${process.env.ANTHROPIC_API_KEY || "missing"}\n`);
-    process.exitCode = 7;
-  } else if (mode === "echo-profile-secret-success") {
-    success(`Provider echoed credential ${process.env.ANTHROPIC_API_KEY || "missing"}`);
   } else {
     success();
   }

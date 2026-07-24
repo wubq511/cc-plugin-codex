@@ -2,7 +2,7 @@
  * Route status computation — honest post-execution route verification.
  *
  * The final route status is one of:
- *   resolved                   — route claim and runtime evidence agree
+ *   resolved                   — a requested native ID and runtime evidence agree
  *   accepted_but_unverified    — job succeeded but no transcript evidence available
  *   model_drift_possible       — route claim and execution evidence disagree
  *   rejected                   — CLI/Provider rejection or failure
@@ -45,11 +45,12 @@ const VALID_STATUSES = new Set(Object.values(ROUTE_STATUSES));
  * @returns {string|null} Route status, or null if no route snapshot exists
  */
 export function computeRouteStatus({ routeSnapshot, jobOk, cancelled, executedModels = [], usageModelKeys = [] }) {
+  // Cancellation is a documented terminal marker even when a legacy record
+  // lacks a route snapshot.
+  if (cancelled) return ROUTE_STATUSES.CANCELLED;
+
   // No route snapshot — can't compute a status (pre-v5 job or bare migration)
   if (!routeSnapshot) return null;
-
-  // Cancelled jobs don't get a route status
-  if (cancelled) return null;
 
   // Failed jobs are rejected
   if (!jobOk) return ROUTE_STATUSES.REJECTED;
@@ -72,18 +73,11 @@ export function computeRouteStatus({ routeSnapshot, jobOk, cancelled, executedMo
     .map((m) => normalizeModelIdForStorage(m?.id))
     .filter(Boolean);
 
-  // Alias: compare the profile's claimed native ID with executed models
+  // Alias: the plugin deliberately has no alias-to-native mapping. It can prove
+  // that the alias was accepted by native Claude, but cannot infer which
+  // provider model the CLI selected. Transcript evidence is still shown to the
+  // caller without upgrading this status to a native-model confirmation.
   if (selectorKind === "alias") {
-    const claimedNativeId = routeSnapshot.aliasClaim?.nativeId;
-    if (claimedNativeId) {
-      const normalizedClaim = normalizeModelIdForStorage(claimedNativeId);
-      if (normalizedClaim && execIds.includes(normalizedClaim)) {
-        return ROUTE_STATUSES.RESOLVED;
-      }
-      // Claim exists but doesn't match evidence
-      return ROUTE_STATUSES.MODEL_DRIFT_POSSIBLE;
-    }
-    // No alias claim (bare inherit profile) — can't verify
     return ROUTE_STATUSES.ACCEPTED_BUT_UNVERIFIED;
   }
 
@@ -114,7 +108,7 @@ export function isValidRouteStatus(status) {
 export function describeRouteStatus(status) {
   const descriptions = {
     [ROUTE_STATUSES.RESOLVED]: "Route claim confirmed by runtime execution evidence.",
-    [ROUTE_STATUSES.ACCEPTED_BUT_UNVERIFIED]: "Job succeeded but no transcript evidence was available to confirm the route.",
+    [ROUTE_STATUSES.ACCEPTED_BUT_UNVERIFIED]: "Job succeeded, but the requested route could not be confirmed as a specific native model.",
     [ROUTE_STATUSES.MODEL_DRIFT_POSSIBLE]: "Route claim and execution evidence disagree — the Provider may have used a different model.",
     [ROUTE_STATUSES.REJECTED]: "Job failed — the route was not accepted by the CLI or Provider.",
     [ROUTE_STATUSES.CANCELLED]: "Job was cancelled before execution evidence could be collected. This is a documented non-terminal exception, not a computed route status.",

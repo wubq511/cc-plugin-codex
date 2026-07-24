@@ -14,7 +14,7 @@ Send a coding task to Claude Code for execution. Claude Code runs in a separate 
 1. **Delegate the task** by calling `cc_delegate`:
    - `cwd` (required): absolute path to the user's current workspace
    - `task` (required): the coding task description
-   - `model` (optional): explicit model override for this delegation. When omitted, Claude Code uses its current configured default (inherited from the user's Provider). Accepts a Claude alias (Opus, Fable, Sonnet, Haiku — case-insensitive), a display name declared in the active profile, or a bounded native model ID (e.g., `deepseek-v4-pro`, `glm-5.2`). Ambiguous selectors are rejected — the plugin does not guess or silently fall back.
+   - `model` (optional): explicit model override for this delegation. When omitted, Claude Code uses its current configured default (inherited from the user's Provider). Accepts a Claude alias (Opus, Fable, Sonnet, Haiku — case-insensitive) or a bounded native model ID (e.g., `deepseek-v4-pro`, `glm-5.2`). Ambiguous selectors are rejected — the plugin does not guess or silently fall back.
    - `effort` (optional): reasoning effort level (low, medium, high, xhigh, max)
    - `write`: set to `true` (default) to allow file writes, `false` for read-only analysis (strictly limits tools to Read, Glob, Grep)
    - `background`: DEPRECATED AND REJECTED. Do not pass `background=true` — it will always produce an error. Default foreground delegation waits silently without polling.
@@ -32,21 +32,21 @@ Send a coding task to Claude Code for execution. Claude Code runs in a separate 
 
 ## Model Selection
 
-Model resolution uses three selector kinds, resolved per job against the active authority (default: **cc-profile-switch**):
+Model resolution uses three selector kinds, classified per job with no filesystem or authority dependency:
 
 - **inherited** (default): omit `model` — no `--model` argument is sent. Claude Code uses its current configured default.
-- **alias**: `Opus`, `Fable`, `Sonnet`, `Haiku` (case-insensitive). Normalized to the canonical lowercase Claude CLI alias (e.g., `Opus` → `--model opus`). Mapped to the current profile's `ANTHROPIC_DEFAULT_<ALIAS>_MODEL` claim.
+- **alias**: `Opus`, `Fable`, `Sonnet`, `Haiku` (case-insensitive). Normalized to the canonical lowercase Claude CLI alias (e.g., `Opus` → `--model opus`).
 - **native**: a model ID with at least one digit and no spaces (e.g., `deepseek-v4-pro`, `glm-5.2`). Passed through unchanged as `--model <id>`.
 
-Ambiguous selectors (no digit, not a known alias, not the current profile's exact display name) are **rejected** — the plugin does not guess or silently fall back. Ask the user to clarify.
+Ambiguous selectors (no digit, not a known alias) are **rejected** — the plugin does not guess or silently fall back. Ask the user to clarify.
 
-Use `cc_resolve_route` to preview how a selector will be routed before delegating. It is read-only, makes no model call, does not require `cwd`, and returns both a human-readable summary and a bounded `structuredContent` object (selector kind, CLI arg, non-secret alias claim, routing policy, injected key names — never values).
+Use `cc_resolve_route` to preview how a selector will be routed before delegating. It is read-only, makes no model call, does not require `cwd`, and returns both a human-readable summary and a bounded `structuredContent` object (selector kind, CLI arg, non-secret route snapshot).
 
-The active authority is re-read fresh on every job — `${CC_PROFILE_SWITCH_HOME:-~/.cc-profile-switch}/config.json` → `lastUsedProfile` → `profiles/<name>/claude-home/settings.json` + common `api-settings.json`. A profile switch takes effect on the next delegation without restarting Codex. If cc-profile-switch is absent, the plugin uses bare inheritance unless `CC_COMPANION_AUTHORITY_ADAPTER=claude-settings|active-profile-fixture` explicitly selects a fallback; a stray local settings/fixture file is never adopted silently. Before each child spawn, all inherited `ANTHROPIC_*` vars and `CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX` are stripped, then only allowlisted current-profile env is injected (common `api-settings` < profile `settings.json` precedence). Profile JSON may never declare `PATH`, `NODE_OPTIONS`, `HOME`, `USER`, `SHELL`, `CLAUDE_CONFIG_DIR`, arbitrary env keys, or a custom `stripInherited` list. If the authority cannot be safely determined, the job fails closed — it does not fall back to a stale profile.
+The plugin does not read, write, or modify any external routing configuration. It does not inject or strip environment variables for routing purposes — the child Claude process inherits the parent environment unchanged.
 
 After completion, the job reports four distinct evidence layers:
 - **Requested model / selector kind**: the user's input and its classification (inherited/alias/native)
-- **Route snapshot**: the resolved CLI argument, active profile fingerprint, and non-secret alias claim (no secrets persisted)
+- **Route snapshot**: the resolved CLI argument (no secrets persisted)
 - **Claude-recorded execution model**: the model(s) recorded in the Claude Code session transcript (`message.model`)
 - **Provider usage key**: the key(s) from the final JSON `modelUsage` object (billing/aggregation dimension)
 
