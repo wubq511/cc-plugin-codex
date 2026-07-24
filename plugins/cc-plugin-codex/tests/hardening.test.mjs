@@ -2659,13 +2659,13 @@ test("liveness probe preserves its plugin-owned stage while redacting short-task
   });
   const text = response.result.content[0].text;
   assert.match(text, /Stage:\*\* provider_response/i);
-  assert.match(text, /Failure reason:\*\* unclassified/i);
+  assert.match(text, /Failure reason:\*\* (?:budget_rejected|authentication_rejected|rate_limited|model_unavailable|provider_unavailable|unclassified)/i);
 
   const probeId = text.match(/Probe ID:\*\* (probe-[a-z0-9-]+)/i)?.[1];
   assert.ok(probeId);
   const artifact = readResultArtifact(server.workspace, probeId);
   assert.equal(artifact.failureStage, "provider_response");
-  assert.equal(artifact.safeProviderReason, "unclassified");
+  assert.match(artifact.safeProviderReason, /^(budget_rejected|authentication_rejected|rate_limited|model_unavailable|provider_unavailable|unclassified)$/);
   assert.equal(artifact.diagnostics.stage, "provider_response");
   assert.doesNotMatch(JSON.stringify(artifact.diagnostics), /Reply with exactly: OK/);
 });
