@@ -53,8 +53,8 @@ cc-plugin-codex/
 ### 3.2 通信方式
 
 - **MCP Server（stdio）**：Codex 作为 MCP client，启动 `cc-companion.mjs` 作为子进程
-- **Claude CLI 调用**：MCP server 通过 `claude -p` 非交互模式调用 Claude Code
-- **Job 追踪**：schema v4 以原子 per-job 文件持久化到 `${os.tmpdir()}/cc-companion/<workspace-slug-hash>/jobs/`，目录和文件分别限制为 `0700`/`0600`
+- **Claude CLI 调用**：watchdog 通过 `claude --print --input-format text --output-format json` 非交互调用 Claude Code；任务只经 stdin 传递
+- **Job 追踪**：schema v6 以原子 per-job 文件持久化到 `${os.tmpdir()}/cc-companion/<workspace-slug-hash>/jobs/`，目录和文件分别限制为 `0700`/`0600`；任务正文不进入 state
 
 ### 3.3 Codex 插件清单（plugin.json）
 
@@ -111,7 +111,7 @@ cc-plugin-codex/
 | `task` | string | ✅ | — | 要执行的任务描述 |
 | `write` | boolean | ❌ | `true` | 是否允许 Claude Code 写文件（`false` 严格限制为 Read/Glob/Grep） |
 | `background` | boolean | ❌ | `false` | DEPRECATED AND REJECTED — 不再支持，设置为 `true` 会报错 |
-| `model` | string | ❌ | — | 显式模型覆盖（自由格式，不验证）。省略时 Claude Code 继承当前 Provider 配置 |
+| `model` | string | ❌ | — | 显式选择器：省略为 inherited；`Opus`/`Fable`/`Sonnet`/`Haiku` 为 alias；合法 native ID 原样透传；歧义/非法值 fail closed |
 | `effort` | string | ❌ | — | 推理努力度：`low`, `medium`, `high`, `xhigh`, `max` |
 | `timeoutSeconds` | integer | ❌ | — | 可选硬超时（秒，1..604800）。省略时任务运行直到完成、失败、取消或服务器关闭 |
 | `dangerouslySkipPermissions` | boolean | ❌ | `false` | 跳过权限确认（仅在显式传入 `true` 时开启） |
@@ -123,7 +123,7 @@ cc-plugin-codex/
 1. 生成 job ID，记录到 state
 2. 构建 `claude` 命令（任务通过 stdin 传递，不出现在进程命令行中）：
    ```
-   claude --output-format json \
+   claude --print --input-format text --output-format json \
      [--dangerously-skip-permissions] \
      [--model <model>] \
      [--effort <effort>] \
@@ -131,7 +131,7 @@ cc-plugin-codex/
    ```
    - 若 `write=false`：`--allowedTools Read,Glob,Grep`（严格禁止 Bash）
    - 仅当 `dangerouslySkipPermissions=true` 时加 `--dangerously-skip-permissions`
-   - 仅当 `model` 非空时加 `--model`，值原样传递不验证
+   - 仅当 `model` 非空时加 `--model`；alias 规范化为 Claude alias，native ID 通过严格语法验证后原样传递
    - 仅当 `timeoutSeconds` 为 1..604800 范围内的正整数时创建内部超时计时器；省略时不创建计时器
 3. 前台执行（默认，唯一模式）：
    - 通过 watchdog 子进程执行，watchdog 通过 fd3 控制管道与 companion 通信
@@ -166,7 +166,7 @@ cc-plugin-codex/
 
 ### 4.2 `cc_list_models` — 兼容性工具
 
-兼容性工具：报告模型解析行为由 Claude Code 的 Provider 配置决定，说明可选的自由格式模型覆盖参数，并在有最近完成的本地任务时分开展示请求模型、Claude transcript 执行证据和 Provider usage key。不枚举、验证或维护模型目录。
+兼容性工具：报告模型解析行为由 Claude Code 的 Provider 配置决定，并在有最近完成的本地任务时分开展示请求模型、Claude transcript 执行证据和 Provider usage key。它不枚举或维护 Provider 模型目录；实际路由预览使用只读的 `cc_resolve_route`。
 
 **输入 Schema：** 可选 `cwd`。省略时只查看当前 MCP server 已记住的工作区；提供时必须是存在的绝对目录，并直接读取该工作区历史。
 
@@ -208,7 +208,7 @@ cc-plugin-codex/
 {
   "content": [{
     "type": "text",
-    "text": "## Job: cc-abc123\n\n**Status:** completed\n**Task:** Implement user auth middleware\n**Requested model:** mimo-v2.5-pro\n**Claude-recorded execution model:** mimo-v2.5-pro\n**Provider usage key:** mimo-v2.5\n**Effort:** high\n**Duration:** 12.3s\n**Cost:** $0.05\n**Started:** 2026-07-06T10:00:00Z\n**Completed:** 2026-07-06T10:00:12Z\n\n### Result\n<full output>\n\n### Files Changed\n- src/auth.ts\n- tests/auth.test.ts"
+    "text": "## Job: cc-abc123\n\n**Status:** completed\n**Task reference:** sha256:12-character-prefix (content withheld)\n**Requested model:** mimo-v2.5-pro\n**Claude-recorded execution model:** mimo-v2.5-pro\n**Provider usage key:** mimo-v2.5\n**Effort:** high\n**Duration:** 12.3s\n**Cost:** $0.05\n**Started:** 2026-07-06T10:00:00Z\n**Completed:** 2026-07-06T10:00:12Z\n\n### Result\n<redacted or bounded Claude output>\n\n### Files Changed\n- src/auth.ts\n- tests/auth.test.ts"
   }]
 }
 ```
@@ -216,10 +216,10 @@ cc-plugin-codex/
 **输出（all=true 摘要表格）：**
 
 ```
-| Job ID | Status | Task | Model Evidence | Duration |
+| Job ID | Status | Task reference | Model Evidence | Duration |
 |--------|--------|------|----------------|----------|
-| cc-abc123 | completed | Implement auth | mimo-v2.5-pro | 12.3s |
-| cc-def456 | running | Fix CSS bug | inherited | — |
+| cc-abc123 | completed | sha256:12-character-prefix | mimo-v2.5-pro | 12.3s |
+| cc-def456 | running | sha256:another-prefix | inherited | — |
 ```
 
 ### 4.4 `cc_cancel` — 取消任务
@@ -264,14 +264,15 @@ cc-plugin-codex/
 
 ### 4.6 `cc_setup` — 环境检测
 
-**输入 Schema：** 必填 `cwd`（用户当前工作区的绝对路径）
+**输入 Schema：** 必填 `cwd`（用户当前工作区的绝对路径）；可选 `livenessProbe: true`、正整数 `timeoutSeconds`、正数 `maxBudgetUsd` 与 `model` selector。
 
 **行为：**
 
 1. 检测 `claude` CLI 是否可用（`claude --version`）
 2. 检测 Claude Code 版本
 3. 检测 `node` 是否可用
-4. 返回环境状态
+4. 静态检查 active authority、source/cache 一致性与 state schema（零模型调用）
+5. 仅在用户明确授权、`livenessProbe=true`、timeout/budget 均有效且 CLI 支持 `--max-budget-usd` 时，执行一次受限 Provider liveness probe；失败时保存私有制品并返回安全 stage/reason，不回显 Provider 原文
 
 **输出：**
 
@@ -294,7 +295,7 @@ cc-plugin-codex/
 
 1. 调用 `cc_delegate`，传入 task（model 和 effort 可选）
    - 默认不传 model，Claude Code 继承当前 Provider 配置
-   - 用户明确指定模型时，传入任意 model 标识（自由格式，不验证）
+   - 用户明确指定模型时，传入 alias、active profile 的精确 display name，或经过语法验证的 native ID；歧义值 fail closed
    - effort 与 model 独立，不耦合
 2. 等待结果返回
 3. 向用户展示结果摘要（分开标注请求模型、Claude-recorded execution model 和 Provider usage key）
@@ -353,7 +354,7 @@ cc-plugin-codex/
 1. 从 stdin 读取 JSON-RPC 消息（换行分隔）
 2. 处理 `initialize` → 返回 capabilities（tools）
 3. 处理 `initialized` 通知
-4. 处理 `tools/list` → 返回 6 个工具定义
+4. 处理 `tools/list` → 返回 7 个工具定义（含只读 `cc_resolve_route`）
 5. 处理 `tools/call` → Promise-aware 路由到对应 handler；pending delegate 不阻塞后续消息
 6. 处理 `notifications/cancelled` → 取消对应 pending job 与进程树，并抑制迟到的正常响应
 7. 结果写入 stdout（JSON-RPC response）
@@ -372,7 +373,7 @@ Job 记录结构：
   "id": "cc-abc123",
   "status": "running",
   "phase": "executing",
-  "taskPreview": "Implement user auth",
+  "taskRef": "sha256:12-character-prefix",
   "taskHash": "sha256...",
   "requestedModel": "mimo-v2.5-pro",
   "requestMode": "explicit",
@@ -421,7 +422,7 @@ MCP 工具 `cc_delegate` 默认在同一次 pending 工具调用中等待 Claude
 ```
 用户: "让 Claude Code 实现 auth middleware"
   → Codex 调用 cc_delegate(task="...")
-  → MCP server 启动 claude -p "..." （不传 --model，继承 Provider 配置）
+  → MCP server 以 `claude --print --input-format text --output-format json` 启动 Claude（任务走 stdin；不传 --model 时继承 Provider 配置）
   → Claude Code 执行任务
   → MCP server 解析输出，返回分层模型证据
   → Codex 展示摘要 + 提示 "Run /claude:review to review"
@@ -460,10 +461,10 @@ Focus: <focus or "general">
 | 维度 | codex-plugin-cc（原插件） | 本插件（反向） |
 |------|--------------------------|----------------|
 | 方向 | Claude Code → Codex | Codex → Claude Code |
-| 通信协议 | codex app-server JSON-RPC | claude -p CLI |
+| 通信协议 | codex app-server JSON-RPC | Claude print-mode JSON CLI |
 | 插件系统 | Claude Code 插件 | Codex 插件 |
 | Hook | SessionStart/End/Stop | 无（Codex 插件无 hook） |
-| 任务执行 | Codex app-server turn | claude -p 子进程 |
+| 任务执行 | Codex app-server turn | watchdog 监管的 Claude print-mode JSON 子进程 |
 | 审查 | Codex 内置 reviewer | Codex 自身审查 diff |
 | Broker | 有（共享 app-server） | 无（直接 spawn） |
 

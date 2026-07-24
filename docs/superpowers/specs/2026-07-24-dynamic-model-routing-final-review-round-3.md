@@ -1,8 +1,8 @@
 # Dynamic Model Routing — Final Review Round 3
 
-> Status: **implemented and locally verified; awaiting merge/install and an explicitly authorized paid liveness probe**.
+> Status: **implemented, installed locally, and verified through the Provider boundary**. The final external result is an honest `rate_limited` response, not a synthetic pass.
 >
-> Reviewed branch: `glm/dynamic-model-routing@93ad3c2`, with final closeout fixes pending commit.
+> Reviewed branch: `glm/dynamic-model-routing`, including the privacy, authority, cache-install, and liveness-evidence closeout commits.
 >
 > Baseline: `main@9871d75`
 >
@@ -10,35 +10,41 @@
 
 ## Decision
 
-Do **not** merge `b392b52` yet. The second rework fixed important behaviour:
+Do not treat `b392b52` alone as merge-ready. The completed rework fixes important behaviour:
 the real active `cc-profile-switch` authority now resolves `Opus`, `Fable`,
 `deepseek-v4-pro`, and `glm-5.2` without a Provider call; same-target display
 names coalesce; and the branch's offline suite and source verification pass.
 
-It nevertheless leaves two P0 secret/prompt-boundary violations and several
-evidence-contract defects. This is a focused third rework on the same branch,
-not a new architecture or a new ticket. Do not merge, push, reinstall the
-plugin, change global Provider configuration, or run a paid liveness probe.
+It initially left two P0 secret/prompt-boundary violations and several
+evidence-contract defects. Those defects are now closed on the same branch;
+this remains a focused rework, not a new routing architecture. No global
+Provider configuration was modified.
 
 ## Local closure update
 
-The required third rework was implemented at `93ad3c2`; the final local
-closeout additionally verifies the success-output prompt boundary, migrates
+The required third rework was implemented at `93ad3c2`; the final closeout
+additionally verifies the success-output prompt boundary, migrates
 unversioned legacy state through the v6 privacy scrubber, preserves an explicit
 Provider-reported zero cost as evidence, validates fixture profile identities,
 applies the private retention policy to standalone liveness artifacts, treats
 opaque credential-bearing profile values as runtime-only redaction markers, and
 requires an explicit fallback-adapter selection when cc-profile-switch is
-absent.
+absent. It also preserves the plugin-owned failure-stage enum when a short
+task forces private diagnostic redaction, and records a non-verbatim safe
+Provider reason code for a failed liveness probe.
 
-Offline tests and source verification are the merge gate. A real liveness
-probe remains deliberately unrun: it is cost-bearing and requires post-install
-explicit authorization. Neither a successful offline fake-Claude run nor a
-usage key is claimed as proof of a paid Provider execution.
+Offline tests and source verification remain the code merge gate. With explicit
+authorization, the plugin was cachebuster-updated and installed from the local
+marketplace; an installed-cache `cc_setup` confirmed schema v6 and a 35-file
+source/cache match. Two bounded real `Opus` liveness attempts (45 seconds,
+maximum `$0.10` each) reached the Provider and failed with `rate_limited`.
+No cost telemetry was reported, so both records remain `unknown`; this is an
+external availability limit, not a claimed successful execution or a reason to
+change routing, credentials, or standards.
 
 ## Verified evidence
 
-- `npm test`: 348 passed, 0 failed.
+- `npm test`: 394 passed, 0 failed.
 - `npm run verify:source`: passed.
 - `git diff --check main...HEAD`: passed.
 - A zero-cost local authority read resolves the current profile as follows:
@@ -46,11 +52,11 @@ usage key is claimed as proof of a paid Provider execution.
   selectors. Stale inherited routing variables did not survive child-env
   construction.
 
-This evidence proves the desired alias/native routing direction, but it does
-not prove the plugin keeps prompts and configuration values out of normal state
-and MCP presentation.
+The installed liveness path also proved that `Opus` is accepted as an alias and
+the CLI budget guard is active. It did not prove successful Provider execution:
+the honest terminal classification is `provider_response` / `rate_limited`.
 
-## P0 — required before merge
+## Resolved P0 requirements
 
 ### 1. Remove task text from normal job state and MCP presentation
 
@@ -106,7 +112,7 @@ Tests must prove that a secret-like, control-character, whitespace, or overlong
 profile value fails before spawn and never appears in state, diagnostics,
 fingerprints, or `cc_resolve_route` output.
 
-## P1 — complete in this focused rework
+## Resolved P1 requirements
 
 ### 4. Make the legacy fixture evidence truthful
 
@@ -143,7 +149,7 @@ The status skill still claims `cc_check` exposes an error excerpt, while the
 implementation intentionally removed it. Align `plugins/cc-plugin-codex/skills`
 and `CLAUDE.md` with the final task-redaction and liveness contracts.
 
-## Acceptance gate
+## Final acceptance gate
 
 Before requesting merge, run:
 
@@ -153,11 +159,13 @@ npm run verify:source
 git diff --check main...HEAD
 ```
 
-The offline suite must include the adversarial cases above. Re-run the
-zero-cost real active-authority read for the four current selectors without
-printing profile values or secrets. Do not run a paid liveness probe. Leave the
-worktree clean, create one coherent local commit, and do not push, merge,
-reinstall, or change user Provider configuration.
+The offline suite includes the adversarial cases above, and the zero-cost real
+active-authority read resolves the four current selectors without printing
+profile values or secrets. The installed-cache static check passed, and the
+authorized liveness attempts were bounded and persisted as private evidence.
+The outstanding operational action is to wait for the Provider rate limit to
+clear before a future, explicitly authorized retry; it is not safe to retry
+automatically or to record a false success.
 
 ## Explicit non-goals
 

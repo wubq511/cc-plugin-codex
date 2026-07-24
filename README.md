@@ -114,6 +114,17 @@ codex plugin add cc-plugin-codex
 /claude:setup
 ```
 
+### 真实 Provider 连通性检查（会产生费用）
+
+`cc_setup` 默认只做零成本静态检查。只有在你明确授权时，才传入
+`livenessProbe: true`、正整数 `timeoutSeconds` 和正数 `maxBudgetUsd`；插件会先
+验证 Claude CLI 的 `--max-budget-usd` 支持，再执行一次最小模型调用。可选 `model`
+与 delegation 使用相同的 alias/native 语义，例如 `Opus` 或 `glm-5.2`。
+
+失败会保留私有、脱敏的 probe 制品，并只返回安全 stage/reason；`rate_limited`
+等 Provider 限制不是成功，也不会触发自动重试或静默 fallback。不要在 CI 中启用
+liveness probe。
+
 ## MCP 工具
 
 插件通过 MCP server 暴露 7 个工具，供 Codex 直接调用：
