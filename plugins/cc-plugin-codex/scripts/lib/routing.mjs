@@ -101,16 +101,32 @@ const MAX_NATIVE_SELECTOR_LEN = 128;
  */
 const NATIVE_SELECTOR_RE = /^[a-zA-Z0-9_\-.:/]+$/;
 
+/**
+ * Secret-like value detector for profile-derived model targets. A profile
+ * that mistakenly places a credential (e.g. an ANTHROPIC_API_KEY value)
+ * into an ANTHROPIC_DEFAULT_*_MODEL field must fail closed before the
+ * value enters an alias mapping, display mapping, fingerprint, snapshot,
+ * error, or MCP output. No legitimate native model ID or display name
+ * starts with `sk-` (the universal API-key prefix) or `Bearer `.
+ */
+const SECRET_LIKE_RE = /^(sk-[a-zA-Z0-9_\-]{8,}|Bearer\s+\S)/i;
+
 // ─── Errors ──────────────────────────────────────────────────────────────────
 
 /**
  * Raised when a model selector cannot be safely resolved to an alias, a
  * declared display name, or a native ID. Fail closed — no fallback model.
+ *
+ * The error message is intentionally generic and never echoes the raw
+ * selector value: the selector may be secret-like, contain control
+ * characters, or be an arbitrary untrusted string. The raw value is
+ * preserved on the `selector` property for internal logging only and
+ * must never enter state, diagnostics, fingerprints, or MCP output.
  */
 export class AmbiguousSelectorError extends Error {
   constructor(selector) {
     super(
-      `Ambiguous model selector "${selector}". ` +
+      `Ambiguous model selector. ` +
       `Use a Claude alias (opus, fable, sonnet, haiku), ` +
       `a full native model ID (e.g., deepseek-v4-pro, glm-5.2), ` +
       `or a display name declared in the active profile. ` +
@@ -353,10 +369,99 @@ function filterAllowedEnv(rawEnv) {
 // ─── Alias / Display-Name Derivation ─────────────────────────────────────────
 
 /**
+ * Maximum length for a profile-declared display name. Display names are
+ * human-readable labels (e.g., "DeepSeek V4 Pro") — they need room for
+ * spaces and mixed case but must still be bounded.
+ */
+const MAX_DISPLAY_NAME_LEN = 128;
+
+/**
+ * Allowed characters for a display name: letters, digits, spaces,
+ * underscore, hyphen, dot, colon, slash, parentheses. Rejects control
+ * characters and other punctuation before the value enters projections,
+ * fingerprints, or MCP output.
+ */
+const DISPLAY_NAME_RE = /^[a-zA-Z0-9 _\-.:/()]+$/;
+
+/**
+ * Validate a native model selector from a profile-derived env value.
+ * Uses the same grammar as `validateNativeSelector` but throws a
+ * `ProfileResolutionError` (configuration-stage failure) instead of an
+ * `AmbiguousSelectorError`. Never echoes the rejected value in the error
+ * message — the value may be secret-like.
+ *
+ * @param {string} selector - The native selector to validate
+ * @param {string} label - Configuration label for the generic error
+ * @throws {ProfileResolutionError} when the selector is invalid
+ */
+function validateProfileNativeSelector(selector, label) {
+  if (typeof selector !== "string" || selector.length === 0) {
+    throw configError(`${label} has an invalid native model selector`);
+  }
+  if (selector.length > MAX_NATIVE_SELECTOR_LEN) {
+    throw configError(`${label} native model selector exceeds ${MAX_NATIVE_SELECTOR_LEN} characters`);
+  }
+  if (/[\x00-\x1f\x7f]/.test(selector)) {
+    throw configError(`${label} native model selector contains control characters`);
+  }
+  if (/\s/.test(selector)) {
+    throw configError(`${label} native model selector contains whitespace`);
+  }
+  if (!NATIVE_SELECTOR_RE.test(selector)) {
+    throw configError(`${label} native model selector contains disallowed characters`);
+  }
+  // Secret-like values (e.g. a misplaced API key) must fail closed before
+  // they enter an alias mapping, fingerprint, snapshot, or MCP output. The
+  // error never echoes the rejected value.
+  if (SECRET_LIKE_RE.test(selector)) {
+    throw configError(`${label} native model selector looks like a secret and was rejected`);
+  }
+}
+
+/**
+ * Validate a profile-declared display name. Display names may contain
+ * spaces and mixed case but must be bounded and free of control characters.
+ * Never echoes the rejected value in the error message.
+ *
+ * @param {string} name - The display name to validate
+ * @param {string} label - Configuration label for the generic error
+ * @throws {ProfileResolutionError} when the display name is invalid
+ */
+function validateProfileDisplayName(name, label) {
+  if (typeof name !== "string" || name.length === 0) {
+    throw configError(`${label} has an invalid display name`);
+  }
+  const trimmed = name.trim();
+  if (trimmed.length === 0) {
+    throw configError(`${label} has a whitespace-only display name`);
+  }
+  if (trimmed.length > MAX_DISPLAY_NAME_LEN) {
+    throw configError(`${label} display name exceeds ${MAX_DISPLAY_NAME_LEN} characters`);
+  }
+  if (/[\x00-\x1f\x7f]/.test(trimmed)) {
+    throw configError(`${label} display name contains control characters`);
+  }
+  if (!DISPLAY_NAME_RE.test(trimmed)) {
+    throw configError(`${label} display name contains disallowed characters`);
+  }
+  // Secret-like display names must fail closed before they enter a display
+  // mapping, fingerprint, snapshot, or MCP output. Never echoes the value.
+  if (SECRET_LIKE_RE.test(trimmed)) {
+    throw configError(`${label} display name looks like a secret and was rejected`);
+  }
+}
+
+/**
  * Derive the non-secret alias→native and display-name→native projections
  * from the allowlisted injected env. Alias keys are canonical lowercase;
  * display-name keys are canonicalized (lowercased) and case-fold collisions
  * are rejected.
+ *
+ * Every profile-derived `ANTHROPIC_DEFAULT_*_MODEL` target is validated
+ * against the strict native-selector grammar BEFORE entering alias mappings,
+ * display mappings, fingerprints, snapshots, errors, or MCP output. Display
+ * names are similarly bounded. Rejected values are never echoed in error
+ * messages — they may be secret-like.
  *
  *   ANTHROPIC_DEFAULT_OPUS_MODEL = "kimi-k2.6"   -> alias opus -> kimi-k2.6
  *   ANTHROPIC_DEFAULT_OPUS_MODEL_NAME = "Kimi"   -> display "kimi" -> kimi-k2.6
@@ -371,26 +476,33 @@ function deriveAliasMappings(env) {
   for (const [alias, modelKey] of Object.entries(ALIAS_TO_MODEL_ENV_KEY)) {
     const modelVal = env[modelKey];
     if (typeof modelVal === "string" && modelVal.trim()) {
-      aliasMappings[alias] = modelVal;
-      knownNativeIds.add(modelVal);
+      // Validate the native selector before it enters any projection,
+      // fingerprint, snapshot, or error. A malformed profile value must
+      // fail closed here — never reach alias mapping or MCP output.
+      validateProfileNativeSelector(modelVal.trim(), `${modelKey}`);
+      const normalized = modelVal.trim();
+      aliasMappings[alias] = normalized;
+      knownNativeIds.add(normalized);
     }
     const nameKey = `${modelKey}_NAME`;
     const nameVal = env[nameKey];
     if (typeof nameVal === "string" && nameVal.trim() && typeof modelVal === "string" && modelVal.trim()) {
+      // Validate the display name before it enters any projection.
+      validateProfileDisplayName(nameVal, nameKey);
       const canon = nameVal.trim().toLowerCase();
       if (Object.prototype.hasOwnProperty.call(nativeDisplayNames, canon)) {
         // Same display name → same native ID is valid (shared target):
         // coalesce silently. Only fail closed when one display name maps
-        // to two different native IDs.
-        if (nativeDisplayNames[canon] !== modelVal) {
+        // to two different native IDs. Use a generic message — never echo
+        // the raw native IDs (they may be sensitive even when validated).
+        if (nativeDisplayNames[canon] !== modelVal.trim()) {
           throw configError(
-            `Display-name collision: "${nameVal}" maps to different native models ` +
-            `(${nativeDisplayNames[canon]} vs ${modelVal})`
+            `Display-name collision: a display name maps to different native models`
           );
         }
         continue;
       }
-      nativeDisplayNames[canon] = modelVal;
+      nativeDisplayNames[canon] = modelVal.trim();
     }
   }
 
@@ -599,6 +711,13 @@ function readClaudeSettingsAdapter(claudeConfigDir) {
  * an explicit test fixture / compatibility adapter only. It obeys the same
  * child-env allowlist rules (stripInherited from the fixture is ignored;
  * envVars must be allowlisted).
+ *
+ * Truthfulness contract (Req 4): the reported alias/display mappings are
+ * ALWAYS derived from the validated injected envVars — exactly as the
+ * cc-profile-switch adapter does. If the fixture also declares
+ * `aliasMappings` or `nativeDisplayNames`, they are compared against the
+ * derived mappings and any mismatch fails closed. This prevents the fixture
+ * from reporting an alias route that Claude never receives.
  */
 function readActiveProfileFixture(claudeConfigDir) {
   const profilePath = path.join(claudeConfigDir, ACTIVE_PROFILE_FILENAME);
@@ -622,25 +741,59 @@ function readActiveProfileFixture(claudeConfigDir) {
     );
   }
 
-  // Canonicalize display names. Same display name → same native ID is a
-  // valid shared target and coalesces silently. Different native IDs for
-  // one canonical display name fail closed.
-  const nativeDisplayNames = {};
-  if (fixtureNativeDisplayNames) {
-    for (const [displayName, nativeId] of Object.entries(fixtureNativeDisplayNames)) {
-      const canon = displayName.trim().toLowerCase();
-      if (Object.prototype.hasOwnProperty.call(nativeDisplayNames, canon)) {
-        if (nativeDisplayNames[canon] !== nativeId) {
-          throw configError(
-            `active-profile.json display-name collision: "${displayName}" maps to different native models`
-          );
+  // Derive alias/display mappings from the validated injected envVars —
+  // the same path as cc-profile-switch. This applies native-selector and
+  // display-name validation before any value enters a projection.
+  const derived = deriveAliasMappings(injectedEnv);
+  const aliasMappings = derived.aliasMappings;
+  const nativeDisplayNames = derived.nativeDisplayNames;
+
+  // Truthfulness check: if the fixture declares alias/display mappings,
+  // they must match the envVars-derived mappings. A mismatch means the
+  // fixture claims a route that the child env does not actually carry —
+  // fail closed. Use generic messages; never echo the raw declared values.
+  if (fixtureAliasMappings) {
+    for (const [alias, declaredNative] of Object.entries(fixtureAliasMappings)) {
+      const canonAlias = String(alias).trim().toLowerCase();
+      const derivedNative = aliasMappings[canonAlias];
+      if (derivedNative === undefined) {
+        // Fixture declares an alias with no corresponding envVar — the
+        // child will not receive this route.
+        if (Object.prototype.hasOwnProperty.call(aliasMappings, canonAlias)) {
+          // Should not happen (undefined own property), but guard anyway.
+          continue;
         }
-        continue;
+        throw configError(
+          `active-profile.json aliasMappings declares an alias not backed by injected envVars`
+        );
       }
-      nativeDisplayNames[canon] = nativeId;
+      if (derivedNative !== String(declaredNative).trim()) {
+        throw configError(
+          `active-profile.json aliasMappings disagrees with injected envVars for an alias`
+        );
+      }
     }
   }
-  const aliasMappings = fixtureAliasMappings || {};
+  if (fixtureNativeDisplayNames) {
+    for (const [displayName, declaredNative] of Object.entries(fixtureNativeDisplayNames)) {
+      const canon = String(displayName).trim().toLowerCase();
+      const derivedNative = nativeDisplayNames[canon];
+      if (derivedNative === undefined) {
+        // Fixture declares a display name with no corresponding envVar.
+        if (Object.prototype.hasOwnProperty.call(nativeDisplayNames, canon)) {
+          continue;
+        }
+        throw configError(
+          `active-profile.json nativeDisplayNames declares a display name not backed by injected envVars`
+        );
+      }
+      if (derivedNative !== String(declaredNative).trim()) {
+        throw configError(
+          `active-profile.json nativeDisplayNames disagrees with injected envVars for a display name`
+        );
+      }
+    }
+  }
 
   const injectedKeyNames = Object.keys(injectedEnv).sort();
   const routingPolicy = {
@@ -846,12 +999,18 @@ function looksLikeNativeId(input) {
 /**
  * Validate a native model selector before it enters a route snapshot,
  * structuredContent, or CLI argv. Rejects control characters, whitespace,
- * overlong values, and characters outside the allowlist. Legitimate native
- * IDs like deepseek-v4-pro, glm-5.2, anthropic/claude-opus-4 are preserved.
+ * overlong values, characters outside the allowlist, and secret-like values.
+ * Legitimate native IDs like deepseek-v4-pro, glm-5.2, anthropic/claude-opus-4
+ * are preserved.
+ *
+ * Secret-like values (e.g. a misplaced API key pasted as a model selector)
+ * fail closed via AmbiguousSelectorError, whose message never echoes the raw
+ * selector. This prevents accidental credential leaks through cc_resolve_route
+ * or cc_delegate MCP output.
  *
  * @param {string} selector - The native selector to validate
  * @throws {AmbiguousSelectorError} when the selector contains disallowed
- *   characters, is empty, or exceeds the length bound.
+ *   characters, is empty, exceeds the length bound, or looks like a secret.
  */
 function validateNativeSelector(selector) {
   if (typeof selector !== "string" || selector.length === 0) {
@@ -867,6 +1026,11 @@ function validateNativeSelector(selector) {
     throw new AmbiguousSelectorError(selector);
   }
   if (!NATIVE_SELECTOR_RE.test(selector)) {
+    throw new AmbiguousSelectorError(selector);
+  }
+  // Secret-like selectors (e.g. a pasted API key) must fail closed before
+  // being echoed in requestedValue, cliArg, snapshot, or MCP output.
+  if (SECRET_LIKE_RE.test(selector)) {
     throw new AmbiguousSelectorError(selector);
   }
 }

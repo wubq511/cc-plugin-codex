@@ -211,6 +211,30 @@ test("ambiguous selector error message guides the user", () => {
   }
 });
 
+test("secret-like user-supplied selectors fail closed and are never echoed", () => {
+  // A user may accidentally paste an API key as a model selector. Such values
+  // pass the native-selector grammar (alphanumeric + hyphens, contains digits)
+  // but must fail closed before reaching requestedValue, cliArg, snapshot, or
+  // MCP output. The AmbiguousSelectorError message is generic (never echoes
+  // the raw selector).
+  const secretLike = [
+    "sk-ant-api03-1234567890abcdef",
+    "sk-test-key-9988776655",
+    "Bearer abc123",
+  ];
+  for (const input of secretLike) {
+    assert.throws(
+      () => classifySelector(input, null),
+      (err) => {
+        assert.ok(err instanceof AmbiguousSelectorError, `${input} must throw AmbiguousSelectorError`);
+        // The raw secret must never appear in the error message.
+        assert.doesNotMatch(err.message, new RegExp(input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+        return true;
+      }
+    );
+  }
+});
+
 // ─── §2  cc-profile-switch Authority: Profile Switch ─────────────────────────
 // Remediation test #1: switching lastUsedProfile changes next job snapshot + child env
 
@@ -1055,10 +1079,16 @@ test("claude-settings adapter returns null for empty env (bare inherit)", () => 
 
 const SAMPLE_FIXTURE = {
   profileIdentity: "test-profile",
-  aliasMappings: { opus: "anthropic-opus-4", fable: "anthropic-fable-1", sonnet: "anthropic-sonnet-4", haiku: "anthropic-haiku-4" },
-  nativeDisplayNames: { "DeepSeek V4 Pro": "deepseek-v4-pro", "GLM 5.2": "glm-5.2" },
+  aliasMappings: { opus: "anthropic-opus-4", sonnet: "anthropic-sonnet-4" },
+  nativeDisplayNames: { "Anthropic Opus 4": "anthropic-opus-4" },
   stripInherited: ["ANTHROPIC_API_KEY"], // ignored — strip list is fixed
-  envVars: { ANTHROPIC_API_KEY: "sk-test-secret-key", ANTHROPIC_BASE_URL: "https://api.test.example.com" },
+  envVars: {
+    ANTHROPIC_API_KEY: "sk-test-secret-key",
+    ANTHROPIC_BASE_URL: "https://api.test.example.com",
+    ANTHROPIC_DEFAULT_OPUS_MODEL: "anthropic-opus-4",
+    ANTHROPIC_DEFAULT_SONNET_MODEL: "anthropic-sonnet-4",
+    ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: "Anthropic Opus 4",
+  },
 };
 
 test("readActiveProfile returns null when no fixture file exists", () => {
@@ -1674,5 +1704,262 @@ test("cc-profile-switch config with version 1 resolves successfully", () => {
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+// ─── §12  Req 3: Profile-derived model-target validation ───────────────────
+// Profile ANTHROPIC_DEFAULT_*_MODEL values must be validated against the
+// strict native-selector grammar (plus a secret-like rejection) BEFORE they
+// enter alias mappings, display mappings, fingerprints, snapshots, errors,
+// or MCP output. A malformed profile must fail closed at the configuration
+// stage and the rejected value must never be echoed in the error message.
+
+function profileWithBadModel(badValue) {
+  const home = makeTempDir();
+  const configDir = makeTempDir();
+  makeCcpsHome(home, {
+    lastUsedProfile: "alpha",
+    profileEnv: {
+      ANTHROPIC_API_KEY: "sk-alpha-secret-123",
+      ANTHROPIC_DEFAULT_OPUS_MODEL: badValue,
+    },
+  });
+  return { home, configDir };
+}
+
+test("profile with control character in ANTHROPIC_DEFAULT_*_MODEL fails closed", () => {
+  const { home, configDir } = profileWithBadModel("glm-5.2\x00evil");
+  try {
+    assert.throws(
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir) }),
+      (err) => {
+        assert.ok(err instanceof ProfileResolutionError);
+        // The raw value (with its control char) must never be echoed.
+        assert.doesNotMatch(err.message, /glm-5\.2\x00evil/);
+        return true;
+      }
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+test("profile with whitespace in ANTHROPIC_DEFAULT_*_MODEL fails closed", () => {
+  const { home, configDir } = profileWithBadModel("glm-5.2 rm -rf /");
+  try {
+    assert.throws(
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir) }),
+      (err) => {
+        assert.ok(err instanceof ProfileResolutionError);
+        assert.doesNotMatch(err.message, /rm -rf/);
+        return true;
+      }
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+test("profile with overlong ANTHROPIC_DEFAULT_*_MODEL fails closed", () => {
+  const longVal = "a".repeat(129) + "1";
+  const { home, configDir } = profileWithBadModel(longVal);
+  try {
+    assert.throws(
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir) }),
+      (err) => {
+        assert.ok(err instanceof ProfileResolutionError);
+        // The overlong value must not be echoed.
+        assert.doesNotMatch(err.message, new RegExp(longVal.slice(0, 20)));
+        return true;
+      }
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+test("profile with disallowed characters in ANTHROPIC_DEFAULT_*_MODEL fails closed", () => {
+  const { home, configDir } = profileWithBadModel("glm-5.2;rm");
+  try {
+    assert.throws(
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir) }),
+      (err) => {
+        assert.ok(err instanceof ProfileResolutionError);
+        assert.doesNotMatch(err.message, /glm-5\.2;rm/);
+        return true;
+      }
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+test("profile with secret-like ANTHROPIC_DEFAULT_*_MODEL fails closed and is not echoed", () => {
+  const secret = "sk-ant-api03-1234567890abcdef";
+  const { home, configDir } = profileWithBadModel(secret);
+  try {
+    assert.throws(
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir) }),
+      (err) => {
+        assert.ok(err instanceof ProfileResolutionError);
+        // The secret must never appear in the error message, fingerprint,
+        // or any projection. Only a generic "looks like a secret" message.
+        assert.doesNotMatch(err.message, /sk-ant-api03/);
+        assert.match(err.message, /secret/i);
+        return true;
+      }
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+test("profile with secret-like display name fails closed and is not echoed", () => {
+  const home = makeTempDir();
+  const configDir = makeTempDir();
+  try {
+    makeCcpsHome(home, {
+      lastUsedProfile: "alpha",
+      profileEnv: {
+        ANTHROPIC_API_KEY: "sk-alpha-secret-123",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "glm-5.2",
+        ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: "sk-ant-display-secret-12345",
+      },
+    });
+    assert.throws(
+      () => readActiveAuthority({ env: isolatedEnv(home, configDir) }),
+      (err) => {
+        assert.ok(err instanceof ProfileResolutionError);
+        assert.doesNotMatch(err.message, /sk-ant-display-secret/);
+        assert.match(err.message, /secret/i);
+        return true;
+      }
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+test("resolveRouteForDisplay fails closed on profile with invalid model target (no MCP output)", () => {
+  const { home, configDir } = profileWithBadModel("sk-ant-api03-secretvalue99");
+  try {
+    // The resolver must throw before producing any structuredContent or
+    // text output — the secret never reaches cc_resolve_route output.
+    assert.throws(
+      () => resolveRouteForDisplay({
+        claudeConfigDir: configDir,
+        selectorInput: "Opus",
+        cliVersion: "2.1.208",
+        env: isolatedEnv(home, configDir),
+      }),
+      (err) => {
+        assert.ok(err instanceof ProfileResolutionError);
+        assert.doesNotMatch(err.message, /sk-ant-api03-secretvalue99/);
+        return true;
+      }
+    );
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
+});
+
+// ─── §13  Req 4: Legacy fixture truthfulness (mismatch regression) ──────────
+// The active-profile.json fixture's declared aliasMappings / nativeDisplayNames
+// must match the mappings derived from the validated injected envVars. A
+// mismatch means the fixture claims a route the child env does not carry —
+// fail closed. Never echo the raw declared values in the error.
+
+test("fixture aliasMappings disagreeing with envVars fails closed", () => {
+  const dir = makeTempDir();
+  try {
+    writeActiveProfileFixture(dir, {
+      profileIdentity: "test-profile",
+      // Declares opus → anthropic-opus-4 ...
+      aliasMappings: { opus: "anthropic-opus-4" },
+      // ... but envVars inject opus → glm-5.2. Mismatch must fail closed.
+      envVars: {
+        ANTHROPIC_API_KEY: "sk-test-secret-key",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "glm-5.2",
+      },
+    });
+    assert.throws(
+      () => readActiveProfile(dir),
+      (err) => {
+        assert.match(err.message, /disagrees with injected envVars/i);
+        return true;
+      }
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fixture nativeDisplayNames disagreeing with envVars fails closed", () => {
+  const dir = makeTempDir();
+  try {
+    writeActiveProfileFixture(dir, {
+      profileIdentity: "test-profile",
+      nativeDisplayNames: { "DeepSeek V4 Pro": "wrong-model-v1" },
+      envVars: {
+        ANTHROPIC_API_KEY: "sk-test-secret-key",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "deepseek-v4-pro",
+        ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: "DeepSeek V4 Pro",
+      },
+    });
+    assert.throws(
+      () => readActiveProfile(dir),
+      /disagrees with injected envVars/i
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fixture aliasMappings declaring an alias not backed by envVars fails closed", () => {
+  const dir = makeTempDir();
+  try {
+    writeActiveProfileFixture(dir, {
+      profileIdentity: "test-profile",
+      // Declares a sonnet alias but envVars has no ANTHROPIC_DEFAULT_SONNET_MODEL.
+      aliasMappings: { opus: "glm-5.2", sonnet: "glm-5.1" },
+      envVars: {
+        ANTHROPIC_API_KEY: "sk-test-secret-key",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "glm-5.2",
+      },
+    });
+    assert.throws(
+      () => readActiveProfile(dir),
+      /not backed by injected envVars/i
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fixture with matching declared mappings resolves successfully (truthful path)", () => {
+  const dir = makeTempDir();
+  try {
+    writeActiveProfileFixture(dir, {
+      profileIdentity: "test-profile",
+      aliasMappings: { opus: "glm-5.2" },
+      nativeDisplayNames: { "Glm 5.2": "glm-5.2" },
+      envVars: {
+        ANTHROPIC_API_KEY: "sk-test-secret-key",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "glm-5.2",
+        ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: "Glm 5.2",
+      },
+    });
+    const result = readActiveProfile(dir);
+    assert.ok(result);
+    assert.equal(result.projection.aliasMappings.opus, "glm-5.2");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

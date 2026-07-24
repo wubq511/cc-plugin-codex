@@ -1,5 +1,5 @@
 /**
- * Job state management — schema v5, atomic per-job persistence.
+ * Job state management — schema v6, atomic per-job persistence.
  *
  * Each job lives in its own JSON file under <stateDir>/jobs/.
  * All writes use tmp+rename for atomicity. Configuration metadata is separate
@@ -15,7 +15,7 @@ import path from "node:path";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 import { migrateV3ModelFields } from "./model-evidence.mjs";
 
-const STATE_VERSION = 5;
+const STATE_VERSION = 6;
 const CONFIG_FILE_NAME = "config.json";
 const LEASE_FILE_NAME = "lease.lock";
 const JOBS_DIR_NAME = "jobs";
@@ -255,7 +255,16 @@ function readJobFileSafe(cwd, jobId) {
 function writeJobFile(cwd, jobId, jobData) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  const serialized = JSON.stringify(jobData, null, 2);
+  // Privacy boundary (Req 1): task content must never reach disk. This is the
+  // structural chokepoint for every write path (upsertJob, reconcileOrphans).
+  // Even if a caller accidentally passes `task` or `taskPreview`, they are
+  // dropped here. Only the non-reversible `taskRef` (short SHA-256 prefix) and
+  // the full `taskHash` (irreversible, retained for migration derivation) may
+  // be persisted. The full task enters only the Claude child stdin stream.
+  const sanitized = { ...jobData };
+  delete sanitized.task;
+  delete sanitized.taskPreview;
+  const serialized = JSON.stringify(sanitized, null, 2);
   const size = Buffer.byteLength(serialized, "utf8");
   if (size > MAX_JOB_METADATA_BYTES) {
     throw new Error(`Job metadata exceeds ${MAX_JOB_METADATA_BYTES}-byte limit (${size} bytes)`);
@@ -309,12 +318,16 @@ export function reconcileOrphans(cwd) {
 // ─── V3 → V4 → V5 Migration ─────────────────────────────────────────────────
 
 /**
- * Migrate a job to the current schema version (v5).
+ * Migrate a job to the current schema version (v6).
  *
  * v3 → v4: model evidence restructure (observedModel → usageModelKeys).
  * v4 → v5: add selectorKind, routeSnapshot, routeStatus (additive null fields).
+ * v5 → v6: privacy boundary — drop `taskPreview` and legacy `task` content
+ *          fields; replace with a non-reversible `taskRef` (short SHA-256
+ *          prefix) derived from the existing `taskHash` when available. Old
+ *          records must never cause task content to be rendered.
  *
- * Idempotent — v5 jobs pass through unchanged.
+ * Idempotent — v6 jobs pass through unchanged.
  */
 function migrateJob(job) {
   if (!job || job.version >= STATE_VERSION) return job;
@@ -340,6 +353,21 @@ function migrateJob(job) {
     migrated.version = 5;
   }
 
+  // v5 → v6: privacy boundary — never persist or render task content.
+  // Drop `taskPreview` (first 4 KiB of the task) and legacy `task` fields.
+  // Derive a non-reversible short hash reference from `taskHash` when present.
+  if (migrated.version < 6) {
+    migrated = { ...migrated };
+    delete migrated.taskPreview;
+    delete migrated.task;
+    if (migrated.taskRef === undefined) {
+      migrated.taskRef = migrated.taskHash
+        ? `sha256:${String(migrated.taskHash).slice(0, 12)}`
+        : null;
+    }
+    migrated.version = 6;
+  }
+
   return migrated;
 }
 
@@ -357,16 +385,23 @@ export function upsertJob(cwd, jobPatch) {
   migrateV2State(cwd);
   ensureStateDir(cwd);
 
+  // Privacy boundary: strip task content from the patch before merge so it
+  // never enters the persisted record or the in-memory return value. The
+  // structural chokepoint (writeJobFile) strips again as defense in depth.
+  const safePatch = { ...jobPatch };
+  delete safePatch.task;
+  delete safePatch.taskPreview;
+
   const timestamp = nowIso();
   const existing = readJobFileSafe(cwd, jobPatch.id);
   if (existing) {
     // Migrate v3 → v4 if needed
     const migrated = migrateV3Job(existing);
-    const merged = { ...migrated, ...jobPatch, updatedAt: timestamp };
+    const merged = { ...migrated, ...safePatch, updatedAt: timestamp };
     writeJobFile(cwd, jobPatch.id, merged);
     return merged;
   }
-  const newJob = { createdAt: timestamp, updatedAt: timestamp, version: STATE_VERSION, ...jobPatch };
+  const newJob = { createdAt: timestamp, updatedAt: timestamp, version: STATE_VERSION, ...safePatch };
   writeJobFile(cwd, jobPatch.id, newJob);
   return newJob;
 }

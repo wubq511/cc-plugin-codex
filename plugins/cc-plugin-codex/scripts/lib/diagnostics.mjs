@@ -39,15 +39,10 @@ const VALID_STAGES = new Set(Object.values(FAILURE_STAGES));
 
 const MAX_TAIL_BYTES = 2048; // 2 KiB per stream tail
 const MAX_SAFE_ERROR_BYTES = 4096; // 4 KiB for safe error message
-const MIN_TASK_MARKER_LEN = 8; // shorter strings are not redacted as task markers
-
-/**
- * Escape a string for safe use in a RegExp. Prevents regex injection from
- * task content (which is untrusted user input).
- */
-function escapeRegExp(str) {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+const MIN_TASK_MARKER_LEN = 8; // shorter markers are not exact-redacted (false-positive risk)
+const TASK_FRAGMENT_LEN = 12; // distinctive alphanumeric fragment triggering fail-safe if it survives
+const TASK_SPAN_WINDOW = 20; // contiguous-span length used to detect chunked prose echoes
+const TASK_BEARING_REDACTED_MARKER = "[TASK_BEARING_OUTPUT_REDACTED]";
 
 // ─── Redaction Patterns ──────────────────────────────────────────────────────
 
@@ -80,10 +75,131 @@ const REDACTION_PATTERNS = [
   { pattern: /(https?:\/\/[a-zA-Z0-9\-._:]+)\/[^\s"']+/gi, replacement: "$1/[REDACTED]" },
 ];
 
+// ─── Task-Marker Variant Generation ──────────────────────────────────────────
+
+/**
+ * Generate redaction variants for a task marker so that echoes in raw,
+ * JSON-escaped, newline-escaped, or whitespace-normalized form are all
+ * removed by exact matching. Returns a Set of candidate strings (not yet
+ * filtered by length).
+ *
+ * Encodings covered:
+ *   - raw                       : the verbatim task
+ *   - JSON-escaped (quoted)     : JSON.stringify(task) — escapes quotes, control chars
+ *   - JSON-escaped (inner)      : the quoted form without surrounding quotes
+ *   - literal-escaped controls  : real \n -> backslash-n, \t -> backslash-t
+ *   - whitespace-collapsed      : runs of whitespace -> single space
+ *   - whitespace-collapsed JSON : the collapsed form, JSON-escaped (quoted + inner)
+ */
+function taskRedactionVariants(marker) {
+  const variants = new Set();
+  if (typeof marker !== "string" || !marker) return variants;
+  variants.add(marker);
+  try {
+    const j = JSON.stringify(marker);
+    if (typeof j === "string") {
+      variants.add(j);
+      if (j.length >= 2) variants.add(j.slice(1, -1));
+    }
+  } catch { /* ignore */ }
+  variants.add(
+    marker
+      .replace(/\r\n/g, "\\n")
+      .replace(/\n/g, "\\n")
+      .replace(/\r/g, "\\n")
+      .replace(/\t/g, "\\t")
+  );
+  const collapsed = marker.replace(/\s+/g, " ").trim();
+  variants.add(collapsed);
+  try {
+    const jc = JSON.stringify(collapsed);
+    if (typeof jc === "string") {
+      variants.add(jc);
+      if (jc.length >= 2) variants.add(jc.slice(1, -1));
+    }
+  } catch { /* ignore */ }
+  return variants;
+}
+
+// ─── Fail-Safe Leak Detection ────────────────────────────────────────────────
+
+/**
+ * Detect a task-bearing leak that exact-variant redaction could not reliably
+ * remove. Returns true when the output cannot be safely rendered and must be
+ * replaced with the generic fail-safe marker.
+ *
+ * Triggers:
+ *   1. A short task marker (< MIN_TASK_MARKER_LEN) appears verbatim in the
+ *      redacted text. Short markers cannot be removed without false-positive
+ *      risk, so any verbatim presence forces a fail-safe.
+ *   2. A distinctive long alphanumeric fragment (>= TASK_FRAGMENT_LEN) of a
+ *      long marker survives — indicates a chunked or partially-escaped echo
+ *      that variant matching missed.
+ *   3. A long contiguous span (>= TASK_SPAN_WINDOW) of a long marker with
+ *      enough alpha content survives — catches chunked prose echoes.
+ */
+function taskBearingLeakDetected(redacted, taskMarkers, shortTaskPresent) {
+  if (shortTaskPresent) {
+    for (const marker of taskMarkers) {
+      if (typeof marker !== "string") continue;
+      const m = marker.trim();
+      if (m.length > 0 && m.length < MIN_TASK_MARKER_LEN && redacted.includes(m)) {
+        return true;
+      }
+    }
+  }
+  for (const marker of taskMarkers) {
+    if (typeof marker !== "string") continue;
+    const m = marker.trim();
+    if (m.length < MIN_TASK_MARKER_LEN) continue;
+    const normMarker = m.replace(/\s+/g, " ").trim();
+    const normRedacted = redacted.replace(/\s+/g, " ");
+    // Distinctive alphanumeric fragment survival (chunked identifier echo).
+    const re = new RegExp(`[A-Za-z0-9_]{${TASK_FRAGMENT_LEN},}`, "g");
+    let match;
+    while ((match = re.exec(normMarker)) !== null) {
+      if (normRedacted.includes(match[0])) return true;
+    }
+    // Long contiguous span survival (chunked prose echo). The window must
+    // contain a run of alpha characters long enough to be distinctive.
+    if (normMarker.length >= TASK_SPAN_WINDOW) {
+      for (let i = 0; i + TASK_SPAN_WINDOW <= normMarker.length; i++) {
+        const win = normMarker.slice(i, i + TASK_SPAN_WINDOW);
+        if (/[A-Za-z]{8,}/.test(win) && normRedacted.includes(win)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Build the bounded fail-safe replacement for task-bearing output that could
+ * not be reliably redacted. Never includes the raw output.
+ */
+function boundedFailSafe(originalText, maxBytes) {
+  const bytes = Buffer.byteLength(originalText || "", "utf8");
+  const out = `${TASK_BEARING_REDACTED_MARKER} (task-bearing output redacted, ${bytes} bytes total)`;
+  if (Buffer.byteLength(out, "utf8") > maxBytes) {
+    return TASK_BEARING_REDACTED_MARKER;
+  }
+  return out;
+}
+
 /**
  * Redact sensitive content from a text string.
- * First redacts task markers (prompt text echoed by CLI/Provider), then
- * applies secret redaction patterns, then bounds the size.
+ *
+ * Redaction proceeds in phases:
+ *   1. Remove every redaction variant of each task marker (raw, JSON-escaped,
+ *      newline-escaped, whitespace-normalized) so echoed prompt text is
+ *      scrubbed regardless of how the CLI/Provider encoded it. Variant
+ *      removal runs over the full captured text.
+ *   2. Apply secret redaction patterns (API keys, tokens, URLs with creds...).
+ *   3. Bound to the first maxBytes (safe UTF-8 boundary). Only this slice is
+ *      ever persisted, so leak detection only inspects it — this also keeps
+ *      fail-safe analysis O(maxBytes) instead of O(captured size).
+ *   4. Fail-safe: if a task-bearing leak cannot be reliably removed from the
+ *      bounded slice (short tasks, chunked/partial echoes), replace the entire
+ *      output with a bounded generic marker — never the raw output.
  *
  * @param {string} text - The text to redact
  * @param {number} maxBytes - Maximum bytes to retain (default MAX_TAIL_BYTES)
@@ -94,33 +210,64 @@ export function redactText(text, maxBytes = MAX_TAIL_BYTES, taskMarkers = []) {
   if (!text || typeof text !== "string") return "";
 
   let redacted = text;
+  let shortTaskPresent = false;
+  const longVariants = [];
 
-  // Redact task markers first — the CLI or Provider may echo prompt text
-  // in error messages. Only markers above a minimum length are redacted
-  // to avoid false positives on short common substrings.
   for (const marker of taskMarkers) {
-    if (typeof marker === "string" && marker.length >= MIN_TASK_MARKER_LEN) {
-      const escaped = escapeRegExp(marker);
-      redacted = redacted.replace(new RegExp(escaped, "g"), "[TASK_REDACTED]");
+    if (typeof marker !== "string") continue;
+    const m = marker.trim();
+    if (!m) continue;
+    if (m.length < MIN_TASK_MARKER_LEN) {
+      shortTaskPresent = true;
+      continue;
     }
+    for (const v of taskRedactionVariants(marker)) {
+      if (v.length >= MIN_TASK_MARKER_LEN) longVariants.push(v);
+    }
+  }
+
+  // Redact long variants, longest first so overlapping shorter variants do
+  // not leave partial fragments behind. Use split/join (literal, not regex)
+  // to avoid regex-injection from task content.
+  longVariants.sort((a, b) => b.length - a.length);
+  for (const v of longVariants) {
+    redacted = redacted.split(v).join("[TASK_REDACTED]");
   }
 
   for (const { pattern, replacement } of REDACTION_PATTERNS) {
     redacted = redacted.replace(pattern, replacement);
   }
 
-  // Bound to maxBytes, cutting at a safe UTF-8 boundary
-  const bytes = Buffer.byteLength(redacted, "utf8");
-  if (bytes > maxBytes) {
-    let truncated = redacted.slice(0, maxBytes);
-    while (truncated.length > 0 && Buffer.byteLength(truncated, "utf8") > maxBytes) {
-      truncated = truncated.slice(0, -1);
+  // Bound to the first maxBytes at a safe UTF-8 boundary BEFORE fail-safe
+  // analysis. Only this slice is persisted, so leak detection only needs to
+  // inspect it; this also keeps fail-safe scanning O(maxBytes).
+  const totalBytes = Buffer.byteLength(redacted, "utf8");
+  let bounded = redacted;
+  let wasTruncated = false;
+  if (totalBytes > maxBytes) {
+    bounded = redacted.slice(0, maxBytes);
+    while (bounded.length > 0 && Buffer.byteLength(bounded, "utf8") > maxBytes) {
+      bounded = bounded.slice(0, -1);
     }
-    redacted = truncated + `... (redacted tail, ${bytes} bytes total)`;
+    wasTruncated = true;
   }
 
-  return redacted;
+  // Fail-safe: replace the entire output with a bounded marker when a
+  // task-bearing leak cannot be reliably removed from the persisted slice.
+  if (taskBearingLeakDetected(bounded, taskMarkers, shortTaskPresent)) {
+    return boundedFailSafe(text, maxBytes);
+  }
+
+  return wasTruncated
+    ? bounded + `... (redacted tail, ${totalBytes} bytes total)`
+    : bounded;
 }
+
+/**
+ * Exported for tests and downstream bounded-output helpers. The generic
+ * marker stored when a task-bearing diagnostic cannot be safely rendered.
+ */
+export const TASK_BEARING_REDACTED = TASK_BEARING_REDACTED_MARKER;
 
 // ─── Failure Stage Classification ────────────────────────────────────────────
 

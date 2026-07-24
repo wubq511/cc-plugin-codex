@@ -567,8 +567,7 @@ test("cc_list_models with cwd loads history from that workspace directly", async
     id: "cc-list-models-test",
     status: "completed",
     phase: "completed",
-    task: "test task",
-    taskPreview: "test task",
+    taskRef: "sha256:listmodel001",
     requestedModel: "workspace-model-xyz",
     requestMode: "explicit",
     modelEvidence: {

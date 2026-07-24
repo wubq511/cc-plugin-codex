@@ -31,6 +31,10 @@
  *   multi-usage-keys    — return multiple usage model keys
  *   exec-model          — return a specific execution model in modelUsage (via EXEC_MODEL env)
  *   echo-task-error     — read task from stdin, echo it in stderr, exit non-zero (tests task redaction)
+ *   echo-task-encoded   — read task from stdin, echo it in stderr using the encoding selected by
+ *                         ECHO_TASK_ENCODING (raw|json|escaped-newline|whitespace-normalized|chunked|short),
+ *                         exit non-zero (tests multi-encoding task redaction + fail-safe)
+ *   success-no-cost     — return fake result with NO total_cost_usd (tests honest null cost)
  */
 
 const args = process.argv.slice(2);
@@ -178,6 +182,17 @@ function handleMode(mode) {
       success(`stdin prompt: ${prompt}`);
     });
     return; // Don't call success() below
+  } else if (mode === "success-no-cost") {
+    // Return a successful result with NO total_cost_usd field. Tests that
+    // the liveness probe reports cost as "unknown" (never "$0.00") when
+    // Provider telemetry is missing.
+    const execModel = process.env.EXEC_MODEL || "mimo-v2.5";
+    process.stdout.write(JSON.stringify({
+      result: "OK",
+      session_id: "fake-session-no-cost",
+      duration_ms: 15,
+      modelUsage: { [execModel]: {} }
+    }));
   } else if (mode === "multi-usage-keys") {
     // Return multiple usage model keys to test multi-key handling
     process.stdout.write(JSON.stringify({
@@ -196,6 +211,46 @@ function handleMode(mode) {
     process.stdin.on("end", () => {
       process.stderr.write(`Error processing request: task="${input.trim()}" failed\n`);
       process.stderr.write(`Context: ${input.trim()}\n`);
+      process.exitCode = 7;
+    });
+    return;
+  } else if (mode === "echo-task-encoded") {
+    // Read the task from stdin, then echo it back in stderr using the
+    // encoding selected by ECHO_TASK_ENCODING. Tests that task redaction
+    // handles raw, JSON-escaped, newline-escaped, whitespace-normalized,
+    // chunked, and short-task echoes — including the fail-safe marker when
+    // reliable redaction is impossible.
+    let input = "";
+    process.stdin.on("data", (chunk) => { input += chunk; });
+    process.stdin.on("end", () => {
+      const task = input.trim();
+      const enc = process.env.ECHO_TASK_ENCODING || "raw";
+      let echo;
+      if (enc === "json") {
+        echo = `Error: failed for ${JSON.stringify(task)} end`;
+      } else if (enc === "escaped-newline") {
+        // Real newlines/tabs become literal backslash escapes.
+        const escaped = task
+          .replace(/\r\n/g, "\\n")
+          .replace(/\n/g, "\\n")
+          .replace(/\r/g, "\\n")
+          .replace(/\t/g, "\\t");
+        echo = `Error: processing ${escaped} failed`;
+      } else if (enc === "whitespace-normalized") {
+        const collapsed = task.replace(/\s+/g, " ").trim();
+        echo = `Error: processing ${collapsed} failed`;
+      } else if (enc === "chunked") {
+        // Split the task on whitespace and emit each token on its own line
+        // so no exact variant matches, but all task content is present.
+        const tokens = task.split(/\s+/).filter(Boolean);
+        echo = tokens.map((tok) => `chunk: ${tok}`).join("\n");
+      } else if (enc === "short") {
+        echo = `Error: ${task} bad`;
+      } else {
+        // raw
+        echo = `Error processing request: task="${task}" failed`;
+      }
+      process.stderr.write(echo + "\n");
       process.exitCode = 7;
     });
     return;

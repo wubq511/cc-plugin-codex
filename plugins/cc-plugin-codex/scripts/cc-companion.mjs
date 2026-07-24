@@ -3,7 +3,7 @@
 /**
  * Claude Code Companion — MCP Server for Codex
  *
- * Schema v5 with dynamic model routing, route snapshots, failure diagnostics,
+ * Schema v6 with dynamic model routing, route snapshots, failure diagnostics,
  * atomic per-job persistence, watchdog-based execution, and comprehensive
  * safety hardening.
  *
@@ -75,7 +75,6 @@ const MAX_JOB_RESULT_BYTES = 32 * 1024; // keep complete job metadata below 64 K
 const MAX_ERROR_MESSAGE_BYTES = 8 * 1024;
 const MAX_TOUCHED_FILES = 500;
 const MAX_TOUCHED_FILES_BYTES = 16 * 1024;
-const MAX_TASK_PREVIEW_BYTES = 4 * 1024; // 4 KiB task preview in metadata
 
 // ─── MCP Protocol ───────────────────────────────────────────────────────────
 
@@ -338,15 +337,21 @@ function truncateForPresentation(text, maxBytes = MAX_MCP_RESULT_BYTES) {
   };
 }
 
-function taskPreview(task) {
-  if (!task) return "";
-  const bytes = Buffer.byteLength(task, "utf8");
-  if (bytes <= MAX_TASK_PREVIEW_BYTES) return task;
-  let preview = task.slice(0, MAX_TASK_PREVIEW_BYTES);
-  while (preview.length > 0 && Buffer.byteLength(preview, "utf8") > MAX_TASK_PREVIEW_BYTES) {
-    preview = preview.slice(0, -1);
-  }
-  return preview + "...";
+/**
+ * Build a non-reversible, bounded task reference from the task content.
+ * Returns a short SHA-256 prefix that lets users correlate jobs without ever
+ * persisting or displaying task text. The full task enters only the child
+ * process stdin stream.
+ */
+function taskRef(task) {
+  if (!task) return null;
+  return "sha256:" + createHash("sha256").update(task).digest("hex").slice(0, 12);
+}
+
+/** Render a safe task-reference label for MCP output (never task content). */
+function taskRefLabel(job) {
+  const ref = job?.taskRef || null;
+  return ref ? `${ref} (content withheld)` : "(content withheld)";
 }
 
 function boundedText(value, maxBytes) {
@@ -614,6 +619,9 @@ async function handleDelegate(params, context = {}) {
     // Preflight route failure: create a bounded rejected job for auditability.
     // Claude is never spawned. No fake route snapshot is persisted.
     // MCP exposes only the safe category, generic summary, and job ID.
+    // Req 5: the raw selector and raw error text are never stored in state,
+    // diagnostics, or MCP output — only the category, safe summary, and
+    // non-reversible task hash reference are preserved.
     const rejectedJobId = generateJobId("cc");
     const rejectedNow = new Date().toISOString();
     const rejectedStage = FAILURE_STAGES.CONFIGURATION;
@@ -621,10 +629,12 @@ async function handleDelegate(params, context = {}) {
       ? "ambiguous-selector"
       : "configuration";
     const rejectedSafeError = buildSafeErrorMessage(rejectedStage, err.message);
+    const rejectedSafeSummary = buildSafeErrorSummary(rejectedStage, err.message);
 
     const rejectedDiagnostics = buildFailureEnvelope({
       stage: rejectedStage,
-      requestedSelector: model ? { kind: "unknown", value: model } : null,
+      // Req 5: never store the raw untrusted selector value.
+      requestedSelector: { kind: "unknown", value: null },
       effort: effort || null,
       cliVersion: null,
       exitCode: null,
@@ -634,7 +644,9 @@ async function handleDelegate(params, context = {}) {
       sessionId: null,
       usageKey: null,
       transcriptFound: false,
-      errorDetail: err.message,
+      // Req 5: use the safe summary, not the raw error message which may
+      // contain the raw selector or untrusted configuration text.
+      errorDetail: rejectedSafeSummary,
       stdout: "",
       stderr: "",
       taskMarkers: [task],
@@ -647,7 +659,8 @@ async function handleDelegate(params, context = {}) {
       duration: null,
       usageModelKeys: [],
       exitCode: null,
-      requestedModel: storedRequestedModel,
+      // Req 5: don't persist the raw selector for rejected jobs.
+      requestedModel: null,
       requestMode: model ? "explicit" : "inherited",
       selectorKind: null,
       routeSnapshot: null,
@@ -667,9 +680,10 @@ async function handleDelegate(params, context = {}) {
       id: rejectedJobId,
       status: "rejected",
       phase: "rejected",
-      taskPreview: taskPreview(task.trim()),
+      taskRef: taskRef(task.trim()),
       taskHash: taskHashSync(task.trim()),
-      requestedModel: storedRequestedModel,
+      // Req 5: don't persist the raw selector for rejected jobs.
+      requestedModel: null,
       requestMode: model ? "explicit" : "inherited",
       selectorKind: null,
       routeSnapshot: null,
@@ -715,7 +729,7 @@ async function handleDelegate(params, context = {}) {
     return {
       content: [{
         type: "text",
-        text: `## ${err instanceof AmbiguousSelectorError ? "Ambiguous Model Selector" : "Configuration Error"}\n\n**Job ID:** ${rejectedJobId}\n**Category:** ${rejectedCategory}\n\n${buildSafeErrorSummary(rejectedStage, err.message)}${guidance}`
+        text: `## ${err instanceof AmbiguousSelectorError ? "Ambiguous Model Selector" : "Configuration Error"}\n\n**Job ID:** ${rejectedJobId}\n**Category:** ${rejectedCategory}\n**Task ref:** ${taskRef(task.trim()) || "(withheld)"} (content withheld)\n\n${rejectedSafeSummary}${guidance}`
       }],
       isError: true
     };
@@ -789,8 +803,9 @@ async function handleDelegate(params, context = {}) {
   // P0: Pre-run workspace fingerprint
   preRunFingerprint = captureWorkspaceFingerprint(workspaceRoot);
 
-  // P0: Store task preview + hash, not full task
-  const preview = taskPreview(task.trim());
+  // Privacy boundary: store only a non-reversible task reference + hash.
+  // The full task enters only the child process stdin stream.
+  const ref = taskRef(task.trim());
   const hash = taskHashSync(task.trim());
 
   // Create job record with separated IDs
@@ -798,7 +813,7 @@ async function handleDelegate(params, context = {}) {
     id: jobId,
     status: "running",
     phase: "starting",
-    taskPreview: preview,
+    taskRef: ref,
     taskHash: hash,
     requestedModel: storedRequestedModel,
     requestMode: model ? "explicit" : "inherited",
@@ -1156,19 +1171,23 @@ function handleResolveRoute(params) {
     });
   } catch (err) {
     if (err instanceof AmbiguousSelectorError) {
+      // Req 5: never echo the raw selector input — it may be secret-like,
+      // contain control characters, or be an arbitrary untrusted string.
+      // Preserve only a safe category and generic guidance.
       return {
         content: [{
           type: "text",
-          text: `## Ambiguous Model Selector\n\nCould not safely resolve \`${selectorInput}\` to a Claude alias or native model ID.\n\n**Reason:** ${err.message}\n\nTo resolve:\n- Use a Claude alias: \`opus\`, \`fable\`, \`sonnet\`, \`haiku\` (case-insensitive)\n- Use a full native model ID with version (e.g., \`deepseek-v4-pro\`, \`glm-5.2\`)\n- Use a display name declared in the active profile\n\nOmit the selector entirely for inherited (default) behavior.`
+          text: `## Ambiguous Model Selector\n\nThe supplied model selector could not be safely resolved to a Claude alias or native model ID.\n\n${buildSafeErrorSummary(FAILURE_STAGES.CONFIGURATION, err.message)}\n\nTo resolve:\n- Use a Claude alias: \`opus\`, \`fable\`, \`sonnet\`, \`haiku\` (case-insensitive)\n- Use a full native model ID with version (e.g., \`deepseek-v4-pro\`, \`glm-5.2\`)\n- Use a display name declared in the active profile\n\nOmit the selector entirely for inherited (default) behavior.`
         }],
         isError: true
       };
     }
     if (err instanceof ProfileResolutionError) {
+      // Req 5: never echo raw configuration text or error strings.
       return {
         content: [{
           type: "text",
-          text: `## Configuration Error\n\nThe active profile authority could not be safely resolved.\n\n**Reason:** ${err.message}\n\nNo fallback profile is used. Fix the configuration or remove it to use bare inheritance.`
+          text: `## Configuration Error\n\nThe active profile authority could not be safely resolved.\n\n${buildSafeErrorSummary(FAILURE_STAGES.CONFIGURATION, err.message)}\n\nNo fallback profile is used. Fix the configuration or remove it to use bare inheritance.`
         }],
         isError: true
       };
@@ -1177,7 +1196,7 @@ function handleResolveRoute(params) {
     return {
       content: [{
         type: "text",
-        text: `## Configuration Error\n\nThe active profile could not be safely resolved.\n\n**Reason:** ${err.message}\n\nNo fallback profile is used. Fix the profile file or remove it to use bare inheritance.`
+        text: `## Configuration Error\n\nThe active profile could not be safely resolved.\n\n${buildSafeErrorSummary(FAILURE_STAGES.CONFIGURATION, err.message)}\n\nNo fallback profile is used. Fix the profile file or remove it to use bare inheritance.`
       }],
       isError: true
     };
@@ -1250,14 +1269,14 @@ async function handleCheck(params) {
       "| Job ID | Status | Phase | Task | Model Evidence | Duration |",
       "|--------|--------|-------|------|----------------|----------|",
       ...sorted.map((j) => {
-        const taskShort = (j.taskPreview || j.task || "").length > 30 ? (j.taskPreview || j.task || "").slice(0, 27) + "..." : (j.taskPreview || j.task || "");
+        const taskDisplay = j.taskRef || "(withheld)";
         const modelDisplay = formatModelCompact({
           requestedModel: j.requestedModel,
           requestMode: j.requestMode || (j.requestedModel ? "explicit" : "inherited"),
           modelEvidence: j.modelEvidence,
           routeStatus: j.routeStatus || null
         });
-        return `| ${j.id} | ${j.status} | ${j.phase || "—"} | ${taskShort} | ${modelDisplay} | ${formatDuration(j.duration ? j.duration * 1000 : null)} |`;
+        return `| ${j.id} | ${j.status} | ${j.phase || "—"} | ${taskDisplay} | ${modelDisplay} | ${formatDuration(j.duration ? j.duration * 1000 : null)} |`;
       })
     ].join("\n");
     return { content: [{ type: "text", text: `## All Jobs${params.session ? " (current session)" : ""}\n\n${table}` }] };
@@ -1363,7 +1382,7 @@ async function handleCheck(params) {
   return {
     content: [{
       type: "text",
-      text: `## Job: ${job.id}\n\n**Status:** ${job.status}\n**Phase:** ${phase} (${phaseDescription(phase)})\n**Task:** ${job.taskPreview || job.task || "—"}\n${modelLine}\n**Effort:** ${job.effort || "—"}\n**Duration:** ${formatDuration(job.duration ? job.duration * 1000 : null)}\n**Cost:** ${formatCost(job.cost)}\n${elapsedSection}**Started:** ${job.startedAt || job.createdAt || "—"}\n**Completed:** ${job.completedAt || "—"}\n\n${resultSection}${truncationNote}\n\n${filesSection}\n\n${progressSection}\n\n${diagnosticSection}`
+      text: `## Job: ${job.id}\n\n**Status:** ${job.status}\n**Phase:** ${phase} (${phaseDescription(phase)})\n**Task:** ${taskRefLabel(job)}\n${modelLine}\n**Effort:** ${job.effort || "—"}\n**Duration:** ${formatDuration(job.duration ? job.duration * 1000 : null)}\n**Cost:** ${formatCost(job.cost)}\n${elapsedSection}**Started:** ${job.startedAt || job.createdAt || "—"}\n**Completed:** ${job.completedAt || "—"}\n\n${resultSection}${truncationNote}\n\n${filesSection}\n\n${progressSection}\n\n${diagnosticSection}`
     }]
   };
 }
@@ -1585,7 +1604,7 @@ function handleReview(params) {
     if (!job) {
       job = {
         id: "working-tree",
-        taskPreview: "Review current repository changes not associated with a recorded Claude Code job.",
+        taskRef: null,
         requestedModel: null,
         requestMode: "inherited",
         modelEvidence: {
@@ -1637,7 +1656,7 @@ function handleReview(params) {
   return {
     content: [{
       type: "text",
-      text: `## Review: Job ${job.id}\n\n**Task:** ${job.taskPreview || job.task || "—"}\n**Model Evidence:**\n${reviewModel}\n**Review Mode:** ${adversarial ? "Adversarial" : "Standard"}\n**Target:** ${target.label}\n**Files:** ${context.fileCount}\n**Diff Size:** ${context.diffBytes} bytes\n**Input Mode:** ${context.inputMode}\n\n### Review Instructions\n${reviewPrompt}\n\n<repository_context>\n${context.content}\n</repository_context>\n\n${schemaRef}`
+      text: `## Review: Job ${job.id}\n\n**Task:** ${taskRefLabel(job)}\n**Model Evidence:**\n${reviewModel}\n**Review Mode:** ${adversarial ? "Adversarial" : "Standard"}\n**Target:** ${target.label}\n**Files:** ${context.fileCount}\n**Diff Size:** ${context.diffBytes} bytes\n**Input Mode:** ${context.inputMode}\n\n### Review Instructions\n${reviewPrompt}\n\n<repository_context>\n${context.content}\n</repository_context>\n\n${schemaRef}`
     }]
   };
 }
@@ -1699,7 +1718,7 @@ async function handleSetup(params) {
 
   // Version info (no secrets)
   lines.push(`**Plugin Version:** ${SERVER_VERSION}`);
-  lines.push(`**State Schema:** v5 (dynamic model routing, route snapshots, failure diagnostics)`);
+  lines.push(`**State Schema:** v6 (task privacy boundary, dynamic model routing, route snapshots, failure diagnostics)`);
 
   if (claudeStatus.available) {
     lines.push(`✅ Claude Code: ${claudeStatus.detail}`);
@@ -1779,7 +1798,7 @@ async function handleSetup(params) {
   } else {
     lines.push(`⚠️ Could not determine Claude CLI version (best-effort)`);
   }
-  lines.push(`✅ Companion server: v${SERVER_VERSION}, schema v5`);
+  lines.push(`✅ Companion server: v${SERVER_VERSION}, schema v6`);
   lines.push(`✅ Watchdog protocol: --print --input-format text --output-format json (task via stdin, never argv)`);
 
   let sourceCacheOk = false;
@@ -1914,6 +1933,7 @@ async function handleSetup(params) {
     } else {
       // All prerequisites met — resolve the route (with model selector if provided)
       // and run the probe with the budget guard.
+      const probeJobId = generateJobId("probe");
       try {
         const claudeConfigDir = resolveClaudeConfigDir();
         let probeRoute;
@@ -1926,8 +1946,28 @@ async function handleSetup(params) {
             env: process.env
           });
         } catch (routeErr) {
-          const stage = routeErr instanceof AmbiguousSelectorError ? "ambiguous-selector" : "configuration";
-          lines.push(`❌ Probe refused (fail-closed): route resolution failed (${stage}): ${routeErr.message}`);
+          // Req 5: don't echo raw error text. Use safe category + summary.
+          const routeCategory = routeErr instanceof AmbiguousSelectorError ? "ambiguous-selector" : "configuration";
+          lines.push(`❌ Probe refused (fail-closed): route resolution failed (${routeCategory}).`);
+          lines.push(`   ${buildSafeErrorSummary(FAILURE_STAGES.CONFIGURATION, routeErr.message)}`);
+          // Persist a private rejected probe artifact for auditability.
+          writeResultArtifact(workspaceRoot, probeJobId, {
+            probeId: probeJobId,
+            timestamp: new Date().toISOString(),
+            ok: false,
+            rejected: true,
+            rejectionCategory: routeCategory,
+            routeSnapshot: null,
+            routeStatus: ROUTE_STATUSES.REJECTED,
+            duration: 0,
+            exitCode: null,
+            failureStage: FAILURE_STAGES.CONFIGURATION,
+            cost: null,
+            costProvenance: "unknown",
+            modelEvidence: { status: "unavailable", executedModels: [], usageModelKeys: [], warnings: ["preflight-route-failure"] },
+            usageKeyIsNotExecutionProof: true,
+          });
+          lines.push(`- **Probe ID:** ${probeJobId} (private artifact persisted)`);
           // Skip the probe — route is not resolvable
           const staticChecksOk = claudeStatus.available && nodeStatus.available && cliProtocolOk && profileResolvable && sourceCacheOk;
           lines.push("\n" + (staticChecksOk ? "✅ Static checks passed (zero model calls)" : "❌ Setup incomplete"));
@@ -1940,6 +1980,7 @@ async function handleSetup(params) {
           lines.push(`- **Model selector:** ${probeRoute.selector.kind} → ${probeRoute.selector.cliArg || "(inherited)"}`);
         }
         lines.push(`- **Budget guard:** --max-budget-usd ${probeMaxBudgetUsd}`);
+        lines.push(`- **Probe ID:** ${probeJobId}`);
 
         const probeExecution = runClaude(probeTask, {
           cwd: workspaceRoot,
@@ -1956,28 +1997,87 @@ async function handleSetup(params) {
           maxBudgetUsd: probeMaxBudgetUsd
         });
         const probeResult = await probeExecution.result;
-        const probeDuration = ((Date.now() - probeStart) / 1000).toFixed(1);
+        const probeDurationSec = ((Date.now() - probeStart) / 1000);
+        const probeDurationLabel = probeDurationSec.toFixed(1);
+
+        // Collect model evidence from transcript (best-effort, non-blocking).
+        // A usage key is never an execution model — transcript evidence is
+        // the only execution proof.
+        const probeUsageModelKeys = probeResult.usageModelKeys || [];
+        let probeModelEvidence;
+        try {
+          probeModelEvidence = await collectModelEvidence({
+            sessionId: probeResult.sessionId,
+            usageModelKeys: probeUsageModelKeys,
+            deadlineMs: 1000
+          });
+        } catch {
+          probeModelEvidence = {
+            status: "unavailable",
+            executedModels: [],
+            usageModelKeys: probeUsageModelKeys,
+            usageSource: "claude-result-modelUsage",
+            warnings: ["transcript-not-found"]
+          };
+        }
+
+        // Compute honest post-execution route status from the route snapshot
+        // and the transcript execution evidence.
+        const probeRouteStatus = computeRouteStatus({
+          routeSnapshot: probeRoute.snapshot,
+          jobOk: probeResult.ok,
+          cancelled: probeResult.cancelled === true,
+          executedModels: probeModelEvidence.executedModels,
+          usageModelKeys: probeModelEvidence.usageModelKeys,
+        });
+
+        // Honest cost: null when telemetry is missing or zero. Never
+        // display "$0.00" for a probe — that would imply the probe was free.
+        const honestCost = (probeResult.cost != null && Number.isFinite(probeResult.cost) && probeResult.cost > 0)
+          ? probeResult.cost
+          : null;
+        const costProvenance = honestCost != null ? "provider_reported" : "unknown";
+
+        // Persist a private, bounded, auditable liveness evidence artifact.
+        // This is the ONLY place where detailed probe evidence is stored.
+        // The MCP output links only to the probe ID and a safe summary.
+        writeResultArtifact(workspaceRoot, probeJobId, {
+          probeId: probeJobId,
+          timestamp: new Date().toISOString(),
+          ok: probeResult.ok,
+          cancelled: probeResult.cancelled === true,
+          routeSnapshot: probeRoute.snapshot,
+          routeStatus: probeRouteStatus,
+          modelEvidence: probeModelEvidence,
+          duration: probeDurationSec,
+          exitCode: probeResult.exitCode ?? null,
+          failureStage: probeResult.failureStage || null,
+          cost: honestCost,
+          costProvenance,
+          usageModelKeys: probeUsageModelKeys,
+          // A usage key is never execution proof — only transcript evidence is.
+          usageKeyIsNotExecutionProof: true,
+          diagnostics: probeResult.diagnostics || null,
+        });
+
         if (probeResult.ok) {
-          lines.push(`✅ Provider liveness confirmed in ${probeDuration}s`);
-          lines.push(`- **Cost:** ${formatCost(probeResult.cost)}`);
-          lines.push(`- **Duration:** ${probeDuration}s`);
-          lines.push(`- **Response:** ${boundedText(probeResult.result, 200)}`);
-          if (probeResult.usageModelKeys && probeResult.usageModelKeys.length > 0) {
-            lines.push(`- **Usage key:** ${probeResult.usageModelKeys.join(", ")}`);
-          }
-          // Cost provenance
-          const costProvenance = probeResult.cost != null && probeResult.cost > 0
-            ? "provider_reported"
-            : "unknown";
-          lines.push(`- **Cost provenance:** ${costProvenance}`);
+          lines.push(`✅ Provider liveness confirmed in ${probeDurationLabel}s`);
+          lines.push(`- **Cost:** ${honestCost != null ? formatCost(honestCost) : "unknown"} (provenance: ${costProvenance})`);
+          lines.push(`- **Duration:** ${probeDurationLabel}s`);
+          lines.push(`- **Route status:** ${describeRouteStatus(probeRouteStatus)}`);
+          lines.push(`- **Private evidence:** artifact ${probeJobId} (route snapshot, model evidence, diagnostics)`);
         } else {
           const probeStage = probeResult.failureStage || FAILURE_STAGES.PROVIDER_RESPONSE;
-          lines.push(`❌ Provider liveness probe failed in ${probeDuration}s`);
+          lines.push(`❌ Provider liveness probe failed in ${probeDurationLabel}s`);
           lines.push(`- **Stage:** ${probeStage}`);
-          lines.push(`- **Error:** ${boundedText(buildSafeErrorMessage(probeStage, probeResult.error || "Unknown"), 500)}`);
+          lines.push(`- **Safe summary:** ${boundedText(buildSafeErrorMessage(probeStage, probeResult.error || "Unknown"), 500)}`);
+          lines.push(`- **Route status:** ${describeRouteStatus(probeRouteStatus)}`);
+          lines.push(`- **Private evidence:** artifact ${probeJobId} (route snapshot, model evidence, diagnostics)`);
         }
       } catch (err) {
-        lines.push(`❌ Liveness probe error: ${err.message}`);
+        // Req 5: don't echo raw error text in the summary line.
+        lines.push(`❌ Liveness probe error (probe ID: ${probeJobId}).`);
+        lines.push(`   ${buildSafeErrorSummary(FAILURE_STAGES.PROVIDER_RESPONSE, err.message)}`);
       }
     }
   }

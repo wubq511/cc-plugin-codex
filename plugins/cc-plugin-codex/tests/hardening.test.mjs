@@ -164,8 +164,7 @@ test("20 concurrent job writers preserve all 20 jobs", async (t) => {
           id,
           status: "completed",
           phase: "completed",
-          task: `concurrent job ${i}`,
-          taskPreview: `concurrent job ${i}`,
+          taskRef: `sha256:concurrent${i}`,
           ownerServerId: `session-${i}`,
           pid: null
         });
@@ -207,7 +206,7 @@ test("foreign-session PID survives cancel attempt", async (t) => {
     phase: "executing",
     ownerServerId: "foreign-server-session",
     pid: harmless.pid,
-    task: "foreign task"
+    taskRef: "sha256:foreign0001"
   });
 
   const server = startServer(t, { workspace });
@@ -252,7 +251,7 @@ test("non-terminal jobs from foreign servers become orphaned on startup", async 
       phase: "executing",
       ownerServerId: "dead-server-session",
       pid: 99999,
-      task: "orphaned task"
+      taskRef: "sha256:orphan0001"
     });
 
     const orphanCount = reconcileOrphans(workspace);
@@ -1675,9 +1674,9 @@ test("cc_resolve_route resolves alias selectors (Opus → opus)", async (t) => {
   const profile = {
     profileIdentity: "test-profile",
     aliasMappings: { opus: "anthropic-opus-4", fable: "anthropic-fable-1", sonnet: "anthropic-sonnet-4", haiku: "anthropic-haiku-4" },
-    nativeDisplayNames: { "DeepSeek V4 Pro": "deepseek-v4-pro", "GLM 5.2": "glm-5.2" },
+    nativeDisplayNames: { "Anthropic Opus 4": "anthropic-opus-4", "Anthropic Sonnet 4": "anthropic-sonnet-4" },
     stripInherited: ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"],
-    envVars: { ANTHROPIC_API_KEY: "sk-test-secret-key", ANTHROPIC_BASE_URL: "https://api.test.example.com" },
+    envVars: { ANTHROPIC_API_KEY: "sk-test-secret-key", ANTHROPIC_BASE_URL: "https://api.test.example.com", ANTHROPIC_DEFAULT_OPUS_MODEL: "anthropic-opus-4", ANTHROPIC_DEFAULT_FABLE_MODEL: "anthropic-fable-1", ANTHROPIC_DEFAULT_SONNET_MODEL: "anthropic-sonnet-4", ANTHROPIC_DEFAULT_HAIKU_MODEL: "anthropic-haiku-4", ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: "Anthropic Opus 4", ANTHROPIC_DEFAULT_SONNET_MODEL_NAME: "Anthropic Sonnet 4" },
   };
   fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
   t.after(async () => { await safeRmDir(configDir); });
@@ -1745,12 +1744,14 @@ test("cc_setup with active profile does not leak secrets, tokens, or api_key", a
   const profile = {
     profileIdentity: "test-profile",
     aliasMappings: { opus: "anthropic-opus-4" },
-    nativeDisplayNames: { "GLM 5.2": "glm-5.2" },
+    nativeDisplayNames: { "Anthropic Opus 4": "anthropic-opus-4" },
     stripInherited: ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"],
     envVars: {
       ANTHROPIC_API_KEY: "sk-leak-test-secret-key-12345",
       ANTHROPIC_BASE_URL: "https://api.leak-test.example.com",
       ANTHROPIC_AUTH_TOKEN: "tok_leak_test_abc123",
+      ANTHROPIC_DEFAULT_OPUS_MODEL: "anthropic-opus-4",
+      ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: "Anthropic Opus 4",
     },
   };
   fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
@@ -1848,8 +1849,8 @@ test("cc_resolve_route returns bounded structuredContent with no secrets", async
   const profile = {
     profileIdentity: "test-profile",
     aliasMappings: { opus: "anthropic-opus-4", fable: "anthropic-fable-1" },
-    nativeDisplayNames: { "GLM 5.2": "glm-5.2" },
-    envVars: { ANTHROPIC_API_KEY: "sk-structured-content-secret" },
+    nativeDisplayNames: { "Anthropic Opus 4": "anthropic-opus-4" },
+    envVars: { ANTHROPIC_API_KEY: "sk-structured-content-secret", ANTHROPIC_DEFAULT_OPUS_MODEL: "anthropic-opus-4", ANTHROPIC_DEFAULT_FABLE_MODEL: "anthropic-fable-1", ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: "Anthropic Opus 4" },
   };
   fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
   t.after(async () => { await safeRmDir(configDir); });
@@ -1884,7 +1885,7 @@ test("delegate with alias model passes canonical alias to Claude CLI (case-insen
     aliasMappings: { opus: "anthropic-opus-4", fable: "anthropic-fable-1" },
     nativeDisplayNames: {},
     stripInherited: [],
-    envVars: {},
+    envVars: { ANTHROPIC_DEFAULT_OPUS_MODEL: "anthropic-opus-4", ANTHROPIC_DEFAULT_FABLE_MODEL: "anthropic-fable-1" },
   };
   fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
   t.after(async () => { await safeRmDir(configDir); });
@@ -1905,7 +1906,7 @@ test("delegate records selectorKind and routeSnapshot in job state (v5)", async 
     aliasMappings: { opus: "anthropic-opus-4" },
     nativeDisplayNames: {},
     stripInherited: [],
-    envVars: {},
+    envVars: { ANTHROPIC_DEFAULT_OPUS_MODEL: "anthropic-opus-4" },
   };
   fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
   t.after(async () => { await safeRmDir(configDir); });
@@ -2032,7 +2033,7 @@ test("no implicit Opus → Fable auto-downgrade on failure", async (t) => {
     aliasMappings: { opus: "anthropic-opus-4", fable: "anthropic-fable-1" },
     nativeDisplayNames: {},
     stripInherited: [],
-    envVars: {},
+    envVars: { ANTHROPIC_DEFAULT_OPUS_MODEL: "anthropic-opus-4", ANTHROPIC_DEFAULT_FABLE_MODEL: "anthropic-fable-1" },
   };
   fs.writeFileSync(path.join(configDir, "active-profile.json"), JSON.stringify(profile), "utf8");
   t.after(async () => { await safeRmDir(configDir); });
@@ -2101,6 +2102,223 @@ test("black-box echo: task text echoed by CLI never leaks into diagnostics, logs
   // cc_check shows only a safe diagnostic summary (stage, duration, structured-error flag).
   assert.match(checkText, /Diagnostic Summary \(safe\)/);
   assert.match(checkText, /provider_response/);
+});
+
+// ─── Req 2: Black-box multi-encoding task-redaction tests ────────────────────
+// For each common echo encoding, a fake CLI failure echoes the task prompt in
+// stderr. The task marker must never appear in the cc_delegate MCP output, job
+// state, job log, diagnostics artifact, or cc_check. Jobs store only a
+// non-reversible taskRef (never taskPreview/task content).
+
+/**
+ * Run one echo-encoding case end-to-end through the MCP server and assert the
+ * task marker does not leak anywhere.
+ *
+ * @param t - test context
+ * @param {string} encoding - ECHO_TASK_ENCODING value
+ * @param {string} task - the delegated task (carries the marker)
+ * @param {string} marker - regex-safe substring that must never leak
+ * @param {boolean} expectFailSafe - true when redaction cannot be reliable
+ *   (chunked/short) and the fail-safe marker must appear in the artifact
+ */
+async function runEchoEncodingCase(t, encoding, task, marker, expectFailSafe) {
+  const server = startServer(t, {
+    env: { FAKE_CLAUDE_MODE: "echo-task-encoded", ECHO_TASK_ENCODING: encoding },
+  });
+  const markerRe = new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+
+  const delegateResult = await server.send(230, "cc_delegate", { task });
+  const delegateText = delegateResult.result.content[0].text;
+  assert.doesNotMatch(delegateText, markerRe);
+  assert.match(delegateText, /\[provider_response\]/);
+
+  const jobs = listJobs(server.workspace);
+  const job = jobs.find((j) => j.status === "failed");
+  assert.ok(job, `echo-task-encoded(${encoding}) must produce a failed job`);
+
+  // Req 1: job state must not carry task content. Only a non-reversible
+  // taskRef is stored; legacy taskPreview/task fields are absent.
+  const jobJson = JSON.stringify(job);
+  assert.doesNotMatch(jobJson, markerRe);
+  assert.doesNotMatch(jobJson, /"taskPreview"/);
+  assert.doesNotMatch(jobJson, /"task":/);
+  assert.ok(job.taskRef, "job must store a non-reversible taskRef");
+  assert.match(job.taskRef, /^sha256:[0-9a-f]{12}$/);
+
+  // Diagnostics artifact: echoed stderr must be redacted or fail-safed.
+  const artifact = readResultArtifact(server.workspace, job.id);
+  assert.ok(artifact, "failed job must have a result artifact");
+  const artifactJson = JSON.stringify(artifact);
+  assert.doesNotMatch(artifactJson, markerRe);
+  if (expectFailSafe) {
+    assert.match(artifactJson, /\[TASK_BEARING_OUTPUT_REDACTED\]/);
+  } else {
+    assert.match(artifactJson, /\[TASK_REDACTED\]/);
+  }
+
+  // Job log must not contain the marker.
+  const logContent = JSON.stringify(readLog(server.workspace, job.id));
+  assert.doesNotMatch(logContent, markerRe);
+
+  // cc_check must not expose the marker.
+  const checkResult = await server.send(231, "cc_check", { job: job.id });
+  const checkText = checkResult.result.content[0].text;
+  assert.doesNotMatch(checkText, markerRe);
+  assert.match(checkText, /Diagnostic Summary \(safe\)/);
+}
+
+test("black-box raw task echo never leaks (variant redaction)", async (t) => {
+  const marker = "ROUTE_PARSER_DELTA_8842";
+  const task = `Review the boundary module ${marker} for input validation checks.`;
+  await runEchoEncodingCase(t, "raw", task, marker, false);
+});
+
+test("black-box JSON-quoted task echo never leaks (variant redaction)", async (t) => {
+  const marker = "ROUTE_PARSER_DELTA_8842";
+  const task = `Review the boundary module ${marker} for input validation checks.`;
+  await runEchoEncodingCase(t, "json", task, marker, false);
+});
+
+test("black-box escaped-newline task echo never leaks (variant redaction)", async (t) => {
+  const marker = "ROUTE_PARSER_DELTA_8842";
+  const task = `Review the boundary module\n${marker}\nfor input validation checks.`;
+  await runEchoEncodingCase(t, "escaped-newline", task, marker, false);
+});
+
+test("black-box whitespace-normalized task echo never leaks (variant redaction)", async (t) => {
+  const marker = "ROUTE_PARSER_DELTA_8842";
+  const task = `Review   the\tboundary  module ${marker}   for   input validation checks.`;
+  await runEchoEncodingCase(t, "whitespace-normalized", task, marker, false);
+});
+
+test("black-box chunked task echo never leaks (fail-safe)", async (t) => {
+  const marker = "ROUTE_PARSER_DELTA_8842";
+  const task = `Review the boundary module ${marker} for input validation checks.`;
+  await runEchoEncodingCase(t, "chunked", task, marker, true);
+});
+
+test("black-box short task echo never leaks (fail-safe)", async (t) => {
+  // A short task (< 8 chars) cannot be safely redacted by exact matching.
+  const marker = "Fixbug7";
+  const task = marker;
+  await runEchoEncodingCase(t, "short", task, marker, true);
+});
+
+test("black-box completed job stores taskRef, never task content, in state and cc_check", async (t) => {
+  // A successful delegation must also respect the privacy boundary: the task
+  // prompt must not appear in job state, cc_check, or cc_check all output.
+  const server = startServer(t);
+  const marker = "SUCCESS_TASK_MARKER_8842";
+  const task = `Implement the handler for ${marker} with tests.`;
+  const delegateResult = await server.send(232, "cc_delegate", { task });
+  const delegateText = delegateResult.result.content[0].text;
+  assert.match(delegateText, /Task Completed/);
+  assert.doesNotMatch(delegateText, /SUCCESS_TASK_MARKER_8842/);
+
+  const jobs = listJobs(server.workspace);
+  const job = jobs.find((j) => j.status === "completed");
+  assert.ok(job, "must produce a completed job");
+  const jobJson = JSON.stringify(job);
+  assert.doesNotMatch(jobJson, /SUCCESS_TASK_MARKER_8842/);
+  assert.doesNotMatch(jobJson, /"taskPreview"/);
+  assert.doesNotMatch(jobJson, /"task":/);
+  assert.match(job.taskRef, /^sha256:[0-9a-f]{12}$/);
+
+  // cc_check (individual) must show the taskRef label, never the task content.
+  const checkResult = await server.send(233, "cc_check", { job: job.id });
+  const checkText = checkResult.result.content[0].text;
+  assert.doesNotMatch(checkText, /SUCCESS_TASK_MARKER_8842/);
+  assert.match(checkText, /content withheld/);
+
+  // cc_check all must show the taskRef, never the task content.
+  const allResult = await server.send(234, "cc_check", { all: true });
+  const allText = allResult.result.content[0].text;
+  assert.doesNotMatch(allText, /SUCCESS_TASK_MARKER_8842/);
+  assert.match(allText, /sha256:[0-9a-f]{12}/);
+});
+
+// ─── Req 1 (structural): upsertJob strips task content even when passed ──────
+// The privacy boundary is structural at the write chokepoint, not convention-
+// based. Even a caller that accidentally passes `task`/`taskPreview` must not
+// persist them to disk or return them in memory.
+
+test("upsertJob structurally strips task/taskPreview from persisted state and return value", () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-strip-"));
+  try {
+    const SECRET_MARKER = "STRUCTURAL_LEAK_MARKER_7741";
+    const returned = upsertJob(workspace, {
+      id: "cc-structural-strip",
+      status: "completed",
+      phase: "completed",
+      task: `secret task containing ${SECRET_MARKER}`,
+      taskPreview: `preview ${SECRET_MARKER}`,
+      taskRef: "sha256:structural1",
+      ownerServerId: "test",
+      pid: null,
+    });
+
+    // Return value must not carry task content.
+    const returnedJson = JSON.stringify(returned);
+    assert.doesNotMatch(returnedJson, /STRUCTURAL_LEAK_MARKER_7741/);
+    assert.equal(returned.task, undefined);
+    assert.equal(returned.taskPreview, undefined);
+    assert.equal(returned.taskRef, "sha256:structural1");
+
+    // Persisted file must not carry task content.
+    const jobs = listJobs(workspace);
+    const job = jobs.find((j) => j.id === "cc-structural-strip");
+    assert.ok(job, "job must exist");
+    const jobJson = JSON.stringify(job);
+    assert.doesNotMatch(jobJson, /STRUCTURAL_LEAK_MARKER_7741/);
+    assert.doesNotMatch(jobJson, /"task":/);
+    assert.doesNotMatch(jobJson, /"taskPreview"/);
+    assert.equal(job.task, undefined);
+    assert.equal(job.taskPreview, undefined);
+    assert.equal(job.taskRef, "sha256:structural1");
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("upsertJob merging a patch with task content strips it from the merged record", () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-merge-strip-"));
+  try {
+    // Seed a clean job.
+    upsertJob(workspace, {
+      id: "cc-merge-strip",
+      status: "running",
+      phase: "executing",
+      taskRef: "sha256:merge0001",
+      ownerServerId: "test",
+      pid: null,
+    });
+
+    // Update with a patch that (incorrectly) includes task content.
+    const SECRET_MARKER = "MERGE_LEAK_MARKER_9921";
+    const returned = upsertJob(workspace, {
+      id: "cc-merge-strip",
+      status: "completed",
+      phase: "completed",
+      task: `late task content ${SECRET_MARKER}`,
+      taskPreview: `late preview ${SECRET_MARKER}`,
+    });
+
+    const returnedJson = JSON.stringify(returned);
+    assert.doesNotMatch(returnedJson, /MERGE_LEAK_MARKER_9921/);
+    assert.equal(returned.task, undefined);
+    assert.equal(returned.taskPreview, undefined);
+    assert.equal(returned.taskRef, "sha256:merge0001");
+    assert.equal(returned.status, "completed");
+
+    const jobs = listJobs(workspace);
+    const job = jobs.find((j) => j.id === "cc-merge-strip");
+    const jobJson = JSON.stringify(job);
+    assert.doesNotMatch(jobJson, /MERGE_LEAK_MARKER_9921/);
+    assert.doesNotMatch(jobJson, /"task":/);
+    assert.doesNotMatch(jobJson, /"taskPreview"/);
+  } finally {
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
 });
 
 // ─── Req 6: Preflight route failure creates an auditable rejected job ────────
@@ -2175,4 +2393,155 @@ test("preflight configuration failure (corrupt authority) creates a rejected job
   const artifact = readResultArtifact(server.workspace, job.id);
   assert.ok(artifact);
   assert.equal(artifact.diagnostics.stage, "configuration");
+});
+
+// ─── Req 6: Honest, private liveness evidence ────────────────────────────────
+// An authorized liveness probe must persist a private, bounded, auditable
+// artifact with route snapshot, route status, execution/model evidence,
+// duration, exit/failure metadata, cost + provenance, and an explicit
+// usageKeyIsNotExecutionProof flag. Unknown cost must be null/unknown,
+// never "$0.00". All probe tests use fake Claude — no paid call.
+
+function makeProbeProfile(ccpsHome) {
+  fs.mkdirSync(ccpsHome, { recursive: true });
+  fs.writeFileSync(
+    path.join(ccpsHome, "config.json"),
+    JSON.stringify({ version: 1, lastUsedProfile: "alpha" }),
+    "utf8"
+  );
+  const claudeHome = path.join(ccpsHome, "profiles", "alpha", "claude-home");
+  fs.mkdirSync(claudeHome, { recursive: true });
+  fs.writeFileSync(
+    path.join(claudeHome, "settings.json"),
+    JSON.stringify({
+      env: {
+        ANTHROPIC_API_KEY: "sk-probe-secret-123",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "deepseek-v4-pro",
+      },
+    }),
+    "utf8"
+  );
+  return ccpsHome;
+}
+
+test("liveness probe persists private auditable artifact with route snapshot + honest cost", async (t) => {
+  const ccpsHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-probe-evidence-"));
+  makeProbeProfile(ccpsHome);
+  t.after(async () => { await safeRmDir(ccpsHome); });
+
+  const server = startServer(t, {
+    env: {
+      CC_PROFILE_SWITCH_HOME: ccpsHome,
+      FAKE_CLAUDE_HELP_BUDGET_GUARD: "1",
+      FAKE_CLAUDE_MODE: "success",
+    },
+  });
+
+  const response = await server.send(230, "cc_setup", {
+    livenessProbe: true,
+    timeoutSeconds: 10,
+    maxBudgetUsd: 0.05,
+  });
+  const text = response.result.content[0].text;
+
+  // Probe must have succeeded.
+  assert.match(text, /Provider liveness confirmed/i);
+  // Cost must be reported with provenance — never "$0.00" for a real probe.
+  assert.match(text, /Cost:\*\* \$0\.0100 \(provenance: provider_reported\)/i);
+
+  // Extract the probe ID and read the private artifact.
+  const idMatch = text.match(/Probe ID:\*\* (probe-[a-z0-9-]+)/i);
+  assert.ok(idMatch, "Probe ID must be present in MCP output");
+  const probeId = idMatch[1];
+  const artifact = readResultArtifact(server.workspace, probeId);
+  assert.ok(artifact, "Private liveness artifact must be persisted");
+
+  // The artifact must record honest, bounded evidence.
+  assert.equal(artifact.ok, true);
+  assert.equal(artifact.probeId, probeId);
+  assert.ok(artifact.routeSnapshot, "Route snapshot must be recorded");
+  assert.equal(artifact.routeSnapshot.selectorKind, "inherited");
+  assert.ok(artifact.routeStatus, "Route status must be recorded");
+  assert.ok(artifact.modelEvidence, "Model evidence must be recorded");
+  assert.equal(typeof artifact.duration, "number");
+  assert.ok(artifact.cost != null && artifact.cost > 0, "Cost must be a positive number");
+  assert.equal(artifact.costProvenance, "provider_reported");
+  // A usage key is never execution proof.
+  assert.equal(artifact.usageKeyIsNotExecutionProof, true);
+  assert.ok(Array.isArray(artifact.usageModelKeys));
+  // No secret leaked into the artifact's route snapshot.
+  const artifactStr = JSON.stringify(artifact.routeSnapshot);
+  assert.doesNotMatch(artifactStr, /sk-probe-secret-123/);
+});
+
+test("liveness probe reports unknown cost (never $0.00) when telemetry is missing", async (t) => {
+  const ccpsHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-probe-nocost-"));
+  makeProbeProfile(ccpsHome);
+  t.after(async () => { await safeRmDir(ccpsHome); });
+
+  const server = startServer(t, {
+    env: {
+      CC_PROFILE_SWITCH_HOME: ccpsHome,
+      FAKE_CLAUDE_HELP_BUDGET_GUARD: "1",
+      FAKE_CLAUDE_MODE: "success-no-cost",
+    },
+  });
+
+  const response = await server.send(231, "cc_setup", {
+    livenessProbe: true,
+    timeoutSeconds: 10,
+    maxBudgetUsd: 0.05,
+  });
+  const text = response.result.content[0].text;
+
+  // Probe succeeded but telemetry was missing.
+  assert.match(text, /Provider liveness confirmed/i);
+  // Cost must be "unknown" — NEVER "$0.00".
+  assert.match(text, /Cost:\*\* unknown \(provenance: unknown\)/i);
+  assert.doesNotMatch(text, /\$0\.00/);
+
+  const idMatch = text.match(/Probe ID:\*\* (probe-[a-z0-9-]+)/i);
+  assert.ok(idMatch);
+  const probeId = idMatch[1];
+  const artifact = readResultArtifact(server.workspace, probeId);
+  assert.ok(artifact);
+  // Honest cost: null when telemetry is missing.
+  assert.equal(artifact.cost, null);
+  assert.equal(artifact.costProvenance, "unknown");
+  assert.equal(artifact.usageKeyIsNotExecutionProof, true);
+  assert.ok(artifact.routeSnapshot);
+  assert.ok(artifact.modelEvidence);
+});
+
+test("liveness probe with explicit Opus selector records alias claim in route snapshot", async (t) => {
+  const ccpsHome = fs.mkdtempSync(path.join(os.tmpdir(), "cc-probe-opus-"));
+  makeProbeProfile(ccpsHome);
+  t.after(async () => { await safeRmDir(ccpsHome); });
+
+  const server = startServer(t, {
+    env: {
+      CC_PROFILE_SWITCH_HOME: ccpsHome,
+      FAKE_CLAUDE_HELP_BUDGET_GUARD: "1",
+      FAKE_CLAUDE_MODE: "success",
+    },
+  });
+
+  const response = await server.send(232, "cc_setup", {
+    livenessProbe: true,
+    timeoutSeconds: 10,
+    maxBudgetUsd: 0.05,
+    model: "Opus",
+  });
+  const text = response.result.content[0].text;
+  assert.match(text, /Provider liveness confirmed/i);
+
+  const idMatch = text.match(/Probe ID:\*\* (probe-[a-z0-9-]+)/i);
+  const probeId = idMatch[1];
+  const artifact = readResultArtifact(server.workspace, probeId);
+  assert.ok(artifact);
+  // Alias selector → route snapshot records the alias claim.
+  assert.equal(artifact.routeSnapshot.selectorKind, "alias");
+  assert.ok(artifact.routeSnapshot.aliasClaim);
+  assert.equal(artifact.routeSnapshot.aliasClaim.alias, "opus");
+  assert.equal(artifact.routeSnapshot.aliasClaim.nativeId, "deepseek-v4-pro");
 });

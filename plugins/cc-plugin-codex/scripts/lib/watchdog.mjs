@@ -466,11 +466,19 @@ async function main() {
       // Extract ALL usage model keys (not just first), with sanitization
       const usageModelKeys = extractUsageModelKeys(parsed.modelUsage);
 
+      // Honest cost: null when the Provider did not report total_cost_usd.
+      // Never coerce absent telemetry to 0 — that would display as "$0.00"
+      // and mislead callers into thinking the probe was free.
+      const rawCost = parsed.total_cost_usd;
+      const honestCost = (typeof rawCost === "number" && Number.isFinite(rawCost))
+        ? rawCost
+        : null;
+
       writeResult({
         ok: true,
         result: parsed.result || "",
         sessionId: parsed.session_id || null,
-        cost: parsed.total_cost_usd || 0,
+        cost: honestCost,
         duration: parsed.duration_ms ? parsed.duration_ms / 1000 : null,
         usageModelKeys,
         exitCode: 0
