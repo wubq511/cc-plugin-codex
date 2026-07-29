@@ -22,6 +22,7 @@ Send a coding task to Claude Code for execution. Claude Code runs in a separate 
    - `dangerouslySkipPermissions`: set to `true` to let Claude Code write without confirmation (default: false)
    - `resume`: set to `true` only when the user explicitly asks to preserve the same/latest Claude Code conversation. It resumes the last completed plugin job in this workspace that has a claudeSessionId. Cannot be combined with resumeSession.
    - `resumeSession`: pass a session ID only when the user explicitly identifies the Claude Code conversation to preserve (adds `--resume <id>`). Cannot be combined with resume.
+   - `autoCompact` (optional): temporary auto-compact policy for this delegation. Injects two env keys via Claude CLI inline `--settings` (no writes to permanent config). See the Auto-Compact section below.
 
    Call the registered `cc_delegate` MCP tool directly. You may announce the delegation once before the tool call, then remain silent while it is pending. Do not manually start `cc-companion.mjs`, wrap it in a shell/PTY, or emit periodic "still running" commentary. If the registered `cc_*` tools are unavailable, use the setup workflow and ask the user to restart or open a new task; never emulate delegation with a polling fallback.
 
@@ -105,6 +106,43 @@ Resume is an explicit conversation-preservation operation, not the default conti
 - "Continue the same latest Claude Code conversation" → `resume=true`
 - "Resume Claude Code session cc-abc123" → `resumeSession="..."`
 - "Fix these review findings and rerun the tests" → fresh session with a bounded handoff
+
+## Auto-Compact
+
+`autoCompact` configures temporary auto-compaction for a delegation. It injects two env keys (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`) via Claude CLI's inline `--settings <json>` flag. **No writes** to `~/.claude/**`, project `.claude/`, or parent `process.env`.
+
+```json
+{
+  "contextWindowTokens": 256000,
+  "targetTokens": 230000,
+  "scope": "delegation"
+}
+```
+
+| Field | Rule |
+|-------|------|
+| `contextWindowTokens` | Positive safe integer. User-declared, unverified. Never inferred from model or routing. |
+| `targetTokens` | Positive safe integer. Must be ≤ `floor(contextWindowTokens * 0.9)`, else rejected before spawn. |
+| `scope` | `delegation` (default), `session`, or `task`. |
+| `taskScopeId` | UUID for task-scope inheritance. Omit on the first full task policy to auto-generate. |
+| `clear` | Only `true` is valid. With `scope:"task"` and a task UUID, writes a clear tombstone without injecting settings. |
+
+**Scope semantics:**
+- `delegation`: current process + subagents only. Its audit is recorded, but it is never replayed.
+- `session`: bound to the Claude session. Persisted in the job record. Replayed on `resume` / `cc_compact` of the same session.
+- `task`: covers all delegations of the same Codex task, including new Claude sessions. `taskScopeId` is the **only** inheritance key — no cwd/prompt guessing. First full task policy without `taskScopeId` generates a UUID and returns it; later calls inherit with `{scope:"task", taskScopeId}`. Unknown or cleared IDs fail before spawn.
+
+The generated `taskScopeId` is returned on completed, failed, and cancelled
+delegations and is also visible in `cc_check`, so a failed first session does
+not break task-scope continuity.
+
+**Priority:** this-call explicit value > session > task > none. On an explicit resume, `autoCompact:null` clears the session policy. Clear a task policy with `{scope:"task", taskScopeId, clear:true}`. Never send `taskScopeId:null`.
+
+**Honest reporting:** the response distinguishes `target` (nominal, user-supplied), `effectiveWindow` (computed `ceil(target/0.9)`), and `observedBoundary` (from transcript, may be null). Claude caps the configured window at the routed model's actual window and the percentage override can only lower built-in thresholds. With a custom Provider, never promise an exact hit from the user-declared window alone.
+
+**Examples:**
+- "All new sessions for this task should compact at 300K tokens" → first call `autoCompact: { contextWindowTokens: 1000000, targetTokens: 300000, scope: "task" }`; later calls `autoCompact: { scope: "task", taskScopeId: "<returned UUID>" }`.
+- "This session should compact at 230K" → `autoCompact: { contextWindowTokens: 256000, targetTokens: 230000, scope: "session" }` — replayed on resume.
 
 ## Notes
 

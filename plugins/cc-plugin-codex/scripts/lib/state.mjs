@@ -1,5 +1,5 @@
 /**
- * Job state management — schema v7, atomic per-job persistence.
+ * Job state management — schema v8, atomic per-job persistence.
  *
  * Each job lives in its own JSON file under <stateDir>/jobs/.
  * All writes use tmp+rename for atomicity. Configuration metadata is separate
@@ -15,7 +15,7 @@ import path from "node:path";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 import { migrateV3ModelFields } from "./model-evidence.mjs";
 
-const STATE_VERSION = 7;
+const STATE_VERSION = 8;
 const CONFIG_FILE_NAME = "config.json";
 const LEASE_FILE_NAME = "lease.lock";
 const JOBS_DIR_NAME = "jobs";
@@ -347,8 +347,9 @@ export function reconcileOrphans(cwd) {
     for (const file of files) {
       const job = tryParseJsonFile(path.join(jobsDir, file));
       if (!job || !job.id) continue;
-      if (job.status === "running" || job.status === "queued") {
-        // Non-terminal job from another (or unknown) server becomes orphaned
+      if (job.status === "running" || job.status === "queued" || job.status === "cancelling") {
+        // Non-terminal job from another (or unknown) server becomes orphaned.
+        // Includes "cancelling" — the server that was cancelling it is gone.
         job.status = "orphaned";
         job.phase = "orphaned";
         job.pid = null;
@@ -365,7 +366,7 @@ export function reconcileOrphans(cwd) {
 // ─── V3 → V4 → V5 Migration ─────────────────────────────────────────────────
 
 /**
- * Migrate a job to the current schema version (v7).
+ * Migrate a job to the current schema version (v8).
  *
  * v3 → v4: model evidence restructure (observedModel → usageModelKeys).
  * v4 → v5: add selectorKind, routeSnapshot, routeStatus (additive null fields).
@@ -377,7 +378,13 @@ export function reconcileOrphans(cwd) {
  * v6 → v7: clear route fields written by the retired routing implementation.
  *          New v7 records use a fixed source-independent snapshot shape.
  *
- * Idempotent — v7 jobs pass through unchanged.
+ * v7 → v8: additive — new fields (claudeSessionUuid, autoCompact, compactResult)
+ *          default to null/undefined. The `cancelling` status is a new
+ *          non-terminal status between running and cancelled; no old jobs will
+ *          have it. reconcileOrphans now also marks `cancelling` jobs as
+ *          orphaned. All existing privacy chokepoints are preserved.
+ *
+ * Idempotent — v8 jobs pass through unchanged.
  */
 function migrateJob(job) {
   if (!job) return job;
@@ -449,6 +456,18 @@ function migrateJob(job) {
       routeStatus: null,
     };
     migrated.version = 7;
+  }
+
+  // v7 → v8: additive — new fields (claudeSessionUuid, autoCompact,
+  // compactResult) default to null/undefined when absent. The `cancelling`
+  // status is new; no migration action needed for old jobs. Privacy
+  // chokepoints (sanitizeJobForStorage) are preserved by the write path.
+  if (migrated.version < 8) {
+    migrated = { ...migrated };
+    if (migrated.claudeSessionUuid === undefined) migrated.claudeSessionUuid = null;
+    if (migrated.autoCompact === undefined) migrated.autoCompact = null;
+    if (migrated.compactResult === undefined) migrated.compactResult = null;
+    migrated.version = 8;
   }
 
   return migrated;
@@ -550,7 +569,7 @@ export function findLatestJob(jobs, predicate = () => true) {
 }
 
 export function findLatestActiveJob(jobs) {
-  return findLatestJob(jobs, (j) => j.status === "running" || j.status === "queued");
+  return findLatestJob(jobs, (j) => j.status === "running" || j.status === "queued" || j.status === "cancelling");
 }
 
 export function findLatestCompletedJob(jobs) {
@@ -704,7 +723,7 @@ export function cleanupOldJobs(cwd) {
 
   // Prune by age (only terminal jobs, never active/orphaned)
   for (const job of jobs) {
-    if (job.status === "running" || job.status === "queued" || job.status === "orphaned") continue;
+    if (job.status === "running" || job.status === "queued" || job.status === "orphaned" || job.status === "cancelling") continue;
     const updatedAt = Date.parse(job.updatedAt || "");
     if (Number.isFinite(updatedAt) && (now - updatedAt) > maxAgeMs) {
       removeFileIfExists(resolveJobFile(cwd, job.id));
@@ -722,7 +741,7 @@ export function cleanupOldJobs(cwd) {
   const remaining = listJobs(cwd);
   if (remaining.length > MAX_JOBS) {
     const terminalJobs = remaining
-      .filter((j) => j.status !== "running" && j.status !== "queued" && j.status !== "orphaned")
+      .filter((j) => j.status !== "running" && j.status !== "queued" && j.status !== "orphaned" && j.status !== "cancelling")
       .sort((a, b) => String(a.updatedAt ?? "").localeCompare(String(b.updatedAt ?? "")));
 
     const toRemove = remaining.length - MAX_JOBS;
@@ -760,7 +779,7 @@ function enforceTotalArtifactCap(cwd) {
   // Prune complete terminal job bundles oldest-first. Never delete an artifact
   // or log independently from an active/orphaned job's metadata.
   const terminalJobs = listJobs(cwd)
-    .filter((job) => !["running", "queued", "orphaned"].includes(job.status))
+    .filter((job) => !["running", "queued", "orphaned", "cancelling"].includes(job.status))
     .sort((a, b) => String(a.updatedAt ?? "").localeCompare(String(b.updatedAt ?? "")));
 
   for (const job of terminalJobs) {

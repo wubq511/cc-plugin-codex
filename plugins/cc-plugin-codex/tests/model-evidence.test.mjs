@@ -45,6 +45,7 @@ test("invalid session IDs are rejected", () => {
   assert.equal(isValidSessionId("foo/bar"), false);
   assert.equal(isValidSessionId("foo\\bar"), false);
   assert.equal(isValidSessionId(".."), false);
+  assert.equal(isValidSessionId("--model"), false);
   // Control characters
   assert.equal(isValidSessionId("abc\x00def"), false);
   assert.equal(isValidSessionId("abc\x1bdef"), false);

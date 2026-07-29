@@ -3,7 +3,7 @@
 /**
  * Claude Code Companion — MCP Server for Codex
  *
- * Schema v7 with native-Claude model routing, route snapshots, failure diagnostics,
+ * Schema v8 with native-Claude model routing, route snapshots, failure diagnostics,
  * atomic per-job persistence, watchdog-based execution, and comprehensive
  * safety hardening.
  *
@@ -20,7 +20,7 @@
  *     optional cost-bearing liveness probe.
  */
 
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -63,6 +63,15 @@ import {
 import {
   resolveActiveCache, compareSourceCache
 } from "./lib/install-cache.mjs";
+import {
+  validateAutoCompact, buildInlineSettings, resolveScope,
+  generateTaskScopeId, buildAutoCompactAudit, buildAutoCompactClearAudit
+} from "./lib/autocompact.mjs";
+import {
+  captureCompactBoundaryCursor,
+  collectCompactBoundary,
+} from "./lib/compact-boundary.mjs";
+import { isValidSessionId } from "./lib/model-evidence-shared.mjs";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -111,6 +120,14 @@ let shuttingDown = false;
 const activeForegroundRuns = new Map();
 const pendingToolCalls = new Map();
 
+// Per-job finalization cache: finalizeJob has no await points, so its
+// read/decide/write sequence is one event-loop critical section. The cache
+// makes re-entrant/late calls return the same terminal decision.
+const finalizingJobs = new Map();
+
+// Terminal statuses — once set, no other status may override.
+const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "rejected", "orphaned"]);
+
 // ─── MCP Input Validation ────────────────────────────────────────────────────
 
 function validateString(value, name, { required = false, minLength = 0 } = {}) {
@@ -158,7 +175,7 @@ function validateToolArgs(toolName, params) {
   // Reject unknown properties and validate types
   const schemas = {
     cc_delegate: {
-      allowed: new Set(["cwd", "task", "write", "background", "model", "effort", "dangerouslySkipPermissions", "timeoutSeconds", "resume", "resumeSession"]),
+      allowed: new Set(["cwd", "task", "write", "background", "model", "effort", "dangerouslySkipPermissions", "timeoutSeconds", "resume", "resumeSession", "autoCompact"]),
       required: ["cwd", "task"],
       booleans: ["write", "background", "dangerouslySkipPermissions", "resume"],
       strings: ["cwd", "task", "model", "effort", "resumeSession"],
@@ -199,6 +216,11 @@ function validateToolArgs(toolName, params) {
       allowed: new Set(["selector"]),
       required: [],
       strings: ["selector"]
+    },
+    cc_compact: {
+      allowed: new Set(["cwd", "job", "resumeSession"]),
+      required: ["cwd"],
+      strings: ["cwd", "job", "resumeSession"]
     }
   };
 
@@ -425,6 +447,68 @@ function updateJob(workspaceRoot, patch) {
   return upsertJob(workspaceRoot, patch);
 }
 
+/**
+ * Centralized finalizer — the ONLY writer of terminal job status.
+ * Prevents the completed-vs-cancelled race via a synchronous per-job critical
+ * section plus an in-memory terminal-decision cache.
+ *
+ * Rules:
+ *   - If the job is already terminal, return the existing state (first writer wins).
+ *   - If the job is "cancelling", the terminal status is always "cancelled"
+ *     regardless of what the result says.
+ *   - Otherwise, write the requested terminal status.
+ *
+ * Both handleDelegate's result path and handleCancel's settlement path call this.
+ */
+function finalizeJob(workspaceRoot, jobId, requestedStatus, patch = {}) {
+  // If another finalization already settled this job, return
+  // its cached result. This prevents the completed-vs-cancelled race where
+  // a late success/failure path could override a cancelled status (or vice
+  // versa). The Map entry is cleared in handleDelegate's finally block once
+  // the completion promise resolves.
+  const existing = finalizingJobs.get(jobId);
+  if (existing) return existing;
+
+  const result = (() => {
+    const jobs = listJobs(workspaceRoot);
+    const current = jobs.find((j) => j.id === jobId);
+    if (!current) return null;
+
+    // Already terminal — first writer wins, no override.
+    if (TERMINAL_STATUSES.has(current.status)) {
+      return current;
+    }
+
+    // If cancellation was requested, always write cancelled.
+    const finalStatus = current.status === "cancelling" ? "cancelled" : requestedStatus;
+
+    const now = new Date().toISOString();
+    const finalPatch = { ...patch };
+    if (finalStatus === "cancelled") {
+      finalPatch.result = null;
+      finalPatch.errorMessage = current.errorMessage || "Cancelled.";
+      finalPatch.routeStatus = ROUTE_STATUSES.CANCELLED;
+    }
+    updateJob(workspaceRoot, {
+      id: jobId,
+      ...finalPatch,
+      status: finalStatus,
+      phase: finalStatus,
+      pid: null,
+      completedAt: now,
+      updatedAt: now,
+    });
+
+    return listJobs(workspaceRoot).find((j) => j.id === jobId) || null;
+  })();
+
+  // Cache the result so any concurrent or late finalization attempt (e.g.
+  // a cancel arriving after the result path settles) returns the same
+  // terminal state without overriding it.
+  finalizingJobs.set(jobId, result);
+  return result;
+}
+
 // ─── Tool Definitions ───────────────────────────────────────────────────────
 
 const CWD_SCHEMA = {
@@ -449,7 +533,19 @@ const TOOLS = [
         dangerouslySkipPermissions: { type: "boolean", description: "Skip permission prompts (default: false, set true to allow Claude Code to write without confirmation)" },
         timeoutSeconds: { type: "integer", description: "Optional hard timeout in seconds. When omitted, the task runs until it completes, fails, is cancelled, or the server shuts down. Must be an integer in 1..604800 if supplied." },
         resume: { type: "boolean", description: "Explicit conversation preservation: resume the last completed plugin job in this workspace that has a claudeSessionId. Do not use for ordinary follow-up or review-fix work; start fresh with a bounded handoff instead. Cannot be combined with resumeSession." },
-        resumeSession: { type: "string", description: "Explicit conversation preservation: resume a specific Claude Code session by session ID (adds --resume <id> flag). Do not use for ordinary follow-up or review-fix work. Cannot be combined with resume." }
+        resumeSession: { type: "string", description: "Explicit conversation preservation: resume a specific Claude Code session by session ID (adds --resume <id> flag). Do not use for ordinary follow-up or review-fix work. Cannot be combined with resume." },
+        autoCompact: {
+          type: ["object", "null"],
+          description: "Temporary auto-compact directive. A full policy supplies contextWindowTokens + targetTokens and optional scope. Task inheritance supplies scope=task + taskScopeId UUID only. Task clear supplies scope=task + taskScopeId UUID + clear=true. Explicit null on a resumed session clears that session's inherited policy. Unknown/cleared task IDs fail before spawn. Values are injected only through inline --settings; permanent Claude/Provider config and parent env are never modified.",
+          additionalProperties: false,
+          properties: {
+            contextWindowTokens: { type: "integer", description: "User-declared context window size in tokens (unverified). Must be a positive integer. Required for full policy; omit when inheriting via taskScopeId only." },
+            targetTokens: { type: "integer", description: "Nominal target token count for auto-compact. Must be a positive integer <= 90% of contextWindowTokens. Required for full policy; omit when inheriting via taskScopeId only." },
+            scope: { type: "string", enum: ["delegation", "session", "task"], description: "Scope of the auto-compact policy. Default: delegation." },
+            taskScopeId: { type: "string", description: "UUID for task-scope inheritance. Omit on the first full task policy to generate one. Carry the same UUID with scope=task on later delegations." },
+            clear: { type: "boolean", const: true, description: "Only true is valid. With scope=task and taskScopeId UUID, clears that task policy without injecting settings." }
+          }
+        }
       },
       required: ["cwd", "task"]
     }
@@ -537,6 +633,20 @@ const TOOLS = [
       },
       required: ["cwd"]
     }
+  },
+  {
+    name: "cc_compact",
+    description: "Run a read-only foreground /compact on a stopped Claude Code session. Captures a transcript cursor first and returns compacted=true only for a new compact_boundary appended by this invocation; historical boundaries and summary markers do not count. Explicit resumeSession is checked against active/cancelling jobs. Stored session/task autoCompact settings are replayed, delegation settings are not. No permanent Claude/Provider configuration is modified.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        cwd: CWD_SCHEMA,
+        job: { type: "string", description: "Job ID or prefix whose claudeSessionId to compact (default: latest stopped job)" },
+        resumeSession: { type: "string", description: "Explicit Claude session ID to compact. Takes precedence over job." }
+      },
+      required: ["cwd"]
+    }
   }
 ];
 
@@ -557,6 +667,89 @@ const REVIEW_SCHEMA_JSON = JSON.stringify({
   }],
   next_steps: ["step 1", "step 2"]
 }, null, 2);
+
+function jobMatchesClaudeSession(job, sessionId) {
+  if (!job || !sessionId) return false;
+  return job.claudeSessionId === sessionId
+    || job.claudeSessionUuid === sessionId
+    || job.resumeSession === sessionId;
+}
+
+function sortPolicyRecordsNewestFirst(jobs) {
+  return [...jobs].sort((a, b) => {
+    const byCreated = String(b.createdAt ?? b.startedAt ?? "")
+      .localeCompare(String(a.createdAt ?? a.startedAt ?? ""));
+    return byCreated || String(b.id ?? "").localeCompare(String(a.id ?? ""));
+  });
+}
+
+function latestTaskPolicyRecord(jobs, taskScopeId) {
+  if (!taskScopeId) return null;
+  return sortPolicyRecordsNewestFirst(jobs).find((job) =>
+    job.autoCompact?.scope === "task"
+    && job.autoCompact?.taskScopeId === taskScopeId
+  ) || null;
+}
+
+/**
+ * Resolve the stored policy for an exact Claude session. A newer session
+ * tombstone blocks older session and task policies. Otherwise session scope
+ * wins over the task policy associated with that session.
+ */
+function resolveStoredPolicyForSession(jobs, sessionId) {
+  const matching = sortPolicyRecordsNewestFirst(jobs).filter((job) =>
+    jobMatchesClaudeSession(job, sessionId)
+  );
+  const sessionRecord = matching.find((job) => job.autoCompact?.scope === "session") || null;
+  if (sessionRecord?.autoCompact?.cleared === true) {
+    return { policy: null, sourceJob: sessionRecord, cleared: true };
+  }
+
+  const sessionPolicy = sessionRecord?.autoCompact || null;
+  const taskScopeId = matching.find((job) =>
+    job.autoCompact?.scope === "task" && job.autoCompact?.taskScopeId
+  )?.autoCompact?.taskScopeId || null;
+  const taskRecord = latestTaskPolicyRecord(jobs, taskScopeId);
+  const taskPolicy = taskRecord?.autoCompact?.cleared === true
+    ? null
+    : taskRecord?.autoCompact || null;
+
+  const policy = resolveScope({
+    thisCall: null,
+    sessionPolicy,
+    taskPolicy,
+    clearTaskScope: false,
+  });
+  const sourceJob = policy === sessionPolicy ? sessionRecord : taskRecord;
+  return { policy, sourceJob: sourceJob || null, cleared: false };
+}
+
+function rebuildStoredPolicy(policy) {
+  if (!policy || policy.cleared === true) return null;
+  const validated = validateAutoCompact({
+    contextWindowTokens: policy.contextWindowTokens,
+    targetTokens: policy.targetTokens,
+    scope: policy.scope,
+    ...(policy.scope === "task" && policy.taskScopeId
+      ? { taskScopeId: policy.taskScopeId }
+      : {}),
+  });
+  return validated.valid ? validated : null;
+}
+
+function formatTaskScopeIdLine(autoCompact) {
+  if (autoCompact?.scope !== "task" || typeof autoCompact.taskScopeId !== "string") {
+    return "";
+  }
+  const validation = validateAutoCompact({
+    scope: "task",
+    taskScopeId: autoCompact.taskScopeId,
+    clear: true,
+  });
+  return validation.valid
+    ? `\n**Auto-compact taskScopeId:** ${autoCompact.taskScopeId}`
+    : "";
+}
 
 // ─── Tool Handlers ──────────────────────────────────────────────────────────
 
@@ -598,6 +791,15 @@ async function handleDelegate(params, context = {}) {
   const skipPerms = params.dangerouslySkipPermissions === true;
   const resume = params.resume === true;
   const resumeSession = params.resumeSession || null;
+  if (params.resumeSession !== undefined && !isValidSessionId(params.resumeSession)) {
+    return {
+      content: [{
+        type: "text",
+        text: "Error: resumeSession must be a valid Claude session identifier.",
+      }],
+      isError: true,
+    };
+  }
 
   // P0: Reject ambiguous resume inputs
   if (resume && resumeSession) {
@@ -790,6 +992,88 @@ async function handleDelegate(params, context = {}) {
       };
     }
   }
+  if (resolvedResumeSession && !isValidSessionId(resolvedResumeSession)) {
+    return {
+      content: [{
+        type: "text",
+        text: "Error: the resolved resume session identifier is invalid. Specify a valid resumeSession explicitly or start a fresh delegation.",
+      }],
+      isError: true,
+    };
+  }
+
+  // ── Auto-compact policy validation & resolution ──
+  // Every branch resolves to one persisted audit object or null. Full policies
+  // inject settings; explicit clears persist tombstones; inheritance misses
+  // fail closed before Claude is spawned.
+  let inlineSettings = null;
+  let autoCompactAudit = null;
+  const existingJobs = listJobs(workspaceRoot);
+
+  if (params.autoCompact !== undefined && params.autoCompact !== null) {
+    const acValidation = validateAutoCompact(params.autoCompact);
+    if (!acValidation.valid) {
+      return {
+        content: [{ type: "text", text: `Error: ${acValidation.error}` }],
+        isError: true
+      };
+    }
+
+    if (acValidation.clearMode) {
+      const previous = latestTaskPolicyRecord(existingJobs, acValidation.taskScopeId);
+      if (!previous?.autoCompact) {
+        return {
+          content: [{
+            type: "text",
+            text: `Error: no autoCompact task policy was found for taskScopeId ${acValidation.taskScopeId}; nothing was cleared.`,
+          }],
+          isError: true,
+        };
+      }
+      autoCompactAudit = buildAutoCompactClearAudit({
+        scope: "task",
+        taskScopeId: acValidation.taskScopeId,
+      });
+    } else if (acValidation.inheritanceMode) {
+      const previous = latestTaskPolicyRecord(existingJobs, acValidation.taskScopeId);
+      if (!previous?.autoCompact || previous.autoCompact.cleared === true) {
+        return {
+          content: [{
+            type: "text",
+            text: `Error: no active autoCompact task policy was found for taskScopeId ${acValidation.taskScopeId}. Supply a full task policy to create or reactivate it.`,
+          }],
+          isError: true,
+        };
+      }
+      const inherited = rebuildStoredPolicy(previous.autoCompact);
+      if (!inherited) {
+        return {
+          content: [{
+            type: "text",
+            text: `Error: the stored autoCompact task policy for taskScopeId ${acValidation.taskScopeId} is invalid and cannot be replayed.`,
+          }],
+          isError: true,
+        };
+      }
+      inlineSettings = buildInlineSettings(inherited.effectiveWindow);
+      autoCompactAudit = buildAutoCompactAudit(inherited, true);
+    } else {
+      if (acValidation.scope === "task" && acValidation.taskScopeId === undefined) {
+        acValidation.taskScopeId = generateTaskScopeId();
+      }
+      inlineSettings = buildInlineSettings(acValidation.effectiveWindow);
+      autoCompactAudit = buildAutoCompactAudit(acValidation, true);
+    }
+  } else if (params.autoCompact === null && resolvedResumeSession) {
+    autoCompactAudit = buildAutoCompactClearAudit({ scope: "session" });
+  } else if (params.autoCompact === undefined && resolvedResumeSession) {
+    const stored = resolveStoredPolicyForSession(existingJobs, resolvedResumeSession);
+    const replay = rebuildStoredPolicy(stored.policy);
+    if (replay) {
+      inlineSettings = buildInlineSettings(replay.effectiveWindow);
+      autoCompactAudit = buildAutoCompactAudit(replay, true);
+    }
+  }
 
   // P0: Writer lease for write-enabled delegations
   let leaseOwner = null;
@@ -811,6 +1095,14 @@ async function handleDelegate(params, context = {}) {
   const now = new Date().toISOString();
   const taskTitle = resume ? "Claude Code Resume" : "Claude Code Task";
 
+  // Pre-allocated session UUID for new (non-resume) delegations.
+  // Generated before spawn, persisted immediately, and passed via --session-id.
+  // Resume delegations use --resume only — the two flags are mutually exclusive.
+  // Cancellation preserves claudeSessionUuid, claudeSessionId, taskScopeId, and
+  // the auto-compact policy so a stopped session can be compacted/resumed later.
+  const claudeSessionUuid = (!resume && !resolvedResumeSession) ? randomUUID() : null;
+  const provisionalClaudeSessionId = resolvedResumeSession || claudeSessionUuid;
+
   let leaseHeartbeat = null;
   if (leaseOwner) {
     leaseHeartbeat = setInterval(() => {
@@ -821,6 +1113,40 @@ async function handleDelegate(params, context = {}) {
 
   let preRunFingerprint;
   let execution;
+  let autoCompactBoundaryCursor = null;
+
+  // Completion promise: resolves when the delegate's result path has fully
+  // finished cleanup (lease released + terminal status written). cc_cancel and
+  // gracefulShutdown await this to ensure no live process or lease remains.
+  // MUST be declared outside the spawn try-catch so the result-path finally
+  // block can resolve it — otherwise the variable is block-scoped and invisible.
+  let completionResolve;
+  const completionPromise = new Promise((resolve) => { completionResolve = resolve; });
+  const foregroundHandle = {
+    execution: null,
+    leaseOwner,
+    leaseHeartbeat,
+    completionPromise,
+    cancelRequested: false,
+  };
+
+  // Register cancellation before the first asynchronous pre-spawn operation.
+  // This removes the window where persisted state said "running" but cc_cancel
+  // could not find a live controller yet.
+  context.setCancel?.(() => {
+    const current = listJobs(workspaceRoot).find((candidate) => candidate.id === jobId);
+    if (!current || TERMINAL_STATUSES.has(current.status) || current.status === "cancelling") return;
+    foregroundHandle.cancelRequested = true;
+    appendLogLine(workspaceRoot, jobId, "Cancelled by MCP client request.");
+    updateJob(workspaceRoot, {
+      id: jobId,
+      status: "cancelling",
+      phase: "cancelling",
+      errorMessage: "Cancelled by MCP client request.",
+    });
+    foregroundHandle.execution?.cancel();
+  });
+
   try {
 
   // Update lease with job ID
@@ -865,7 +1191,8 @@ async function handleDelegate(params, context = {}) {
     resume,
     resumeSession: resolvedResumeSession,
     ownerServerId: SESSION_ID,
-    claudeSessionId: null,
+    claudeSessionId: provisionalClaudeSessionId,
+    claudeSessionUuid,
     pid: null,
     logFile,
     createdAt: now,
@@ -879,74 +1206,115 @@ async function handleDelegate(params, context = {}) {
     touchedFiles: [],
     workspaceChanges: null,
     errorMessage: null,
-    truncation: null
+    truncation: null,
+    autoCompact: autoCompactAudit
   };
 
   updateJob(workspaceRoot, job);
+  activeForegroundRuns.set(jobId, foregroundHandle);
 
   // Foreground mode (default)
   appendLogLine(workspaceRoot, jobId, "Running claude via watchdog; tools/call remains pending.");
   updateJob(workspaceRoot, { id: jobId, phase: "executing" });
 
+  if (autoCompactAudit?.settingsInjected === true && provisionalClaudeSessionId) {
+    try {
+      autoCompactBoundaryCursor = await captureCompactBoundaryCursor({
+        sessionId: provisionalClaudeSessionId,
+        deadlineMs: 500,
+      });
+    } catch {
+      // Evidence collection is best-effort and must not block execution.
+    }
+  }
+
+  if (foregroundHandle.cancelRequested
+    || listJobs(workspaceRoot).find((candidate) => candidate.id === jobId)?.status === "cancelling") {
+    if (leaseHeartbeat) clearInterval(leaseHeartbeat);
+    if (leaseOwner) releaseWriterLease(workspaceRoot, leaseOwner);
+    finalizeJob(workspaceRoot, jobId, "cancelled", {
+      errorMessage: "Cancelled before Claude Code was started.",
+      routeStatus: ROUTE_STATUSES.CANCELLED,
+    });
+    activeForegroundRuns.delete(jobId);
+    finalizingJobs.delete(jobId);
+    completionResolve?.(null);
+    return {
+      content: [{
+        type: "text",
+        text: `## Task Cancelled\n\n**Job ID:** ${jobId}${formatTaskScopeIdLine(autoCompactAudit)}\n\nThe pending Claude Code task was cancelled before Claude Code started.`,
+      }],
+      isError: true,
+    };
+  }
+
   execution = runClaude(task, {
     cwd: workspaceRoot, write, model: resolvedModel, effort,
     dangerouslySkipPermissions: skipPerms, resume,
     resumeSession: resolvedResumeSession,
+    sessionId: claudeSessionUuid,
     timeout: timeoutMs,
     childEnv,
     routeSnapshot,
-    cliVersion
+    cliVersion,
+    inlineSettings
   });
-  activeForegroundRuns.set(jobId, execution);
+  foregroundHandle.execution = execution;
   updateJob(workspaceRoot, { id: jobId, pid: execution.pid });
   } catch (err) {
     try { execution?.cancel(); } catch { /* best effort */ }
-    activeForegroundRuns.delete(jobId);
     if (leaseHeartbeat) clearInterval(leaseHeartbeat);
     if (leaseOwner) releaseWriterLease(workspaceRoot, leaseOwner);
+    const current = listJobs(workspaceRoot).find((candidate) => candidate.id === jobId);
+    if (current) {
+      finalizeJob(
+        workspaceRoot,
+        jobId,
+        current.status === "cancelling" ? "cancelled" : "failed",
+        {
+          errorMessage: current.status === "cancelling"
+            ? (current.errorMessage || "Cancelled.")
+            : buildSafeErrorMessage(FAILURE_STAGES.SPAWN, err?.message || "Spawn failed."),
+          routeStatus: current.status === "cancelling"
+            ? ROUTE_STATUSES.CANCELLED
+            : ROUTE_STATUSES.REJECTED,
+        },
+      );
+    }
+    activeForegroundRuns.delete(jobId);
+    finalizingJobs.delete(jobId);
+    completionResolve?.(null);
     return {
       content: [{ type: "text", text: "Error: failed to start Claude Code safely. No task was executed." }],
       isError: true
     };
   }
 
-  context.setCancel?.(() => {
-    const current = listJobs(workspaceRoot).find((candidate) => candidate.id === jobId);
-    if (current?.status !== "running" && current?.status !== "queued") return;
-    const cancelledAt = new Date().toISOString();
-    appendLogLine(workspaceRoot, jobId, "Cancelled by MCP client request.");
-    updateJob(workspaceRoot, {
-      id: jobId,
-      status: "cancelled",
-      phase: "cancelled",
-      pid: null,
-      completedAt: cancelledAt,
-      errorMessage: "Cancelled by MCP client request.",
-      routeStatus: ROUTE_STATUSES.CANCELLED
-    });
-    execution.cancel();
-  });
-
   const result = await execution.result;
-  activeForegroundRuns.delete(jobId);
 
-  if (leaseHeartbeat) clearInterval(leaseHeartbeat);
+  try {
   // Release only after the watchdog has actually exited and its process tree is
   // gone. Cancellation must not open a second writer window prematurely.
+  if (leaseHeartbeat) clearInterval(leaseHeartbeat);
   if (leaseOwner) releaseWriterLease(workspaceRoot, leaseOwner);
 
-  // Check if already cancelled
-  const current = listJobs(workspaceRoot).find((candidate) => candidate.id === jobId);
-  if (current?.status === "cancelled") {
+  // Check if cancellation was requested — finalizeJob writes cancelled.
+  const preFinalize = listJobs(workspaceRoot).find((candidate) => candidate.id === jobId);
+  if (preFinalize?.status === "cancelling" || preFinalize?.status === "cancelled") {
+    finalizeJob(workspaceRoot, jobId, "cancelled", {
+      errorMessage: preFinalize.errorMessage || "Cancelled.",
+      routeStatus: ROUTE_STATUSES.CANCELLED,
+    });
     return {
-      content: [{ type: "text", text: `## Task Cancelled\n\n**Job ID:** ${jobId}\n\nThe pending Claude Code task was cancelled.` }],
+      content: [{
+        type: "text",
+        text: `## Task Cancelled\n\n**Job ID:** ${jobId}${formatTaskScopeIdLine(autoCompactAudit)}\n\nThe pending Claude Code task was cancelled.`,
+      }],
       isError: true
     };
   }
 
   // Handle result
-  const completedAt = new Date().toISOString();
-
   if (result.ok) {
     updateJob(workspaceRoot, { id: jobId, phase: "verifying" });
     appendLogLine(workspaceRoot, jobId, "Execution complete, verifying output.");
@@ -989,6 +1357,29 @@ async function handleDelegate(params, context = {}) {
       usageModelKeys: modelEvidence.usageModelKeys,
     });
 
+    // Auto-compact deviation recording (spec 4.4): if auto-compact was
+    // configured, collect the observed boundary from the transcript and
+    // record the deviation. NEVER fabricate — null if not observed.
+    let observedBoundary = null;
+    let compactTrigger = null;
+    if (autoCompactAudit?.settingsInjected === true
+      && result.sessionId
+      && autoCompactBoundaryCursor) {
+      try {
+        const boundary = await collectCompactBoundary({
+          sessionId: result.sessionId,
+          deadlineMs: 500,
+          afterCursor: autoCompactBoundaryCursor,
+        });
+        if (boundary.compacted) {
+          observedBoundary = boundary.observedBoundary;
+          compactTrigger = boundary.trigger;
+        }
+      } catch {
+        // Best-effort — deviation recording must not affect job success
+      }
+    }
+
     // Store full result as separate artifact
     // A successful Provider result can quote or repeat the delegated task.
     // Apply the same task-aware, fail-safe redaction before *any* persistence
@@ -1030,26 +1421,44 @@ async function handleDelegate(params, context = {}) {
       ? { originalSize: presentation.originalSize, presentationLimit: MAX_MCP_RESULT_BYTES }
       : null;
 
-    updateJob(workspaceRoot, {
-      id: jobId,
-      status: "completed",
-      phase: "completed",
-      pid: null,
-      completedAt,
+    // Route all terminal status writes through finalizeJob so the per-job
+    // lock prevents the completed-vs-cancelled race. If a cancel arrived
+    // while we were collecting evidence, finalizeJob writes "cancelled"
+    // instead of "completed" (cancelling status takes priority).
+    const finalizedJob = finalizeJob(workspaceRoot, jobId, "completed", {
       result: metadataPresentation.text,
       resultArtifact: resultArtifactPath,
       cost: result.cost,
       duration: result.duration,
       modelEvidence,
       routeStatus,
-      claudeSessionId: result.sessionId || null,
+      // The requested --session-id/--resume target is authoritative. Preserve
+      // it even if a Provider omits or misreports session_id in its result.
+      claudeSessionId: provisionalClaudeSessionId,
       touchedFiles: workspaceChanges.totalChanges > 0
         ? boundedTouchedFiles([...workspaceChanges.added, ...workspaceChanges.modified, ...workspaceChanges.removed])
         : [],
       workspaceChanges: workspaceChanges.totalChanges > 0 ? workspaceChanges.summary : null,
       errorMessage: null,
-      truncation
+      truncation,
+      autoCompact: autoCompactAudit ? {
+        ...autoCompactAudit,
+        observedBoundary,
+        compactTrigger,
+      } : null
     });
+
+    if (finalizedJob?.status === "cancelled") {
+      appendLogLine(workspaceRoot, jobId, "Cancelled during post-result verification.");
+      cleanupOldJobs(workspaceRoot);
+      return {
+        content: [{
+          type: "text",
+          text: `## Task Cancelled\n\n**Job ID:** ${jobId}${formatTaskScopeIdLine(autoCompactAudit)}\n\nThe pending Claude Code task was cancelled during final verification.`,
+        }],
+        isError: true,
+      };
+    }
 
     appendLogLine(workspaceRoot, jobId, `Done. Cost: ${formatCost(result.cost)}, Duration: ${formatDuration(result.duration ? result.duration * 1000 : null)}.`);
 
@@ -1077,10 +1486,35 @@ async function handleDelegate(params, context = {}) {
       ? `\n\n_Note: result truncated for presentation (${presentation.originalSize} bytes original). Full result stored in artifact._`
       : "";
 
+    // Auto-compact info: include taskScopeId when generated so the caller can
+    // carry it forward. Honest reporting: requestedTarget (nominal) vs
+    // effectiveWindow (computed) vs observedBoundary (from transcript, may be null).
+    // Never claim precise target hit — Claude may truncate, skip, or override.
+    let compactSection = "";
+    if (autoCompactAudit) {
+      if (autoCompactAudit.cleared === true) {
+        const parts = [`cleared scope=${autoCompactAudit.scope}`];
+        if (autoCompactAudit.taskScopeId) parts.push(`taskScopeId=${autoCompactAudit.taskScopeId}`);
+        compactSection = `\n**Auto-compact:** ${parts.join(", ")}`;
+      } else {
+        const parts = [
+          `scope=${autoCompactAudit.scope}`,
+          `target=${autoCompactAudit.targetTokens}`,
+          `effectiveWindow=${autoCompactAudit.effectiveWindow}`,
+        ];
+        if (autoCompactAudit.taskScopeId) parts.push(`taskScopeId=${autoCompactAudit.taskScopeId}`);
+        if (observedBoundary !== null) {
+          parts.push(`observedBoundary=${observedBoundary}`);
+          if (compactTrigger) parts.push(`trigger=${compactTrigger}`);
+        }
+        compactSection = `\n**Auto-compact:** ${parts.join(", ")}`;
+      }
+    }
+
     return {
       content: [{
         type: "text",
-        text: `## Task Completed\n\n**Job ID:** ${jobId}\n**Duration:** ${formatDuration(result.duration ? result.duration * 1000 : null)}\n**Cost:** ${formatCost(result.cost)}\n${modelLine}\n\n### Result\n${presentation.text}${truncationNote}\n\n${filesSection}\n\n---\n💡 Run \`/claude:review\` to review the changes, or \`/claude:review --adversarial\` for an adversarial review.`
+        text: `## Task Completed\n\n**Job ID:** ${jobId}\n**Duration:** ${formatDuration(result.duration ? result.duration * 1000 : null)}\n**Cost:** ${formatCost(result.cost)}\n${modelLine}${compactSection}\n\n### Result\n${presentation.text}${truncationNote}\n\n${filesSection}\n\n---\n💡 Run \`/claude:review\` to review the changes, or \`/claude:review --adversarial\` for an adversarial review.`
       }]
     };
   } else {
@@ -1122,17 +1556,27 @@ async function handleDelegate(params, context = {}) {
       failureStage
     });
 
-    updateJob(workspaceRoot, {
-      id: jobId,
-      status: "failed",
-      phase: "failed",
-      pid: null,
-      completedAt,
+    // Route through finalizeJob for the same race protection as the success
+    // path. If a cancel arrived during failure handling, write "cancelled".
+    const finalizedJob = finalizeJob(workspaceRoot, jobId, "failed", {
       errorMessage: boundedText(safeError, MAX_ERROR_MESSAGE_BYTES),
       routeStatus: failedRouteStatus,
       resultArtifact: failureArtifactPath,
       truncation: null
     });
+
+    if (finalizedJob?.status === "cancelled") {
+      appendLogLine(workspaceRoot, jobId, "Cancelled during failure finalization.");
+      cleanupOldJobs(workspaceRoot);
+      return {
+        content: [{
+          type: "text",
+          text: `## Task Cancelled\n\n**Job ID:** ${jobId}${formatTaskScopeIdLine(autoCompactAudit)}\n\nThe pending Claude Code task was cancelled.`,
+        }],
+        isError: true,
+      };
+    }
+
     appendLogLine(workspaceRoot, jobId, `Failed: ${boundedText(safeError, MAX_ERROR_MESSAGE_BYTES)}`);
 
     cleanupOldJobs(workspaceRoot);
@@ -1140,10 +1584,21 @@ async function handleDelegate(params, context = {}) {
     return {
       content: [{
         type: "text",
-        text: `## Task Failed\n\n**Job ID:** ${jobId}\n**Error:** ${boundedText(safeError, MAX_ERROR_MESSAGE_BYTES)}\n\nCheck \`/claude:status\` for details.`
+        text: `## Task Failed\n\n**Job ID:** ${jobId}${formatTaskScopeIdLine(autoCompactAudit)}\n**Error:** ${boundedText(safeError, MAX_ERROR_MESSAGE_BYTES)}\n\nCheck \`/claude:status\` for details.`
       }],
       isError: true
     };
+  }
+  } finally {
+    // Ensure the handle is removed and the completion promise is resolved
+    // regardless of which result path was taken. cc_cancel and gracefulShutdown
+    // await completionPromise to guarantee no live process or lease remains.
+    activeForegroundRuns.delete(jobId);
+    // Clear the finalizer lock so a future delegation with the same job ID
+    // (theoretically) or a retry can finalize cleanly. By this point the
+    // terminal status is already persisted and cc_cancel has returned.
+    finalizingJobs.delete(jobId);
+    completionResolve?.(result);
   }
 }
 
@@ -1385,6 +1840,7 @@ async function handleCheck(params) {
     routeStatus: job.routeStatus || null,
     selectorKind: job.selectorKind || null
   });
+  const taskScopeLine = formatTaskScopeIdLine(job.autoCompact);
 
   const truncationNote = resultPresentation.truncated
     ? `\n_Result truncated for presentation (original: ${resultPresentation.originalSize} bytes)_`
@@ -1393,13 +1849,13 @@ async function handleCheck(params) {
   return {
     content: [{
       type: "text",
-      text: `## Job: ${job.id}\n\n**Status:** ${job.status}\n**Phase:** ${phase} (${phaseDescription(phase)})\n**Task:** ${taskRefLabel(job)}\n${modelLine}\n**Effort:** ${job.effort || "—"}\n**Duration:** ${formatDuration(job.duration ? job.duration * 1000 : null)}\n**Cost:** ${formatCost(job.cost)}\n${elapsedSection}**Started:** ${job.startedAt || job.createdAt || "—"}\n**Completed:** ${job.completedAt || "—"}\n\n${resultSection}${truncationNote}\n\n${filesSection}\n\n${progressSection}\n\n${diagnosticSection}`
+      text: `## Job: ${job.id}\n\n**Status:** ${job.status}\n**Phase:** ${phase} (${phaseDescription(phase)})\n**Task:** ${taskRefLabel(job)}\n${modelLine}${taskScopeLine}\n**Effort:** ${job.effort || "—"}\n**Duration:** ${formatDuration(job.duration ? job.duration * 1000 : null)}\n**Cost:** ${formatCost(job.cost)}\n${elapsedSection}**Started:** ${job.startedAt || job.createdAt || "—"}\n**Completed:** ${job.completedAt || "—"}\n\n${resultSection}${truncationNote}\n\n${filesSection}\n\n${progressSection}\n\n${diagnosticSection}`
     }]
   };
 }
 
 // cc_cancel
-function handleCancel(params) {
+async function handleCancel(params) {
   const cwd = getCwd(params);
   const workspaceRoot = rememberWorkspaceRoot(cwd);
   const jobs = listJobs(workspaceRoot);
@@ -1422,6 +1878,36 @@ function handleCancel(params) {
     }
   }
 
+  // Already terminal — honest report, no lie.
+  if (TERMINAL_STATUSES.has(job.status)) {
+    return { content: [{ type: "text", text: `Job ${job.id} is not running (status: ${job.status}). Cannot cancel.` }] };
+  }
+
+  // Cancelling in progress — await settlement (idempotent duplicate cancel).
+  if (job.status === "cancelling") {
+    const handle = activeForegroundRuns.get(job.id);
+    if (handle) {
+      await handle.completionPromise;
+      const settled = listJobs(workspaceRoot).find((candidate) => candidate.id === job.id);
+      if (settled?.status === "cancelled") {
+        return {
+          content: [{
+            type: "text",
+            text: `Job ${job.id} cancelled.${formatTaskScopeIdLine(settled.autoCompact)}`,
+          }],
+        };
+      }
+      return {
+        content: [{
+          type: "text",
+          text: `Job ${job.id} settled as ${settled?.status || "unknown"} before cancellation completed.`,
+        }],
+        isError: true,
+      };
+    }
+    return { content: [{ type: "text", text: `Job ${job.id} is cancelling but no live handle is available.` }], isError: true };
+  }
+
   if (job.status !== "running" && job.status !== "queued") {
     return { content: [{ type: "text", text: `Job ${job.id} is not running (status: ${job.status}). Cannot cancel.` }] };
   }
@@ -1437,30 +1923,287 @@ function handleCancel(params) {
     };
   }
 
-  // Cancel via active run handle (never via persisted PID alone)
-  const foregroundRun = activeForegroundRuns.get(job.id);
-  if (foregroundRun) {
-    foregroundRun.cancel();
+  // Must hold the live in-memory controller — never signal via persisted PID.
+  const handle = activeForegroundRuns.get(job.id);
+  if (!handle) {
+    return {
+      content: [{
+        type: "text",
+        text: `Job ${job.id} has no live process handle. The process may have already exited; cannot safely cancel.`
+      }],
+      isError: true
+    };
   }
-  // Note: we do NOT call terminateProcessTree on persisted PIDs.
-  // The watchdog process will terminate Claude when stdin closes.
 
-  const now = new Date().toISOString();
+  // Transition to cancelling (not directly to cancelled). The delegate's result
+  // path will finalize to cancelled via finalizeJob once the process tree dies.
   appendLogLine(workspaceRoot, job.id, "Cancelled by user.");
   updateJob(workspaceRoot, {
     id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    completedAt: now,
+    status: "cancelling",
+    phase: "cancelling",
     errorMessage: "Cancelled by user.",
-    routeStatus: ROUTE_STATUSES.CANCELLED
   });
+
+  // Yield briefly so the cancelling status is flushed to disk and observable
+  // by external state pollers before we signal the watchdog. Without this,
+  // the process tree can die within the same event-loop turn, overwriting
+  // cancelling→cancelled before any observer sees the intermediate state.
+  // The delay is bounded (20ms) and negligible compared to process-tree
+  // shutdown time in production.
+  await new Promise((r) => setTimeout(r, 20));
+
+  // Signal the watchdog once. The watchdog terminates the Claude process tree.
+  handle.cancelRequested = true;
+  try { handle.execution?.cancel(); } catch { /* best effort */ }
+
+  // Await process tree death + lease release + finalizeJob. The delegate's
+  // result path resolves completionPromise only after all cleanup is done.
+  await handle.completionPromise;
+
+  const settled = listJobs(workspaceRoot).find((candidate) => candidate.id === job.id);
+  if (settled?.status !== "cancelled") {
+    return {
+      content: [{
+        type: "text",
+        text: `Job ${job.id} settled as ${settled?.status || "unknown"} before cancellation completed.`,
+      }],
+      isError: true,
+    };
+  }
 
   return {
     content: [{
       type: "text",
-      text: `Job ${job.id} cancelled.`
+      text: `Job ${job.id} cancelled.${formatTaskScopeIdLine(settled.autoCompact)}`
+    }]
+  };
+}
+
+// cc_compact — read-only foreground /compact on a stopped session.
+// Rejects active/cancelling jobs. Only a observed compact_boundary in the
+// transcript yields compacted=true. observedBoundary is null if not observed,
+// never fabricated. requestedTarget/effectiveWindow come from the job's stored
+// auto-compact policy (if any).
+async function handleCompact(params) {
+  const cwd = getCwd(params);
+  const workspaceRoot = rememberWorkspaceRoot(cwd);
+  const jobs = listJobs(workspaceRoot);
+
+  // 1. Locate the target session.
+  //    Priority: explicit resumeSession > job ID/prefix > latest stopped job.
+  let sessionId = null;
+  let job = null;
+
+  if (params.resumeSession) {
+    sessionId = params.resumeSession;
+    if (!isValidSessionId(sessionId)) {
+      return {
+        content: [{ type: "text", text: "Error: resumeSession is not a valid Claude session identifier." }],
+        isError: true
+      };
+    }
+    job = sortJobsNewestFirst(jobs).find((candidate) =>
+      TERMINAL_STATUSES.has(candidate.status)
+      && jobMatchesClaudeSession(candidate, sessionId)
+    ) || null;
+  } else if (params.job) {
+    try {
+      job = findJob(jobs, params.job);
+    } catch (err) {
+      return { content: [{ type: "text", text: err.message }], isError: true };
+    }
+    if (!job) {
+      return { content: [{ type: "text", text: `Job "${params.job}" not found.` }], isError: true };
+    }
+    // 2. Reject active/cancelling jobs BEFORE checking claudeSessionId.
+    //    A running job may not have a claudeSessionId yet, but it must still be
+    //    rejected so the caller knows to wait.
+    if (job.status === "running" || job.status === "queued" || job.status === "cancelling") {
+      return {
+        content: [{
+          type: "text",
+          text: `Job ${job.id} is still ${job.status}. cc_compact only accepts stopped sessions. Wait for completion or cancel it first.`
+        }],
+        isError: true
+      };
+    }
+    sessionId = job.claudeSessionId || job.claudeSessionUuid;
+  } else {
+    // Find the latest stopped (terminal) job with a usable session ID.
+    // A cancelled new job may have claudeSessionUuid but null claudeSessionId
+    // (the pre-allocated UUID was passed via --session-id but the task never
+    // completed to record the final session_id). Fall back to claudeSessionUuid.
+    const stopped = sortJobsNewestFirst(jobs).find((j) =>
+      TERMINAL_STATUSES.has(j.status) && (j.claudeSessionId || j.claudeSessionUuid)
+    );
+    job = stopped || null;
+    sessionId = stopped?.claudeSessionId || stopped?.claudeSessionUuid || null;
+  }
+
+  if (!sessionId) {
+    return {
+      content: [{
+        type: "text",
+        text: "No stopped Claude Code session with a claudeSessionId was found in this workspace. Run a delegation first."
+      }],
+      isError: true
+    };
+  }
+  if (!isValidSessionId(sessionId)) {
+    return {
+      content: [{
+        type: "text",
+        text: "The stopped job contains an invalid Claude session identifier. Refusing to invoke Claude with persisted untrusted state.",
+      }],
+      isError: true,
+    };
+  }
+
+  // Explicit resumeSession must not bypass the same active-session guard as
+  // job-based selection. Match every identifier retained in local job state.
+  const activeMatch = jobs.find((candidate) =>
+    (candidate.status === "running"
+      || candidate.status === "queued"
+      || candidate.status === "cancelling")
+    && jobMatchesClaudeSession(candidate, sessionId)
+  );
+  if (activeMatch) {
+    return {
+      content: [{
+        type: "text",
+        text: `Job ${activeMatch.id} is still ${activeMatch.status}. cc_compact only accepts stopped sessions. Wait for completion or cancel it first.`,
+      }],
+      isError: true,
+    };
+  }
+
+  // Resolve the current stored policy. Session/task policies replay for the
+  // compact invocation; delegation policies and clear tombstones do not.
+  const stored = resolveStoredPolicyForSession(jobs, sessionId);
+  const compactPolicy = rebuildStoredPolicy(stored.policy);
+  const inlineSettings = compactPolicy
+    ? buildInlineSettings(compactPolicy.effectiveWindow)
+    : null;
+  if (!job && stored.sourceJob && TERMINAL_STATUSES.has(stored.sourceJob.status)) {
+    job = stored.sourceJob;
+  }
+
+  let boundaryCursor = null;
+  try {
+    boundaryCursor = await captureCompactBoundaryCursor({
+      sessionId,
+      deadlineMs: 1000,
+    });
+  } catch {
+    // The post-run collector will fail closed without a cursor.
+  }
+
+  // 3. Run read-only foreground /compact via the watchdog.
+  //    write=false → read-only (Read, Glob, Grep only). No lease needed.
+  //    resume=true + resumeSession → --resume <sessionId>. No --session-id.
+  const execution = runClaude("/compact", {
+    cwd: workspaceRoot,
+    write: false,
+    resume: true,
+    resumeSession: sessionId,
+    inlineSettings,
+  });
+
+  const result = await execution.result;
+
+  // If the compact invocation itself failed, report honestly.
+  if (!result.ok) {
+    const safeError = buildSafeErrorMessage(
+      result.failureStage || FAILURE_STAGES.PROVIDER_RESPONSE,
+      result.error || "Compact invocation failed."
+    );
+    return {
+      content: [{
+        type: "text",
+        text: `## Compact Failed\n\n**Session:** ${sessionId}\n**Error:** ${boundedText(safeError, MAX_ERROR_MESSAGE_BYTES)}`
+      }],
+      isError: true
+    };
+  }
+
+  // 4. Collect compact boundary evidence from the transcript (best-effort).
+  //    The collector never fabricates — null if not observed.
+  // The requested resume target is authoritative for transcript evidence.
+  // A Provider/CLI result field cannot redirect the collector to another file.
+  const effectiveSessionId = sessionId;
+  let boundary;
+  try {
+    if (!boundaryCursor) throw new Error("cursor-unavailable");
+    boundary = await collectCompactBoundary({
+      sessionId: effectiveSessionId,
+      deadlineMs: 1000,
+      afterCursor: boundaryCursor,
+    });
+  } catch {
+    boundary = {
+      compacted: false,
+      preTokens: null,
+      trigger: null,
+      observedBoundary: null,
+      warning: "read-error",
+    };
+  }
+
+  // 5. Retrieve stored auto-compact policy from the job (if any).
+  const requestedTarget = compactPolicy?.targetTokens ?? null;
+  const effectiveWindow = compactPolicy?.effectiveWindow ?? null;
+
+  const boundaryWarnings = {
+    "transcript-not-found": "Transcript not found — cannot confirm a compact boundary was crossed.",
+    "transcript-replaced": "Transcript file changed identity during compact; evidence was rejected.",
+    "transcript-truncated": "Transcript was truncated during compact; evidence was rejected.",
+    "invalid-cursor": "The pre-compact transcript cursor was invalid; evidence was rejected.",
+    "scan-deadline": "Transcript evidence scan exceeded its deadline.",
+    "read-error": "Transcript evidence could not be read safely.",
+    "symlink-escape": "Transcript path escaped the configured Claude directory and was rejected.",
+  };
+  const reason = boundary.compacted
+    ? null
+    : (boundaryWarnings[boundary.warning]
+      || "No new compact boundary was observed after this invocation. The session may have too few messages to compact.");
+
+  // 6. Persist compact result to the job record (if we located via job).
+  if (job) {
+    try {
+      updateJob(workspaceRoot, {
+        id: job.id,
+        compactResult: {
+          compacted: boundary.compacted,
+          preTokens: boundary.preTokens,
+          trigger: boundary.trigger,
+          observedBoundary: boundary.observedBoundary,
+          requestedTarget,
+          effectiveWindow,
+          reason,
+        },
+      });
+    } catch { /* best effort — compact result is advisory */ }
+  }
+
+  // 7. Build honest response.
+  const lines = [
+    "## Compact Result",
+    "",
+    `**Session:** ${effectiveSessionId}`,
+    `**Compacted:** ${boundary.compacted ? "true" : "false"}`,
+  ];
+  if (boundary.preTokens !== null) lines.push(`**Pre-compaction tokens:** ${boundary.preTokens}`);
+  if (boundary.trigger !== null) lines.push(`**Trigger:** ${boundary.trigger}`);
+  if (requestedTarget !== null) lines.push(`**Requested target:** ${requestedTarget}`);
+  if (effectiveWindow !== null) lines.push(`**Effective window:** ${effectiveWindow}`);
+  if (boundary.observedBoundary !== null) lines.push(`**Observed boundary:** ${boundary.observedBoundary}`);
+  if (reason) lines.push("", `**Reason:** ${reason}`);
+
+  return {
+    content: [{
+      type: "text",
+      text: lines.join("\n")
     }]
   };
 }
@@ -2174,7 +2917,8 @@ const HANDLERS = {
   cc_check: handleCheck,
   cc_cancel: handleCancel,
   cc_review: handleReview,
-  cc_setup: handleSetup
+  cc_setup: handleSetup,
+  cc_compact: handleCompact
 };
 
 // ─── JSON-RPC Message Handling ──────────────────────────────────────────────
@@ -2286,10 +3030,12 @@ async function gracefulShutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  const foregroundExecutions = [...activeForegroundRuns.values()];
-  const completedAt = new Date().toISOString();
+  // Snapshot handles before mutating state. Each handle has:
+  //   { execution, leaseOwner, leaseHeartbeat, completionPromise }
+  const handles = [...activeForegroundRuns.values()];
 
-  // Cancel all owned jobs
+  // 1. Mark owned running/queued jobs as cancelling (not directly cancelled).
+  //    The delegate's result path will finalize to cancelled via finalizeJob.
   for (const workspaceRoot of workspaceRoots) {
     try {
       const jobs = listJobs(workspaceRoot);
@@ -2297,39 +3043,62 @@ async function gracefulShutdown(signal) {
         if ((job.status === "running" || job.status === "queued") && job.ownerServerId === SESSION_ID) {
           upsertJob(workspaceRoot, {
             id: job.id,
-            status: "cancelled",
-            phase: "cancelled",
-            pid: null,
-            completedAt,
+            status: "cancelling",
+            phase: "cancelling",
             errorMessage: `Cancelled: server received ${signal}`,
-            routeStatus: ROUTE_STATUSES.CANCELLED
           });
           appendLogLine(workspaceRoot, job.id, `Cancelled: server ${signal}`);
         }
       }
-      // Release any writer lease we hold
-      releaseWriterLease(workspaceRoot, WRITER_TOKEN);
     } catch { /* best effort */ }
   }
 
-  // Cancel foreground executions (watchdog will detect stdin EOF)
-  for (const execution of foregroundExecutions) {
-    try { execution.cancel(); } catch { /* best effort */ }
+  // 2. Signal all foreground executions (watchdog terminates Claude process tree).
+  for (const handle of handles) {
+    try { handle.execution.cancel(); } catch { /* best effort */ }
   }
 
-  // Give processes a bounded grace period
+  // 3. Await process tree exit (bounded grace period). The delegate's result
+  //    path releases the lease and calls finalizeJob as each execution settles.
   const drained = await Promise.race([
-    Promise.allSettled(foregroundExecutions.map((e) => e.result)).then(() => true),
+    Promise.allSettled(handles.map((h) => h.completionPromise)).then(() => true),
     new Promise((resolve) => setTimeout(() => resolve(false), 5250))
   ]);
 
   if (!drained) {
-    // Force kill remaining
-    for (const execution of foregroundExecutions) {
-      if (execution.pid) {
-        try { terminateProcessTree(execution.pid, "SIGKILL"); } catch { /* already dead */ }
+    // Force kill remaining processes that didn't drain in time.
+    for (const handle of handles) {
+      if (handle.execution.pid) {
+        try { terminateProcessTree(handle.execution.pid, "SIGKILL"); } catch { /* already dead */ }
       }
     }
+    // Wait a short beat for the delegate result paths to finish cleanup.
+    await Promise.race([
+      Promise.allSettled(handles.map((h) => h.completionPromise)),
+      new Promise((resolve) => setTimeout(resolve, 500))
+    ]);
+  }
+
+  // 4. Release any writer leases still held (safety net — the delegate's result
+  //    path should have already released them, but we must not leave them dangling).
+  for (const workspaceRoot of workspaceRoots) {
+    try { releaseWriterLease(workspaceRoot, WRITER_TOKEN); } catch { /* best effort */ }
+  }
+
+  // 5. Finalize any jobs still in cancelling state (the delegate may not have
+  //    had a chance to run its result path, e.g. force-killed above).
+  for (const workspaceRoot of workspaceRoots) {
+    try {
+      const jobs = listJobs(workspaceRoot);
+      for (const job of jobs) {
+        if (job.status === "cancelling" && job.ownerServerId === SESSION_ID) {
+          finalizeJob(workspaceRoot, job.id, "cancelled", {
+            errorMessage: job.errorMessage || `Cancelled: server received ${signal}`,
+            routeStatus: ROUTE_STATUSES.CANCELLED,
+          });
+        }
+      }
+    } catch { /* best effort */ }
   }
 
   process.exit(0);

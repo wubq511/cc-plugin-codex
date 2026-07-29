@@ -161,19 +161,20 @@ export function deleteLog(cwd, jobId) {
 
 // ─── Phase Tracking ──────────────────────────────────────────────────────────
 
-const PHASES = ["starting", "executing", "reviewing", "editing", "verifying", "finalizing", "completed", "failed", "cancelled", "rejected"];
+const PHASES = ["starting", "executing", "reviewing", "editing", "verifying", "finalizing", "cancelling", "completed", "failed", "cancelled", "rejected"];
 
 /**
  * Validate and return the next allowed phases from a given phase.
  */
 export function allowedTransitions(from) {
   switch (from) {
-    case "starting":    return ["executing", "failed", "cancelled"];
-    case "executing":   return ["reviewing", "editing", "verifying", "finalizing", "completed", "failed", "cancelled"];
-    case "reviewing":   return ["editing", "verifying", "finalizing", "completed", "failed", "cancelled"];
-    case "editing":     return ["verifying", "finalizing", "completed", "failed", "cancelled"];
-    case "verifying":   return ["finalizing", "completed", "failed", "cancelled"];
-    case "finalizing":  return ["completed", "failed", "cancelled"];
+    case "starting":    return ["executing", "cancelling", "failed", "cancelled"];
+    case "executing":   return ["reviewing", "editing", "verifying", "finalizing", "cancelling", "completed", "failed", "cancelled"];
+    case "reviewing":   return ["editing", "verifying", "finalizing", "cancelling", "completed", "failed", "cancelled"];
+    case "editing":     return ["verifying", "finalizing", "cancelling", "completed", "failed", "cancelled"];
+    case "verifying":   return ["finalizing", "cancelling", "completed", "failed", "cancelled"];
+    case "finalizing":  return ["cancelling", "completed", "failed", "cancelled"];
+    case "cancelling":  return ["cancelled"];
     case "completed":   return [];
     case "failed":      return [];
     case "cancelled":   return [];
@@ -200,6 +201,7 @@ export function phaseDescription(phase) {
     case "editing":     return "Applying edits to files";
     case "verifying":   return "Verifying the implementation";
     case "finalizing":  return "Finalizing changes";
+    case "cancelling":  return "Cancelling task";
     case "completed":   return "Task completed successfully";
     case "failed":      return "Task failed";
     case "cancelled":   return "Task cancelled by user";

@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+const fs = process.getBuiltinModule("fs");
+const path = process.getBuiltinModule("path");
+
 /**
  * Fake Claude CLI for testing.
  *
@@ -41,6 +44,33 @@ const args = process.argv.slice(2);
 const taskIndex = args.indexOf("-p");
 const taskFromArgs = taskIndex >= 0 ? args[taskIndex + 1] : "";
 
+if (process.env.FAKE_CLAUDE_ARGS_LOG) {
+  fs.appendFileSync(process.env.FAKE_CLAUDE_ARGS_LOG, `${JSON.stringify(args)}\n`, "utf8");
+}
+
+function appendCompactBoundary() {
+  if (process.env.FAKE_CLAUDE_APPEND_COMPACT_BOUNDARY !== "1") return;
+  const resumeIndex = args.indexOf("--resume");
+  const sessionId = resumeIndex >= 0 ? args[resumeIndex + 1] : null;
+  const configDir = process.env.CLAUDE_CONFIG_DIR;
+  if (!sessionId || !configDir) return;
+
+  const projectDir = path.join(configDir, "projects", "test-project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  fs.appendFileSync(
+    path.join(projectDir, `${sessionId}.jsonl`),
+    `${JSON.stringify({
+      type: "system",
+      subtype: "compact_boundary",
+      compactMetadata: {
+        preTokens: Number(process.env.FAKE_CLAUDE_COMPACT_PRE_TOKENS || 45000),
+        trigger: process.env.FAKE_CLAUDE_COMPACT_TRIGGER || "manual",
+      },
+    })}\n`,
+    "utf8",
+  );
+}
+
 // Handle --version and --help immediately so cc_setup's spawnSync calls
 // don't hang waiting for stdin. The budget-guard flag is controllable via
 // FAKE_CLAUDE_HELP_BUDGET_GUARD=1 so tests can verify fail-closed behavior.
@@ -78,7 +108,10 @@ function success(result = "fake result") {
 }
 
 function handleMode(mode) {
-  if (mode.startsWith("delay")) {
+  if (mode === "/compact") {
+    appendCompactBoundary();
+    success("compact command handled");
+  } else if (mode.startsWith("delay")) {
     const delayMs = Number(mode.split(":")[1] || 150);
     setTimeout(() => success("delayed result"), delayMs);
   } else if (mode === "invalid-json") {
@@ -118,6 +151,14 @@ function handleMode(mode) {
       success();
     }
   } else if (mode === "hang") {
+    setInterval(() => {}, 1000);
+  } else if (mode === "hang-slow") {
+    // Like hang, but traps SIGTERM and waits 300ms before exiting.
+    // This makes the `cancelling` status observable by tests that poll disk
+    // state — without it, the process dies too fast for the polling interval.
+    process.on("SIGTERM", () => {
+      setTimeout(() => process.exit(0), 300).unref?.();
+    });
     setInterval(() => {}, 1000);
   } else if (mode === "hang-pid") {
     // Write PID to file for crash tests to track liveness

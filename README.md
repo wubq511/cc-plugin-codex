@@ -108,6 +108,37 @@ codex plugin add cc-plugin-codex
 /claude:cancel
 ```
 
+取消状态机为 `running → cancelling → cancelled`。`cc_cancel` 会在 `cancelling` 状态落盘后发送信号，然后等待 watchdog/Claude 进程树退出、状态收口、writer lease 释放后才返回。无 live handle 时如实报告；同步 finalizer 临界区与 per-job 终态缓存共同防止 completed-vs-cancelled 竞态。
+
+### 自动压缩与会话恢复
+
+`cc_delegate` 的 `autoCompact` 参数支持按 delegation/session/task 临时配置自动压缩，通过 Claude CLI 内联 `--settings <json>` 注入两个 env 键，不修改 `~/.claude/**`、项目 `.claude/` 或父 `process.env`。
+
+```json
+{ "contextWindowTokens": 256000, "targetTokens": 230000, "scope": "delegation" }
+```
+
+- `contextWindowTokens`：用户声明的窗口大小（正安全整数，不验证、不从模型推断）
+- `targetTokens`：名义目标（正安全整数，必须 ≤ `floor(context × 0.9)`，否则 spawn 前拒绝）
+- `scope`：`delegation`（默认，仅当前进程）/ `session`（绑定会话，resume 时重放）/ `task`（覆盖同一 Codex 任务的所有 delegation，通过 `taskScopeId` 继承）
+- `taskScopeId`：task scope 的唯一继承标识，必须是 UUID。首次完整 task policy 省略时自动生成并返回；后续用 `{ "scope": "task", "taskScopeId": "..." }` 继承，禁止按 cwd/提示词猜测归属。未知或已清除的 ID 在 spawn 前失败，不会静默无策略执行。
+- 首次 task delegation 即使失败或被取消，也会在 delegation 结果和 `cc_check` 中返回生成的 `taskScopeId`，便于新 session 继续继承。
+- 清除：恢复某个 session 时传 `autoCompact:null` 会为该 session 写入清除标记；task policy 用 `{ "scope": "task", "taskScopeId": "...", "clear": true }` 清除。`taskScopeId:null` 无法指明目标任务，因此拒绝。
+
+优先级：本次显式值 > session > task > 无。
+
+新 delegation 启动前生成 Claude UUID，同时作为 provisional `claudeSessionId` 立即落盘并用 `--session-id`；resume 的 session ID 也在 spawn 前落盘，CLI 只用 `--resume`，二者不并存。取消后仍可用同一 `claudeSessionId` 主动 compact、再 resume。
+
+输出区分 `target`（名义）、`effectiveWindow`（计算值 `ceil(target/0.9)`）、`observedBoundary`（transcript 实测，可能为 null）。Claude Code 会把 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` 封顶到模型真实窗口，百分比 override 也只能把内建阈值调低；因此当自定义 Provider 实际窗口更小、模型内建阈值更早或 managed policy 覆盖时，插件不能保证精确命中用户声明值。
+
+### 主动压缩已停止的会话
+
+```
+/claude:compact
+```
+
+`cc_compact` 对已停止的 Claude Code 会话运行只读前台 `/compact`。调用前先记录 transcript 文件游标；只有本次调用后新增的 canonical `compact_boundary` 才 `compacted:true`，历史 boundary 与 `isCompactSummary` 都不算。按 job 或显式 session 选择时都会拒绝 active/cancelling；session/task 临时策略会重放，delegation 策略不会。消息不足或证据读取失败返回 `false` + 原因，`observedBoundary` 未观察到时为 null。
+
 ### 环境检查
 
 ```
@@ -127,17 +158,18 @@ liveness probe。
 
 ## MCP 工具
 
-插件通过 MCP server 暴露 7 个工具，供 Codex 直接调用：
+插件通过 MCP server 暴露 8 个工具，供 Codex 直接调用：
 
 | 工具 | 说明 |
 |------|------|
-| `cc_delegate` | 分派编码任务给 Claude Code（默认继承 Provider 配置，支持 alias/native 模型路由） |
+| `cc_delegate` | 分派编码任务给 Claude Code（默认继承 Provider 配置，支持 alias/native 模型路由、autoCompact 临时压缩策略） |
 | `cc_resolve_route` | 只读模型路由解析器（不发起模型调用，不枚举 Provider 模型） |
 | `cc_list_models` | 报告模型解析行为和最近完成任务的模型证据信息 |
 | `cc_check` | 查看任务状态/结果 |
-| `cc_cancel` | 取消运行中的任务 |
+| `cc_cancel` | 取消运行中的任务（running→cancelling→cancelled，异步确认进程树退出和 lease 释放） |
 | `cc_review` | 审查代码变更 |
 | `cc_setup` | 环境检查（静态零模型调用 + 可选付费 liveness probe） |
+| `cc_compact` | 对已停止的 Claude Code 会话运行只读 /compact，诚实报告是否跨越压缩边界 |
 
 ## 项目结构
 
@@ -158,15 +190,18 @@ liveness probe。
     │       ├── git.mjs            # Git 集成（diff、review context）
     │       ├── job-log.mjs        # Job 日志和阶段追踪
     │       ├── process.mjs        # 进程管理
-    │       ├── state.mjs          # Job 状态、writer lease 与保留策略（schema v7）
+    │       ├── state.mjs          # Job 状态、writer lease 与保留策略（schema v8）
     │       ├── model-evidence.mjs # 模型证据模块统一出口
     │       ├── model-evidence-collector.mjs # 有界 transcript 采集
     │       ├── model-evidence-formatter.mjs # 统一安全展示
     │       ├── model-evidence-migration.mjs # 模型证据迁移（状态 schema 迁移由 state.mjs 管理）
     │       ├── model-evidence-shared.mjs # 常量与规范化
+    │       ├── autocompact.mjs    # 自动压缩策略验证、内联 settings 注入、scope 解析
+    │       ├── compact-boundary.mjs # 压缩边界采集（有界 transcript 读取）
     │       └── workspace.mjs      # 工作区解析
     ├── skills/                    # Codex skill 定义
     │   ├── delegate/SKILL.md
+    │   ├── compact/SKILL.md
     │   ├── status/SKILL.md
     │   ├── review/SKILL.md
     │   ├── cancel/SKILL.md

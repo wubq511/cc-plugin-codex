@@ -72,6 +72,9 @@ export function isValidSessionId(sessionId) {
   if (sessionId.includes("..")) return false;
   if (sessionId.includes("\0")) return false;
   if (/[\x00-\x1f\x7f]/.test(sessionId)) return false;
+  // Session IDs are also passed after --resume. Reject option-like persisted
+  // or user-supplied values even though the process is spawned with argv.
+  if (sessionId.startsWith("-")) return false;
   // Must look like a session identifier (UUID-like or Claude session format)
   // Allow alphanumeric, hyphens, underscores, dots
   if (!/^[a-zA-Z0-9._-]+$/.test(sessionId)) return false;

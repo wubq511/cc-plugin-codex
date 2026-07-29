@@ -27,7 +27,7 @@ Verify that Claude Code is installed and the plugin is ready to use. Performs st
 
 - **Claude Code CLI availability and version**
 - **CLI protocol verification**: confirms `--print`, `--input-format`, and `--output-format` flags are supported (print-mode JSON capability)
-- **Companion compatibility**: server version, state schema v7, watchdog protocol
+- **Companion compatibility**: server version, state schema v8, watchdog protocol
 - **Model routing**: the selector classifier (inherited/alias/native) is active. Model selection is inherited from the parent environment or explicitly supplied via `model` selector. The plugin does not read, write, or modify any external routing configuration.
 - **Source/cache compatibility**: performs a real comparison between the running plugin source and the installed cache directory (reports `match`, `differ`, or `not-installed` when running from source). Never prints a green compatibility claim without an actual comparison.
 - **Node.js availability and version**
@@ -35,7 +35,7 @@ Verify that Claude Code is installed and the plugin is ready to use. Performs st
 - **Workspace root detection**
 - **Default branch detection (main/master)**
 - **Current session ID**
-- **State schema version (v7 with task privacy boundary, native-Claude routing, route snapshots, failure diagnostics)**
+- **State schema version (v8 with task privacy boundary, native-Claude routing, pre-allocated session IDs, temporary auto-compact policy, compact evidence, and cancellation settlement)**
 - **State health** (orphaned job count, active job count)
 
 ## Optional Liveness Probe (Cost-Bearing)

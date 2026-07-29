@@ -35,6 +35,8 @@ cc-plugin-codex/
 │       ├── claude-runner.mjs    # claude CLI 调用封装
 │       ├── watchdog.mjs         # 监督、捕获与进程树终止
 │       ├── state.mjs            # job 状态、lease 与保留策略
+│       ├── autocompact.mjs      # 临时自动压缩策略与 scope 解析
+│       ├── compact-boundary.mjs # transcript 压缩边界证据
 │       ├── model-evidence*.mjs  # 模型证据采集、展示与迁移
 │       ├── git.mjs              # Git/review context 与 workspace fingerprint
 │       ├── job-log.mjs          # 有界 lifecycle 日志
@@ -45,7 +47,8 @@ cc-plugin-codex/
 │   ├── status/SKILL.md          # 查看执行状态
 │   ├── review/SKILL.md          # 审查 Claude Code 产出
 │   ├── cancel/SKILL.md          # 取消正在执行的任务
-│   └── setup/SKILL.md           # 检测环境可用性
+│   ├── setup/SKILL.md           # 检测环境可用性
+│   └── compact/SKILL.md         # 主动压缩已停止会话
 └── schemas/
     └── delegate-output.schema.json
 ```
@@ -54,7 +57,7 @@ cc-plugin-codex/
 
 - **MCP Server（stdio）**：Codex 作为 MCP client，启动 `cc-companion.mjs` 作为子进程
 - **Claude CLI 调用**：watchdog 通过 `claude --print --input-format text --output-format json` 非交互调用 Claude Code；任务只经 stdin 传递
-- **Job 追踪**：schema v7 以原子 per-job 文件持久化到 `${os.tmpdir()}/cc-companion/<workspace-slug-hash>/jobs/`，目录和文件分别限制为 `0700`/`0600`；任务正文不进入 state，旧路由实现留下的 route 字段会在迁移时清空
+- **Job 追踪**：schema v8 以原子 per-job 文件持久化到 `${os.tmpdir()}/cc-companion/<workspace-slug-hash>/jobs/`，目录和文件分别限制为 `0700`/`0600`；任务正文不进入 state；v8 增加临时 compact 策略、会话 UUID、compact 证据与 `cancelling` 状态
 
 ### 3.3 Codex 插件清单（plugin.json）
 
@@ -97,7 +100,7 @@ cc-plugin-codex/
 
 ## 4. MCP 工具定义
 
-所有会读取或修改 job/workspace 状态的工具（`cc_delegate`、`cc_check`、`cc_cancel`、`cc_review`、`cc_setup`）都必须接收当前用户工作区的绝对路径 `cwd`。MCP server 自身运行在插件安装 cache 中，不能用 `process.cwd()` 推断用户项目；缺失、相对或无效的 `cwd` 必须直接报错，不能静默回退到 cache。`cc_review` 在没有历史 job 时仍可审查显式指定的 working-tree/branch target，并使用合成的审查任务标签。
+插件暴露 8 个工具：`cc_delegate`、`cc_resolve_route`、`cc_list_models`、`cc_check`、`cc_cancel`、`cc_review`、`cc_setup`、`cc_compact`。所有会读取或修改 job/workspace 状态的工具都必须接收当前用户工作区的绝对路径 `cwd`；`cc_resolve_route` 是无状态例外，`cc_list_models.cwd` 可选但一旦提供也执行同样校验。MCP server 自身运行在插件安装 cache 中，不能用 `process.cwd()` 推断用户项目；缺失、相对或无效的必填 `cwd` 必须直接报错，不能静默回退到 cache。
 
 ### 4.1 `cc_delegate` — 分派编码任务
 
@@ -117,21 +120,26 @@ cc-plugin-codex/
 | `dangerouslySkipPermissions` | boolean | ❌ | `false` | 跳过权限确认（仅在显式传入 `true` 时开启） |
 | `resume` | boolean | ❌ | `false` | 仅在用户明确要求保留同一个 Claude Code 会话时，恢复当前工作区最近完成任务的 Claude session |
 | `resumeSession` | string | ❌ | — | 仅在用户明确指定 Claude session 时恢复该会话；不能与 `resume` 同时使用 |
+| `autoCompact` | object\|null | ❌ | — | 只对指定 delegation/session/task 生效的临时压缩策略；`null` 用于显式恢复会话时清除 session 策略 |
 
 **行为：**
 
-1. 生成 job ID，记录到 state
+1. 生成 job ID；新会话预分配 Claude UUID 并在 spawn 前作为 canonical `claudeSessionId` 落盘
 2. 构建 `claude` 命令（任务通过 stdin 传递，不出现在进程命令行中）：
    ```
    claude --print --input-format text --output-format json \
      [--dangerously-skip-permissions] \
      [--model <model>] \
      [--effort <effort>] \
+     [--session-id <uuid> | --resume <session-id>] \
+     [--settings <inline-json>] \
      [--allowedTools <tools>]
    ```
    - 若 `write=false`：`--allowedTools Read,Glob,Grep`（严格禁止 Bash）
    - 仅当 `dangerouslySkipPermissions=true` 时加 `--dangerously-skip-permissions`
    - 仅当 `model` 非空时加 `--model`；alias 规范化为 Claude alias，native ID 通过严格语法验证后原样传递
+   - 新会话只用 `--session-id`，resume 只用 `--resume`，两者永不并存
+   - `autoCompact` 只通过内联 `--settings` 注入两个 compact env 键，不修改永久配置或父进程环境
    - 仅当 `timeoutSeconds` 为 1..604800 范围内的正整数时创建内部超时计时器；省略时不创建计时器
 3. 前台执行（默认，唯一模式）：
    - 通过 watchdog 子进程执行，watchdog 通过 fd3 控制管道与 companion 通信
@@ -152,6 +160,14 @@ cc-plugin-codex/
 - 不复制完整旧会话、完整 diff 或冗长日志；这些内容由 Claude Code 在工作区中按需读取。
 - 只有用户明确要求保留同一个 Claude Code 对话，或明确指定 session ID，才使用 resume。
 - 不使用 `--fork-session` 解决成本问题，因为它会继承被恢复会话的历史，只改变后续 session ID。
+
+**临时自动压缩策略：**
+
+- `contextWindowTokens` 与 `targetTokens` 由调用者声明；插件不根据 alias、Provider 路由或 `[1M]` 标记猜测真实窗口。
+- `targetTokens` 必须 `<= contextWindowTokens * 0.9`；插件固定 90% 并计算 `effectiveWindow = ceil(targetTokens / 0.9)`。这是对 Claude 自动 compact 的配置目标，不是 Provider 实际容量或精确命中承诺。
+- `scope` 为 `delegation`（仅当前进程）、`session`（同一 Claude session 的 resume/compact 重放）或 `task`（显式携带同一 UUID `taskScopeId` 的新 session 继承）。
+- 解析优先级为本次显式值 > session > task > none。未知/已清除的 task ID 在 spawn 前失败；session/task 清除使用 tombstone，禁止旧策略复活。
+- 永久配置边界：不得写 `~/.claude/**`、项目 `.claude/`、Provider/profile/router 配置或父 `process.env`。
 
 **输出（前台完成时）：**
 
@@ -235,8 +251,8 @@ cc-plugin-codex/
 
 - 无 `job`：找到最新的 `running`/`queued` job 并取消
 - 有 `job`：取消指定 job
-- 终止 claude 子进程树
-- 更新 job 状态为 `cancelled`
+- 仅通过当前 MCP server 拥有的 live controller 终止 Claude 子进程树，绝不根据持久化 PID 发信号
+- 状态先进入 `cancelling`，等待进程树退出、delegate 收口与 writer lease 释放后才进入 `cancelled` 并返回
 
 ### 4.5 `cc_review` — 审查 Claude Code 产出
 
@@ -284,6 +300,19 @@ cc-plugin-codex/
   }]
 }
 ```
+
+### 4.7 `cc_compact` — 主动压缩已停止会话
+
+**输入 Schema：** 必填绝对路径 `cwd`；可选 `job` 或 `resumeSession`。显式 `resumeSession` 优先于 `job`。
+
+**行为：**
+
+1. 解析目标 job/session；任何匹配的 `queued`、`running` 或 `cancelling` job 都拒绝，必须先完成或取消。
+2. 在调用前记录 path-contained transcript 游标；游标无法可靠建立时 fail closed。
+3. 对目标 session 运行只读前台 `claude --print --resume <sessionId> ...`，并将 `/compact` 通过 stdin 传入；不使用 `--session-id`。
+4. session/task 临时 auto-compact settings 会重放，delegation-only settings 不重放。
+5. 只有本次调用后新增的 canonical `type:"system", subtype:"compact_boundary"` 才返回 `compacted:true`；历史 boundary、summary marker 或普通成功退出都不能伪装为压缩成功。
+6. 将有界、非敏感的 `compactResult` 写回 job；随后可用同一 `resumeSession` 继续会话。
 
 ## 5. Skills 定义
 
@@ -345,6 +374,17 @@ cc-plugin-codex/
 1. 调用 `cc_setup`
 2. 如果 Claude Code 不可用，提示安装：`npm install -g @anthropic-ai/claude-code`
 
+### 5.6 `compact` — 主动压缩会话
+
+**触发：** 用户要求停止后压缩某个 Claude Code session，或压缩后继续同一会话。
+
+**工作流：**
+
+1. 若目标仍 active，先显式调用 `cc_cancel` 并等待其返回。
+2. 调用 `cc_compact`，通过 job 或 `resumeSession` 定位。
+3. 仅以新增 canonical boundary 判断是否真正 compact；没有边界时如实返回原因。
+4. 需要继续时，用返回的同一 session ID 调用 `cc_delegate.resumeSession`。
+
 ## 6. MCP Server 实现
 
 ### 6.1 协议实现
@@ -354,7 +394,7 @@ cc-plugin-codex/
 1. 从 stdin 读取 JSON-RPC 消息（换行分隔）
 2. 处理 `initialize` → 返回 capabilities（tools）
 3. 处理 `initialized` 通知
-4. 处理 `tools/list` → 返回 7 个工具定义（含只读 `cc_resolve_route`）
+4. 处理 `tools/list` → 返回 8 个工具定义（含只读 `cc_resolve_route` 与主动压缩 `cc_compact`）
 5. 处理 `tools/call` → Promise-aware 路由到对应 handler；pending delegate 不阻塞后续消息
 6. 处理 `notifications/cancelled` → 取消对应 pending job 与进程树，并抑制迟到的正常响应
 7. 结果写入 stdout（JSON-RPC response）
@@ -362,7 +402,7 @@ cc-plugin-codex/
 
 ### 6.2 Claude CLI 调用（claude-runner.mjs）
 
-`claude-runner.mjs` 启动独立 watchdog。companion 通过 watchdog stdin 发送一次性配置，并用 IPC channel 保持取消/父进程死亡信号；watchdog 再把任务写入 Claude stdin。模型参数只有在用户显式提供时才以独立 argv 传入；`write=false` 固定为 `Read,Glob,Grep`。watchdog 对 stdout/stderr 共享 8 MiB 捕获预算，并在 POSIX/Windows 上终止完整 Claude 进程树。
+`claude-runner.mjs` 启动独立 watchdog。companion 通过 watchdog stdin 发送一次性配置，并用 IPC channel 保持取消/父进程死亡信号；watchdog 再把任务写入 Claude stdin。模型参数只有在用户显式提供时才以独立 argv 传入；`write=false` 固定为 `Read,Glob,Grep`。新 session 的 `--session-id`、resume 的 `--resume` 与临时 compact `--settings` 都以独立参数传入，任务仍只走 stdin。watchdog 对 stdout/stderr 共享 8 MiB 捕获预算，并在 POSIX/Windows 上终止完整 Claude 进程树。
 
 ### 6.3 Job 状态管理（state.mjs）
 
@@ -387,7 +427,18 @@ Job 记录结构：
   "effort": "high",
   "write": true,
   "ownerServerId": "session-...",
-  "claudeSessionId": null,
+  "claudeSessionId": "550e8400-e29b-41d4-a716-446655440000",
+  "claudeSessionUuid": "550e8400-e29b-41d4-a716-446655440000",
+  "taskScopeId": null,
+  "autoCompact": {
+    "scope": "session",
+    "contextWindowTokens": 256000,
+    "targetTokens": 230000,
+    "effectiveWindow": 255556,
+    "settingsInjected": true,
+    "cleared": false
+  },
+  "compactResult": null,
   "pid": 12345,
   "createdAt": "2026-07-06T10:00:00Z",
   "updatedAt": "2026-07-06T10:00:00Z",
@@ -400,7 +451,7 @@ Job 记录结构：
 }
 ```
 
-状态：`queued` → `running` → `completed` | `failed` | `cancelled` | `orphaned`。单个 metadata 文件最大 64 KiB；完整结果进入独立 artifact。写任务通过原子 writer lease 串行化，lease 每 60 秒续约。
+状态：`queued` → `running` → `completed` | `failed` | `orphaned`，取消路径为 `running → cancelling → cancelled`。单个 metadata 文件最大 64 KiB；完整结果进入独立 artifact。写任务通过原子 writer lease 串行化，lease 每 60 秒续约。取消保留 session ID、task scope 与 compact 策略，便于停止后 compact/resume。
 
 ### 6.4 进程管理（process.mjs）
 
@@ -478,12 +529,13 @@ Focus: <focus or "general">
 ## 11. 实现顺序
 
 1. **MCP server 骨架**：cc-companion.mjs + JSON-RPC 协议处理
-2. **lib 模块**：claude-runner, state, process, workspace
+2. **lib 模块**：claude-runner, state, process, workspace, autocompact, compact-boundary
 3. **cc_setup**：最简单，先跑通 MCP 通信
 4. **cc_delegate**：核心功能，前台模式优先
 5. **cc_list_models**：辅助工具
 6. **cc_check**：状态查询
 7. **cc_cancel**：进程终止
 8. **cc_review**：审查 + 对抗模式
-9. **Skills**：5 个 SKILL.md
-10. **测试**：本地 marketplace 安装 + 端到端验证
+9. **cc_resolve_route / cc_compact**：只读路由预览与停止会话主动压缩
+10. **Skills**：6 个 SKILL.md
+11. **测试**：本地 marketplace 安装 + 端到端验证

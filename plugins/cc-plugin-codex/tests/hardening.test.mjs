@@ -1213,6 +1213,207 @@ test("cc_cancel terminates Claude descendant processes before releasing control"
   });
 });
 
+// ─── P3: Cancellation State Machine (running → cancelling → cancelled) ──────
+
+test("cc_cancel transitions through cancelling status before cancelled", async (t) => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-cancelling-status-"));
+  // No FAKE_CLAUDE_MODE env: the fake Claude reads the mode from stdin (the task text).
+  // Using "hang-slow" which traps SIGTERM and waits 300ms before exiting, giving
+  // the test enough time to observe the cancelling status on disk.
+  const server = startServer(t, { workspace });
+
+  const delegate = server.send(1, "cc_delegate", { task: "hang-slow" });
+  // Wait for job to be running
+  await waitFor(() => {
+    const jobs = listJobs(workspace);
+    return jobs.find((j) => j.status === "running");
+  }, 5000);
+
+  // Start cancel (async) — don't await yet
+  const cancelPromise = server.send(2, "cc_cancel");
+
+  // The job must transition to cancelling while the process tree is still alive.
+  // hang-slow traps SIGTERM for 300ms, so cancelling should be observable.
+  let sawCancelling = false;
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const jobs = listJobs(workspace);
+    const job = jobs.find((j) => j.status === "cancelling");
+    if (job) { sawCancelling = true; break; }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  assert.ok(sawCancelling,
+    "Job must transition to cancelling status (not directly to cancelled)");
+
+  const cancelled = await cancelPromise;
+  assert.match(cancelled.result.content[0].text, /cancelled/i);
+
+  // Final state must be cancelled
+  const jobs = listJobs(workspace);
+  const job = jobs.find((j) => j.status === "cancelled");
+  assert.ok(job, "Job must be cancelled after cc_cancel returns");
+
+  await delegate.catch(() => {});
+});
+
+test("cc_cancel returns only after writer lease is released", async (t) => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-cancel-lease-"));
+  // No FAKE_CLAUDE_MODE env: each delegation's task text becomes the fake
+  // Claude's mode via stdin, so the first delegation hangs and the second
+  // succeeds.
+  const server = startServer(t, { workspace });
+
+  const delegate = server.send(1, "cc_delegate", { task: "hang" });
+  // Wait for job to be running and lease acquired
+  await waitFor(() => {
+    const jobs = listJobs(workspace);
+    return jobs.find((j) => j.status === "running");
+  }, 5000);
+
+  // Lease should be held
+  const leaseBefore = getWriterLeaseOwner(workspace);
+  assert.ok(leaseBefore, "Writer lease must be held during running job");
+
+  const cancelled = await server.send(2, "cc_cancel");
+  assert.match(cancelled.result.content[0].text, /cancelled/i);
+
+  // After cc_cancel returns, the lease must be free
+  const leaseAfter = getWriterLeaseOwner(workspace);
+  assert.equal(leaseAfter, null, "Writer lease must be released after cc_cancel returns");
+
+  // A new write delegation should be able to start immediately
+  const newJob = await server.send(3, "cc_delegate", { task: "success" });
+  assert.match(newJob.result.content[0].text, /Task Completed/);
+
+  await delegate.catch(() => {});
+});
+
+test("completed-vs-cancel race: cancelling wins over late success result", async (t) => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-cancel-race-"));
+  // No FAKE_CLAUDE_MODE env: the task text "delay:200" becomes the mode via stdin.
+  const server = startServer(t, { workspace });
+
+  const delegate = server.send(1, "cc_delegate", { task: "delay:200" });
+  // Wait for job to be running
+  await waitFor(() => {
+    const jobs = listJobs(workspace);
+    return jobs.find((j) => j.status === "running");
+  }, 5000);
+
+  // Cancel while the delayed result is still pending.
+  // The cancel transitions to cancelling; when the result arrives,
+  // the finalizer must write cancelled (not completed).
+  const cancelled = await server.send(2, "cc_cancel");
+  assert.match(cancelled.result.content[0].text, /cancelled/i);
+
+  await delegate.catch(() => {});
+
+  // Final status must be cancelled, not completed
+  const jobs = listJobs(workspace);
+  const job = jobs[0];
+  assert.equal(job.status, "cancelled",
+    `Job must be cancelled (not completed) when cancel was requested before result arrived. Got: ${job.status}`);
+});
+
+test("cancel during post-result verification returns cancelled consistently", async (t) => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-cancel-post-result-"));
+  const fakeHome = path.join(workspace, "home");
+  fs.mkdirSync(path.join(fakeHome, ".claude", "projects"), { recursive: true });
+  const server = startServer(t, { workspace, env: { HOME: fakeHome } });
+
+  const delegate = server.send(1, "cc_delegate", { task: "success" });
+  const verifyingJob = await waitFor(
+    () => listJobs(workspace).find((j) =>
+      j.status === "running" && (j.phase === "verifying" || j.phase === "finalizing")
+    ),
+    5000,
+  );
+
+  const cancelled = await server.send(2, "cc_cancel", { job: verifyingJob.id });
+  assert.match(cancelled.result.content[0].text, /cancelled/i);
+
+  const delegateResult = await delegate;
+  assert.equal(delegateResult.result.isError, true);
+  assert.match(delegateResult.result.content[0].text, /Task Cancelled/i,
+    "The pending delegate response must agree with the cancelled terminal state");
+
+  const finalJob = listJobs(workspace).find((j) => j.id === verifyingJob.id);
+  assert.equal(finalJob.status, "cancelled");
+  assert.equal(finalJob.routeStatus, "cancelled");
+  assert.match(finalJob.errorMessage, /cancel/i);
+});
+
+test("duplicate cc_cancel on same job is idempotent", async (t) => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-cancel-dup-"));
+  const server = startServer(t, { workspace });
+
+  const delegate = server.send(1, "cc_delegate", { task: "hang" });
+  await waitFor(() => {
+    const jobs = listJobs(workspace);
+    return jobs.find((j) => j.status === "running");
+  }, 5000);
+
+  const cancel1 = await server.send(2, "cc_cancel");
+  assert.match(cancel1.result.content[0].text, /cancelled/i);
+
+  // Second cancel on the already-cancelled job should not error
+  const cancel2 = await server.send(3, "cc_cancel");
+  // It should say "not running" or similar — not crash
+  assert.ok(cancel2.result || cancel2.error);
+
+  await delegate.catch(() => {});
+});
+
+test("cc_cancel on already-completed job reports honestly without lying", async (t) => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-cancel-done-"));
+  const server = startServer(t, { workspace });
+
+  // Run a quick successful job
+  const result = await server.send(1, "cc_delegate", { task: "success" });
+  assert.match(result.result.content[0].text, /Task Completed/);
+
+  // Cancel the completed job — should report "not running"
+  const cancel = await server.send(2, "cc_cancel");
+  assert.match(cancel.result.content[0].text, /not running|already|Cannot cancel|No active/i);
+});
+
+test("graceful shutdown drains foreground processes before releasing writer lease", async (t) => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-shutdown-drain-"));
+  const childPidFile = path.join(workspace, "tree-child.pid");
+  // No FAKE_CLAUDE_MODE env: the task text "hang-tree" becomes the mode via stdin.
+  // TREE_CHILD_PID_FILE is still needed in the env (inherited by the fake Claude).
+  const server = startServer(t, {
+    workspace,
+    env: { TREE_CHILD_PID_FILE: childPidFile },
+  });
+
+  const delegate = server.send(1, "cc_delegate", { task: "hang-tree" });
+  await waitFor(() => fs.existsSync(childPidFile), 5000);
+  const descendantPid = Number(fs.readFileSync(childPidFile, "utf8"));
+  assert.ok(Number.isFinite(descendantPid));
+
+  // Verify lease is held
+  const leaseBefore = getWriterLeaseOwner(workspace);
+  assert.ok(leaseBefore, "Lease must be held during running job");
+
+  // Send SIGTERM to trigger graceful shutdown
+  server.child.kill("SIGTERM");
+
+  // Wait for companion to exit
+  await waitFor(() => server.child.exitCode !== null || server.child.signalCode !== null, 10000);
+
+  // After shutdown, the descendant process must be dead (drained before lease release)
+  await waitFor(() => {
+    try { process.kill(descendantPid, 0); return false; } catch { return true; }
+  }, 5000);
+
+  // And the lease must be released
+  const leaseAfter = getWriterLeaseOwner(workspace);
+  assert.equal(leaseAfter, null, "Writer lease must be released after graceful shutdown");
+
+  await delegate.catch(() => {});
+});
+
 // ─── P2: Background not advertised in tool description ──────────────────────
 
 test("cc_delegate tool description does not encourage background=true usage", async (t) => {
@@ -2305,7 +2506,7 @@ test("unversioned persisted jobs migrate and scrub task content before cc_check"
 
   const job = listJobs(workspace).find((entry) => entry.id === "cc-unversioned");
   assert.ok(job);
-  assert.equal(job.version, 7);
+  assert.equal(job.version, 8);
   assert.doesNotMatch(JSON.stringify(job), /UNVERSIONED_TASK_LEAK_MARKER_5531/);
   assert.equal(job.taskRef, "sha256:aaaaaaaaaaaa");
 
@@ -2340,7 +2541,7 @@ test("v6 route snapshots are cleared because their provenance is no longer trust
 
     const job = listJobs(workspace).find((entry) => entry.id === "cc-legacy-route");
     assert.ok(job);
-    assert.equal(job.version, 7);
+    assert.equal(job.version, 8);
     assert.equal(job.routeSnapshot, null);
     assert.equal(job.selectorKind, null);
     assert.equal(job.routeStatus, null);

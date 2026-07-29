@@ -43,13 +43,15 @@ export function runClaude(task, options = {}) {
     dangerouslySkipPermissions: options.dangerouslySkipPermissions === true,
     resume: options.resume === true,
     resumeSession: options.resumeSession || null,
+    sessionId: options.sessionId || null,
     timeoutMs,
     maxCaptureBytes,
     command,
     childEnv: options.childEnv || null,
     routeSnapshot: options.routeSnapshot || null,
     cliVersion: options.cliVersion || null,
-    maxBudgetUsd: options.maxBudgetUsd || null
+    maxBudgetUsd: options.maxBudgetUsd || null,
+    inlineSettings: options.inlineSettings || null
   };
 
   // Spawn watchdog with IPC channel for control.
