@@ -23,6 +23,8 @@ Send a coding task to Claude Code for execution. Claude Code runs in a separate 
    - `resume`: set to `true` only when the user explicitly asks to preserve the same/latest Claude Code conversation. It resumes the last completed plugin job in this workspace that has a claudeSessionId. Cannot be combined with resumeSession.
    - `resumeSession`: pass a session ID only when the user explicitly identifies the Claude Code conversation to preserve (adds `--resume <id>`). Cannot be combined with resume.
    - `autoCompact` (optional): temporary auto-compact policy for this delegation. Injects two env keys via Claude CLI inline `--settings` (no writes to permanent config). See the Auto-Compact section below.
+   - `continuationPlan` (optional): planId from `cc_plan_continuation`. Enforces the chosen continuation action: `fresh_handoff` forbids resume flags; `resume`/`compact_resume` target the exact parent session. Single-use; replay, expiry, or binding mismatch (cwd/model/write) fails closed.
+   - `maxBudgetUsd` (optional): positive maximum budget in USD (≤ 1000) passed through to the CLI budget guard (`--max-budget-usd`). When supplied but the CLI lacks `--max-budget-usd`, the call fails closed before any Provider call. Omit to run without an explicit budget cap.
 
    Call the registered `cc_delegate` MCP tool directly. You may announce the delegation once before the tool call, then remain silent while it is pending. Do not manually start `cc-companion.mjs`, wrap it in a shell/PTY, or emit periodic "still running" commentary. If the registered `cc_*` tools are unavailable, use the setup workflow and ask the user to restart or open a new task; never emulate delegation with a polling fallback.
 
@@ -66,14 +68,24 @@ Do not call `cc_list_models` before ordinary delegation — it does not enumerat
 
 Task continuity does not require conversation continuity. The workspace, git diff, tests, and project instructions are the authoritative state for review-and-fix work.
 
-For ordinary follow-ups such as "keep going", "continue", "fix the review findings", or another review/fix round:
+For follow-ups such as "keep going", "continue", "fix the review findings", or another review/fix round:
 
-- start a fresh Claude Code session by omitting both resume flags;
-- give Claude Code a bounded handoff with only the current objective, actionable findings, still-valid constraints, and acceptance checks;
-- tell Claude Code to inspect the current workspace and git diff as primary evidence;
-- do not paste the full prior transcript, full diff, or verbose logs into the handoff.
+1. **Call `cc_plan_continuation` first**, after classifying the follow-up:
+   - `parentJob`: use the exact prior plugin job whenever known. Use `parentSession` only when the user identifies a Claude session directly.
+   - `relationship`: `same_attempt` for fixing/retrying the same acceptance target; `same_goal` for another slice of the same outcome; `next_step` for a dependent but distinct stage; `unrelated` when the old reasoning is irrelevant; `unknown` only when inspection cannot resolve it.
+   - `contextValue`: `essential` when decisions/reasoning cannot be reconstructed cheaply from the workspace; `useful` when reuse saves meaningful reading; `reconstructable` when current files, diff, tests, and rules are sufficient.
+   - `userIntent`: `same_session` only for an explicit request to preserve the conversation; `fresh` only for an explicit fresh-start request; otherwise `auto`.
+   - `correctionCount`: number of completed correction/rework rounds for this same target, including the immediately preceding failed correction.
+   - `allowCompact`: false if the user forbids compaction or the next action is time-critical; otherwise true.
+   - `model` and `write`: the exact values you will pass to the next `cc_delegate` (`null`/omitted model means inherited). A mismatch at execution fails closed.
+   - `sessionPollution`: true only when the session contains substantial obsolete, conflicting, or unrelated work. Do not guess drift flags; the plugin derives workspace/CLI/tool drift and merges any concrete caller evidence.
+2. **Read `structuredContent.action` and execute exactly once:**
+   - `resume`: call `cc_delegate` with `continuationPlan=planId`; do not add resume flags.
+   - `compact_resume`: call `cc_compact` with the same `continuationPlan`, then call `cc_delegate` with that same plan. If no new compact boundary is observed, the plan safely falls back to Resume; if compact fails, re-plan.
+   - `fresh_handoff`: fill the returned bounded `handoffTemplate`, then call `cc_delegate` with `continuationPlan=planId` and no resume flags.
+3. **Re-plan instead of improvising** when the plan expires, is replayed, or a bound input changes. Without a plan, delegation starts a fresh session.
 
-Use this concise shape and omit empty sections:
+When the plan returns `fresh_handoff`, give Claude Code a bounded handoff with only the current objective, actionable findings, still-valid constraints, and acceptance checks. Use this concise shape (omit empty sections):
 
 ```text
 Objective
@@ -91,21 +103,23 @@ Acceptance checks
 Inspect the current workspace and git diff as primary evidence before editing.
 ```
 
+Do not paste the full prior transcript, full diff, or verbose logs into the handoff.
+
 Resume is an explicit conversation-preservation operation, not the default continuation strategy:
 
-- "continue the same/latest Claude Code conversation" → `cc_delegate` with `resume=true`
+- "continue the same/latest Claude Code conversation" → `cc_plan_continuation` with `userIntent: "same_session"`, then `cc_delegate` with the `planId`
 - "resume Claude Code session abc123" → `cc_delegate` with `resumeSession="abc123"`
-- ambiguous "continue" or "keep going" → fresh session with a bounded handoff
-- "fresh start" → fresh session without resume flags
+- ambiguous "continue" or "keep going" → `cc_plan_continuation` with `userIntent: "auto"`, then follow the plan
+- "fresh start" → `cc_plan_continuation` with `userIntent: "fresh"`, then `cc_delegate` with the `planId`
 
 ## Examples
 
 - "Have Claude Code implement the auth middleware"
 - "Delegate the CSS fix to Claude Code"
 - "Ask Claude Code to refactor the database layer"
-- "Continue the same latest Claude Code conversation" → `resume=true`
+- "Continue the same latest Claude Code conversation" → plan with `userIntent:"same_session"` and consume the returned action
 - "Resume Claude Code session cc-abc123" → `resumeSession="..."`
-- "Fix these review findings and rerun the tests" → fresh session with a bounded handoff
+- "Fix these review findings and rerun the tests" → classify as `same_attempt`, use `userIntent:auto`, and follow the returned plan
 
 ## Auto-Compact
 

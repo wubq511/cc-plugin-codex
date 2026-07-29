@@ -633,15 +633,16 @@ test("collectCompactBoundary returns null for no boundary", async () => {
   }
 });
 
-// ─── tools/list includes cc_compact (8th tool) ───────────────────────────────
+// ─── tools/list includes cc_compact and cc_plan_continuation (9 tools) ──────
 
-test("tools/list returns 8 tools including cc_compact", async (t) => {
+test("tools/list returns 9 tools including cc_compact and cc_plan_continuation", async (t) => {
   const server = startServer(t);
   const result = await server.request(1, "tools/list", {});
   const tools = result.result.tools;
-  assert.equal(tools.length, 8, "Must expose 8 tools");
+  assert.equal(tools.length, 9, "Must expose 9 tools");
   const names = tools.map((t) => t.name);
   assert.ok(names.includes("cc_compact"), "cc_compact must be in tools/list");
+  assert.ok(names.includes("cc_plan_continuation"), "cc_plan_continuation must be in tools/list");
 });
 
 // ─── Cancel preserves claudeSessionId and autoCompact policy ─────────────────

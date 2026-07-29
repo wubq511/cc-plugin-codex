@@ -93,17 +93,58 @@ if (args.includes("--help") || args.includes("-h")) {
     helpLines.push("  --max-budget-usd     Maximum budget in USD (budget guard)");
   }
   process.stdout.write(helpLines.join("\n") + "\n");
-  process.exit(0);
+  process.exit(Number(process.env.FAKE_CLAUDE_HELP_EXIT_CODE || 0));
 }
 
 function success(result = "fake result") {
   const execModel = process.env.EXEC_MODEL || "mimo-v2.5";
+  const highPressure = process.env.FAKE_USAGE_PROFILE === "high";
+  const lastIteration = highPressure
+    ? {
+        input_tokens: 20000,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 140000,
+        output_tokens: 1000,
+        type: "message",
+      }
+    : {
+        input_tokens: 1000,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 10000,
+        output_tokens: 500,
+        type: "message",
+      };
   process.stdout.write(JSON.stringify({
     result,
     session_id: "fake-session",
     total_cost_usd: 0.01,
     duration_ms: 25,
-    modelUsage: { [execModel]: {} }
+    num_turns: 2,
+    usage: {
+      input_tokens: lastIteration.input_tokens + 500,
+      cache_creation_input_tokens: lastIteration.cache_creation_input_tokens,
+      cache_read_input_tokens: lastIteration.cache_read_input_tokens + 1000,
+      output_tokens: lastIteration.output_tokens + 100,
+      iterations: [
+        {
+          input_tokens: 500,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 1000,
+          output_tokens: 100,
+          type: "message",
+        },
+        lastIteration,
+      ],
+    },
+    modelUsage: {
+      [execModel]: {
+        inputTokens: lastIteration.input_tokens + 500,
+        cacheCreationInputTokens: lastIteration.cache_creation_input_tokens,
+        cacheReadInputTokens: lastIteration.cache_read_input_tokens + 1000,
+        outputTokens: lastIteration.output_tokens + 100,
+        contextWindow: 200000,
+      },
+    }
   }));
 }
 

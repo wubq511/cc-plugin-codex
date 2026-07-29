@@ -27,10 +27,10 @@ test("delegate skill rejects background=true and keeps tasks pending", () => {
   assert.match(skill, /stdin.*never argv/);
 });
 
-test("delegate follow-ups use fresh sessions with bounded handoffs by default", () => {
+test("delegate follow-ups call cc_plan_continuation first for evidence-based choice", () => {
   const skill = fs.readFileSync(path.join(pluginRoot, "skills", "delegate", "SKILL.md"), "utf8");
   assert.match(skill, /Task continuity does not require conversation continuity/);
-  assert.match(skill, /ambiguous "continue" or "keep going" → fresh session with a bounded handoff/);
+  assert.match(skill, /Call `cc_plan_continuation` first/);
   assert.match(skill, /objective, actionable findings, still-valid constraints, and acceptance checks/);
   assert.match(skill, /inspect the current workspace and git diff as primary evidence/i);
   assert.match(skill, /do not paste the full prior transcript, full diff, or verbose logs/i);
@@ -39,10 +39,12 @@ test("delegate follow-ups use fresh sessions with bounded handoffs by default", 
 
 test("MCP guidance reserves resume for explicit conversation preservation", () => {
   const server = fs.readFileSync(path.join(pluginRoot, "scripts", "cc-companion.mjs"), "utf8");
-  assert.match(server, /Follow-up and review-fix work starts a fresh Claude Code session by default/);
+  // New: follow-up work should call cc_plan_continuation first.
+  assert.match(server, /call cc_plan_continuation first/);
   assert.match(server, /Use resume only when the user explicitly requests preservation of the same Claude Code conversation/);
-  assert.match(server, /ordinary follow-up and review-fix work, start a fresh Claude Code session with a bounded handoff/);
   assert.doesNotMatch(server, /Use resume=true to continue the last Claude Code session/);
+  // Old "always Fresh" text must not remain.
+  assert.doesNotMatch(server, /ordinary follow-up and review-fix work, start a fresh Claude Code session with a bounded handoff/);
 });
 
 test("MCP guidance forbids periodic commentary and manual polling fallbacks", () => {

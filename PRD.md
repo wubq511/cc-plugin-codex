@@ -100,7 +100,7 @@ cc-plugin-codex/
 
 ## 4. MCP 工具定义
 
-插件暴露 8 个工具：`cc_delegate`、`cc_resolve_route`、`cc_list_models`、`cc_check`、`cc_cancel`、`cc_review`、`cc_setup`、`cc_compact`。所有会读取或修改 job/workspace 状态的工具都必须接收当前用户工作区的绝对路径 `cwd`；`cc_resolve_route` 是无状态例外，`cc_list_models.cwd` 可选但一旦提供也执行同样校验。MCP server 自身运行在插件安装 cache 中，不能用 `process.cwd()` 推断用户项目；缺失、相对或无效的必填 `cwd` 必须直接报错，不能静默回退到 cache。
+插件暴露 9 个工具：`cc_delegate`、`cc_resolve_route`、`cc_list_models`、`cc_check`、`cc_cancel`、`cc_review`、`cc_setup`、`cc_compact`、`cc_plan_continuation`。所有会读取或修改 job/workspace 状态的工具都必须接收当前用户工作区的绝对路径 `cwd`；`cc_resolve_route` 是无状态例外，`cc_list_models.cwd` 可选但一旦提供也执行同样校验。MCP server 自身运行在插件安装 cache 中，不能用 `process.cwd()` 推断用户项目；缺失、相对或无效的必填 `cwd` 必须直接报错，不能静默回退到 cache。
 
 ### 4.1 `cc_delegate` — 分派编码任务
 
@@ -121,6 +121,8 @@ cc-plugin-codex/
 | `resume` | boolean | ❌ | `false` | 仅在用户明确要求保留同一个 Claude Code 会话时，恢复当前工作区最近完成任务的 Claude session |
 | `resumeSession` | string | ❌ | — | 仅在用户明确指定 Claude session 时恢复该会话；不能与 `resume` 同时使用 |
 | `autoCompact` | object\|null | ❌ | — | 只对指定 delegation/session/task 生效的临时压缩策略；`null` 用于显式恢复会话时清除 session 策略 |
+| `continuationPlan` | string | ❌ | — | `cc_plan_continuation` 返回的一次性 planId；强制执行所选 action，并绑定 cwd/model/write/parent session |
+| `maxBudgetUsd` | number | ❌ | — | 单次 Provider 调用预算上限，必须 `> 0` 且 `<= 1000`；CLI 不支持该能力时在调用前 fail closed |
 
 **行为：**
 
@@ -155,10 +157,11 @@ cc-plugin-codex/
 
 **后续任务的上下文策略：**
 
-- 审查修复、普通“继续”或下一轮实现默认不传 `resume` / `resumeSession`，开启新 Claude Code 会话。
-- Codex 传递有界交接包：当前目标、可执行发现、仍有效约束、验收命令，并要求 Claude Code 以当前工作区和 git diff 为主要证据。
-- 不复制完整旧会话、完整 diff 或冗长日志；这些内容由 Claude Code 在工作区中按需读取。
-- 只有用户明确要求保留同一个 Claude Code 对话，或明确指定 session ID，才使用 resume。
+- Codex 对非平凡 follow-up 先调用 `cc_plan_continuation`，再消费其一次性 `planId`，只在 Resume、Compact+Resume、Fresh+handoff 中选择。
+- 显式 `fresh` 必须 Fresh；显式 `same_session` 只能 Resume 或 Compact+Resume；`auto` 根据任务关系、上下文价值、重复返工、会话污染、workspace/model/CLI/tool drift 和可靠压力证据选择。
+- 同一尝试或同一目标、上下文仍有价值且没有 drift 时优先 Resume；弱关联、可从工作区重建、重复纠错或环境漂移时 Fresh。
+- 只有最后一次可用 API 迭代的 token 用量与 Provider `contextWindow` 组成可靠证据；多轮累计账单用量不能冒充当前上下文。可靠压力达到有效阈值且 warm cache 存在时才选择 Compact+Resume；证据不完整不猜 Compact。
+- Fresh 使用有界交接包：当前目标、可执行发现、仍有效约束、验收命令；不复制完整旧会话、完整 diff 或冗长日志。
 - 不使用 `--fork-session` 解决成本问题，因为它会继承被恢复会话的历史，只改变后续 session ID。
 
 **临时自动压缩策略：**
@@ -303,7 +306,7 @@ cc-plugin-codex/
 
 ### 4.7 `cc_compact` — 主动压缩已停止会话
 
-**输入 Schema：** 必填绝对路径 `cwd`；可选 `job` 或 `resumeSession`。显式 `resumeSession` 优先于 `job`。
+**输入 Schema：** 必填绝对路径 `cwd`；可选 `job`、`resumeSession`、`continuationPlan`、`maxBudgetUsd`。显式 `resumeSession` 优先于 `job`；提供 `continuationPlan` 时必须是 `compact_resume` action。
 
 **行为：**
 
@@ -312,7 +315,19 @@ cc-plugin-codex/
 3. 对目标 session 运行只读前台 `claude --print --resume <sessionId> ...`，并将 `/compact` 通过 stdin 传入；不使用 `--session-id`。
 4. session/task 临时 auto-compact settings 会重放，delegation-only settings 不重放。
 5. 只有本次调用后新增的 canonical `type:"system", subtype:"compact_boundary"` 才返回 `compacted:true`；历史 boundary、summary marker 或普通成功退出都不能伪装为压缩成功。
-6. 将有界、非敏感的 `compactResult` 写回 job；随后可用同一 `resumeSession` 继续会话。
+6. 将有界、非敏感的 `compactResult`（含本次 compact 的 cost/duration）写回 job，并在 `structuredContent` 返回 `compacted`、boundary、cost、duration、reason；随后可用同一 `resumeSession` 继续会话。
+
+### 4.8 `cc_plan_continuation` — 三选一延续规划
+
+**输入 Schema：** 必填 `cwd`、`relationship`（`same_attempt|same_goal|next_step|unrelated|unknown`）、`contextValue`（`essential|useful|reconstructable`）、`userIntent`（`auto|same_session|fresh`）、`correctionCount`、`allowCompact`、`write`；可选 `parentJob`、`parentSession`、`model`、`sessionPollution` 和 bounded `drift` 信号。
+
+**行为：**
+
+1. 从持久化 job 解析 canonical parent session，并拒绝 job/session/cwd 不一致；MCP 重启后显式 `same_session` 可据此重新规划。
+2. 合并调用者 drift 与插件实测的 workspace fingerprint、Claude CLI 版本、model 和 write/tool profile 漂移。
+3. 读取仅存于当前 MCP 进程的上一轮证据。压力 token 优先取最后一个可用 `usage.iterations`；仅单轮运行可使用 aggregate usage。Provider `modelUsage.contextWindow` 一致时采用，否则仅可退回用户声明且未验证的 autoCompact window。
+4. 返回 `resume`、`compact_resume` 或 `fresh_handoff`，以及 `reasonCodes`、`evidenceState`、`fallbackAction`、压力信息和一次性 `planId` 的 `structuredContent`。
+5. plan 15 分钟过期，容量有界，且绑定 cwd、parent job/session、action、model、write。未知、过期、重放或绑定不匹配全部 fail closed；Compact+Resume 严格执行 `issued → compacted → consumed`。
 
 ## 5. Skills 定义
 
@@ -394,7 +409,7 @@ cc-plugin-codex/
 1. 从 stdin 读取 JSON-RPC 消息（换行分隔）
 2. 处理 `initialize` → 返回 capabilities（tools）
 3. 处理 `initialized` 通知
-4. 处理 `tools/list` → 返回 8 个工具定义（含只读 `cc_resolve_route` 与主动压缩 `cc_compact`）
+4. 处理 `tools/list` → 返回 9 个工具定义（含只读 `cc_resolve_route`、主动压缩 `cc_compact` 与延续规划 `cc_plan_continuation`）
 5. 处理 `tools/call` → Promise-aware 路由到对应 handler；pending delegate 不阻塞后续消息
 6. 处理 `notifications/cancelled` → 取消对应 pending job 与进程树，并抑制迟到的正常响应
 7. 结果写入 stdout（JSON-RPC response）

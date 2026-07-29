@@ -22,7 +22,11 @@
  */
 
 import { spawn } from "node:child_process";
-import { extractUsageModelKeys } from "../lib/model-evidence.mjs";
+import {
+  extractContextWindow,
+  extractUsageModelKeys,
+  extractUsageTokens,
+} from "../lib/model-evidence.mjs";
 import { resolveCommandForSpawn, terminateProcessTree } from "../lib/process.mjs";
 import {
   buildFailureEnvelope,
@@ -481,6 +485,12 @@ async function main() {
       // Extract ALL usage model keys (not just first), with sanitization
       const usageModelKeys = extractUsageModelKeys(parsed.modelUsage);
 
+      // Extract per-round token usage for the continuation planner. Best-effort:
+      // null when the Provider did not report token counts. Never persisted to
+      // state/artifacts/logs — lives only in the in-memory result envelope.
+      const usageTokens = extractUsageTokens(parsed);
+      const contextWindow = extractContextWindow(parsed);
+
       // Honest cost: null when the Provider did not report total_cost_usd.
       // Never coerce absent telemetry to 0 — that would display as "$0.00"
       // and mislead callers into thinking the probe was free.
@@ -496,6 +506,8 @@ async function main() {
         cost: honestCost,
         duration: parsed.duration_ms ? parsed.duration_ms / 1000 : null,
         usageModelKeys,
+        usage: usageTokens,
+        contextWindow,
         exitCode: 0
       });
       exitWith(0);

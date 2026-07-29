@@ -139,6 +139,42 @@ codex plugin add cc-plugin-codex
 
 `cc_compact` 对已停止的 Claude Code 会话运行只读前台 `/compact`。调用前先记录 transcript 文件游标；只有本次调用后新增的 canonical `compact_boundary` 才 `compacted:true`，历史 boundary 与 `isCompactSummary` 都不算。按 job 或显式 session 选择时都会拒绝 active/cancelling；session/task 临时策略会重放，delegation 策略不会。消息不足或证据读取失败返回 `false` + 原因，`observedBoundary` 未观察到时为 null。
 
+### 延续规划（三选一）
+
+```
+/claude:delegate  →  cc_plan_continuation  →  cc_delegate / cc_compact
+```
+
+`cc_plan_continuation` 是只读工具（零模型调用），基于上一轮的内存 token 用量证据，在
+`resume`、`compact_resume`、`fresh_handoff` 三种延续策略中选择，并返回一次性 `planId`。
+计划和上下文遥测仅存在于当前 MCP 进程中，不写入 state/artifact/log。进程重启后旧
+`planId` 失效；但显式 `same_session` 可以通过持久化 job 找回 canonical session，
+重新生成一个可执行的 Resume 计划。
+
+决策优先级：显式 `fresh` → Fresh；显式 `same_session` 永不 Fresh；`auto` 下根据
+`relationship`、`contextValue`、`correctionCount`、drift、会话污染和上下文压力
+（`≥ 75%` 且 `cache_read > 0` → Compact+Resume）决定。插件会自行核对 workspace、
+Claude CLI 版本和 write/tool profile 漂移，并与调用者提供的 drift 信号合并。压力使用
+上一轮最后一次可用 API 迭代的 token 用量及 Provider 报告的 `contextWindow`；多轮累计
+账单用量不会冒充当前上下文。证据不完整时不猜 Compact。将 `planId` 作为
+`continuationPlan` 传给 `cc_delegate` 或 `cc_compact` 即可执行所选动作并防止重放。
+
+仓库提供独立校准器，只通过 source MCP 执行三条策略，不直接启动 Claude：
+
+```bash
+# 零费用：必须让 PATH 中的 claude 指向测试 fake
+node plugins/cc-plugin-codex/scripts/calibrate-continuation.mjs --dry-run
+
+# 真实付费：累计授权硬上限 $4.90，不自动重试
+node plugins/cc-plugin-codex/scripts/calibrate-continuation.mjs --confirm-paid-calibration --model=Haiku
+```
+
+干净运行使用 6 次受限调用（2 个 seed、3 个 follow-up、1 个 compact）；Fresh 从
+post-seed 文件快照启动但没有旧 Claude session。每次调用在发出前预留 $0.70，失败也
+不退还预留；中断后续跑必须显式传入 `--prior-reserved-usd` 与
+`--prior-paid-calls`，确保跨进程仍不突破总上限。一次校准只能作为方向性证据，不能
+单独重设 75% pressure 阈值。
+
 ### 环境检查
 
 ```
@@ -158,11 +194,11 @@ liveness probe。
 
 ## MCP 工具
 
-插件通过 MCP server 暴露 8 个工具，供 Codex 直接调用：
+插件通过 MCP server 暴露 9 个工具，供 Codex 直接调用：
 
 | 工具 | 说明 |
 |------|------|
-| `cc_delegate` | 分派编码任务给 Claude Code（默认继承 Provider 配置，支持 alias/native 模型路由、autoCompact 临时压缩策略） |
+| `cc_delegate` | 分派编码任务给 Claude Code（默认继承 Provider 配置，支持 alias/native 模型路由、autoCompact 临时压缩策略、continuationPlan 延续计划） |
 | `cc_resolve_route` | 只读模型路由解析器（不发起模型调用，不枚举 Provider 模型） |
 | `cc_list_models` | 报告模型解析行为和最近完成任务的模型证据信息 |
 | `cc_check` | 查看任务状态/结果 |
@@ -170,6 +206,7 @@ liveness probe。
 | `cc_review` | 审查代码变更 |
 | `cc_setup` | 环境检查（静态零模型调用 + 可选付费 liveness probe） |
 | `cc_compact` | 对已停止的 Claude Code 会话运行只读 /compact，诚实报告是否跨越压缩边界 |
+| `cc_plan_continuation` | 只读证据延续规划器（零模型调用，基于上一轮 token 用量选择 resume/compact_resume/fresh_handoff） |
 
 ## 项目结构
 

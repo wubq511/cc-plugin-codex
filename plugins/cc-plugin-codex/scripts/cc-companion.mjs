@@ -72,6 +72,7 @@ import {
   collectCompactBoundary,
 } from "./lib/compact-boundary.mjs";
 import { isValidSessionId } from "./lib/model-evidence-shared.mjs";
+import { createPlanner, ACTIONS } from "./lib/continuation-planner.mjs";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -82,6 +83,71 @@ const MAX_JOB_RESULT_BYTES = 32 * 1024; // keep complete job metadata below 64 K
 const MAX_ERROR_MESSAGE_BYTES = 8 * 1024;
 const MAX_TOUCHED_FILES = 500;
 const MAX_TOUCHED_FILES_BYTES = 16 * 1024;
+const MAX_BUDGET_USD_CAP = 1000;
+
+// In-memory continuation planner. One instance per MCP server process.
+// Token telemetry and plans live only here — restart loses them, and nothing
+// is written to state, artifacts, or logs. Persisted jobs still allow an
+// explicit same-session request to recover its canonical session and re-plan.
+const continuationPlanner = createPlanner();
+
+// ─── Budget Guard ─────────────────────────────────────────────────────────────
+
+/**
+ * Read `claude --help` once through the same cross-platform command resolution
+ * used by execution. A non-zero exit is never accepted as capability evidence.
+ */
+function readClaudeHelp(cwd) {
+  try {
+    const resolved = resolveCommandForSpawn("claude", ["--help"]);
+    const helpResult = spawnSync(resolved.command, resolved.args, {
+      cwd,
+      encoding: "utf8",
+      timeout: 10000,
+      stdio: "pipe",
+      shell: resolved.shell,
+      windowsHide: true,
+    });
+    return {
+      ok: helpResult.status === 0,
+      text: `${helpResult.stdout || ""}\n${helpResult.stderr || ""}`,
+    };
+  } catch {
+    return { ok: false, text: "" };
+  }
+}
+
+/**
+ * Check whether the Claude CLI supports --max-budget-usd by inspecting --help.
+ * Zero model calls. Returns true only when a successful help invocation
+ * explicitly recognizes the flag.
+ */
+function checkBudgetGuardSupported(cwd) {
+  const help = readClaudeHelp(cwd);
+  return help.ok && /--max-budget-usd\b/.test(help.text);
+}
+
+/**
+ * Validate an optional maxBudgetUsd parameter and enforce the budget guard.
+ * Returns { ok: true, value: number|null } or { ok: false, error: string }.
+ */
+function validateMaxBudgetUsd(params, cwd) {
+  const v = params.maxBudgetUsd;
+  if (v === undefined || v === null) return { ok: true, value: null };
+  if (!Number.isFinite(v) || v <= 0) {
+    return { ok: false, error: `maxBudgetUsd must be a positive number, received: ${v}` };
+  }
+  if (v > MAX_BUDGET_USD_CAP) {
+    return { ok: false, error: `maxBudgetUsd must not exceed ${MAX_BUDGET_USD_CAP} (safety cap), received: ${v}` };
+  }
+  if (!checkBudgetGuardSupported(cwd)) {
+    return {
+      ok: false,
+      error: "maxBudgetUsd was requested but the Claude CLI does not support --max-budget-usd. The budget guard is required before a Provider call (fail-closed). Update Claude Code or omit maxBudgetUsd.",
+    };
+  }
+  return { ok: true, value: v };
+}
 
 // ─── MCP Protocol ───────────────────────────────────────────────────────────
 
@@ -175,10 +241,10 @@ function validateToolArgs(toolName, params) {
   // Reject unknown properties and validate types
   const schemas = {
     cc_delegate: {
-      allowed: new Set(["cwd", "task", "write", "background", "model", "effort", "dangerouslySkipPermissions", "timeoutSeconds", "resume", "resumeSession", "autoCompact"]),
+      allowed: new Set(["cwd", "task", "write", "background", "model", "effort", "dangerouslySkipPermissions", "timeoutSeconds", "resume", "resumeSession", "autoCompact", "maxBudgetUsd", "continuationPlan"]),
       required: ["cwd", "task"],
       booleans: ["write", "background", "dangerouslySkipPermissions", "resume"],
-      strings: ["cwd", "task", "model", "effort", "resumeSession"],
+      strings: ["cwd", "task", "model", "effort", "resumeSession", "continuationPlan"],
       integers: ["timeoutSeconds"],
       enums: { effort: ["low", "medium", "high", "xhigh", "max"] }
     },
@@ -218,10 +284,23 @@ function validateToolArgs(toolName, params) {
       strings: ["selector"]
     },
     cc_compact: {
-      allowed: new Set(["cwd", "job", "resumeSession"]),
+      allowed: new Set(["cwd", "job", "resumeSession", "maxBudgetUsd", "continuationPlan"]),
       required: ["cwd"],
-      strings: ["cwd", "job", "resumeSession"]
-    }
+      strings: ["cwd", "job", "resumeSession", "continuationPlan"]
+    },
+    cc_plan_continuation: {
+      allowed: new Set(["cwd", "parentJob", "parentSession", "relationship", "contextValue", "userIntent", "correctionCount", "allowCompact", "model", "write", "drift", "sessionPollution"]),
+      required: ["cwd", "relationship", "contextValue", "userIntent", "correctionCount", "allowCompact", "write"],
+      booleans: ["allowCompact", "write", "sessionPollution"],
+      strings: ["cwd", "parentJob", "parentSession", "model", "userIntent", "relationship", "contextValue"],
+      integers: ["correctionCount"],
+      objects: ["drift"],
+      enums: {
+        relationship: ["same_attempt", "same_goal", "next_step", "unrelated", "unknown"],
+        contextValue: ["essential", "useful", "reconstructable"],
+        userIntent: ["auto", "same_session", "fresh"],
+      },
+    },
   };
 
   const schema = schemas[toolName];
@@ -279,6 +358,27 @@ function validateToolArgs(toolName, params) {
       const val = params[key];
       if (val !== undefined && val !== null && !allowed.includes(val)) {
         throw new Error(`${key} must be one of [${allowed.join(", ")}], got "${val}".`);
+      }
+    }
+  }
+
+  // Validate object types (reject strings, numbers, booleans)
+  if (schema.objects) {
+    for (const key of schema.objects) {
+      const val = params[key];
+      if (val !== undefined && val !== null && (typeof val !== "object" || Array.isArray(val))) {
+        throw new Error(`${key} must be an object, got ${Array.isArray(val) ? "array" : typeof val}.`);
+      }
+    }
+  }
+  if (toolName === "cc_plan_continuation" && params.drift) {
+    const allowedDriftKeys = new Set(["workspace", "cli", "tool"]);
+    for (const [key, value] of Object.entries(params.drift)) {
+      if (!allowedDriftKeys.has(key)) {
+        throw new Error(`Unknown drift signal "${key}".`);
+      }
+      if (typeof value !== "boolean") {
+        throw new Error(`drift.${key} must be a boolean, got ${typeof value}.`);
       }
     }
   }
@@ -519,7 +619,7 @@ const CWD_SCHEMA = {
 const TOOLS = [
   {
     name: "cc_delegate",
-    description: "Delegate a coding task to Claude Code. All tasks keep one foreground tool call pending and return automatically on completion. Call this registered tool directly: while it is pending, do not manually launch the MCP server, poll, or emit periodic 'still running' commentary. background=true is deprecated and rejected. Task prompts are sent via stdin for privacy. Follow-up and review-fix work starts a fresh Claude Code session by default: omit resume flags and pass a bounded handoff containing the objective, actionable findings, constraints, and acceptance checks. Use resume only when the user explicitly requests preservation of the same Claude Code conversation. By default, delegation inherits the user's current Claude Code Provider and model configuration — do not pass --model unless the user explicitly names one.",
+    description: "Delegate a coding task to Claude Code. All tasks keep one foreground tool call pending and return automatically on completion. Call this registered tool directly: while it is pending, do not manually launch the MCP server, poll, or emit periodic 'still running' commentary. background=true is deprecated and rejected. Task prompts are sent via stdin for privacy. For follow-up and review-fix work, call cc_plan_continuation first and pass the returned planId as continuationPlan: the plan enforces the chosen action (resume, compact_resume, or fresh_handoff) and prevents replay. Without a plan, delegation starts a fresh session by default. Use resume only when the user explicitly requests preservation of the same Claude Code conversation. By default, delegation inherits the user's current Claude Code Provider and model configuration — do not pass --model unless the user explicitly names one.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -545,7 +645,9 @@ const TOOLS = [
             taskScopeId: { type: "string", description: "UUID for task-scope inheritance. Omit on the first full task policy to generate one. Carry the same UUID with scope=task on later delegations." },
             clear: { type: "boolean", const: true, description: "Only true is valid. With scope=task and taskScopeId UUID, clears that task policy without injecting settings." }
           }
-        }
+        },
+        maxBudgetUsd: { type: "number", description: "Optional positive maximum budget in USD (≤ 1000) for this delegation, passed through to the CLI budget guard (--max-budget-usd). When supplied but the CLI lacks --max-budget-usd, the call fails closed before any Provider call. Omit to run without an explicit budget cap.", exclusiveMinimum: 0, maximum: 1000 },
+        continuationPlan: { type: "string", description: "Optional planId from cc_plan_continuation. Enforces the chosen continuation action: fresh_handoff forbids resume flags; resume/compact_resume target the exact parent session. Single-use; replay, expiry, or binding mismatch (cwd/model/write) fails closed." }
       },
       required: ["cwd", "task"]
     }
@@ -636,16 +738,50 @@ const TOOLS = [
   },
   {
     name: "cc_compact",
-    description: "Run a read-only foreground /compact on a stopped Claude Code session. Captures a transcript cursor first and returns compacted=true only for a new compact_boundary appended by this invocation; historical boundaries and summary markers do not count. Explicit resumeSession is checked against active/cancelling jobs. Stored session/task autoCompact settings are replayed, delegation settings are not. No permanent Claude/Provider configuration is modified.",
+    description: "Run a read-only foreground /compact on a stopped Claude Code session. Captures a transcript cursor first and returns compacted=true only for a new compact_boundary appended by this invocation; historical boundaries and summary markers do not count. Explicit resumeSession is checked against active/cancelling jobs. Stored session/task autoCompact settings are replayed, delegation settings are not. When a compact_resume continuationPlan is supplied, enforces the issued → compacted → consumed lifecycle. No permanent Claude/Provider configuration is modified.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
         cwd: CWD_SCHEMA,
         job: { type: "string", description: "Job ID or prefix whose claudeSessionId to compact (default: latest stopped job)" },
-        resumeSession: { type: "string", description: "Explicit Claude session ID to compact. Takes precedence over job." }
+        resumeSession: { type: "string", description: "Explicit Claude session ID to compact. Takes precedence over job." },
+        maxBudgetUsd: { type: "number", description: "Optional positive maximum budget in USD (≤ 1000) for this compact invocation, passed through to the CLI budget guard (--max-budget-usd). When supplied but the CLI lacks --max-budget-usd, the call fails closed before any Provider call. Omit to run without an explicit budget cap.", exclusiveMinimum: 0, maximum: 1000 },
+        continuationPlan: { type: "string", description: "Optional planId from cc_plan_continuation with action=compact_resume. Enforces the compact lifecycle: issued → compacted → consumed. A non-compact_resume plan, replay, or expiry fails closed." }
       },
       required: ["cwd"]
+    }
+  },
+  {
+    name: "cc_plan_continuation",
+    description: "Evidence-based continuation planner (read-only, zero model calls). Selects between resume, compact_resume, and fresh_handoff for the next delegation using current-turn token evidence from the previous round. Returns a single-use planId bound to cwd/model/write/action. Call before cc_delegate or cc_compact when continuing prior work; the plan enforces the chosen action and prevents replay. Plans and token telemetry live only in the current MCP process; after restart, explicit same_session can recover the canonical session from persisted job state, while auto remains conservative without telemetry. Incomplete evidence never guesses Compact; multi-turn aggregate billing usage is never misrepresented as current context.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        cwd: CWD_SCHEMA,
+        parentJob: { type: "string", description: "Parent job ID for evidence lookup. When omitted, parentSession is used." },
+        parentSession: { type: "string", description: "Parent Claude session ID for evidence lookup." },
+        relationship: { type: "string", enum: ["same_attempt", "same_goal", "next_step", "unrelated", "unknown"], description: "How the next task relates to the parent." },
+        contextValue: { type: "string", enum: ["essential", "useful", "reconstructable"], description: "Value of the prior session's context for the next task." },
+        userIntent: { type: "string", enum: ["auto", "same_session", "fresh"], description: "User's explicit continuation preference. fresh → fresh_handoff; same_session never Fresh; auto uses evidence." },
+        correctionCount: { type: "integer", minimum: 0, description: "Number of prior correction rounds for this task." },
+        allowCompact: { type: "boolean", description: "Whether compaction is permitted for this continuation." },
+        model: { type: ["string", "null"], description: "Next-round model selector (null = inherited). Bound to the plan; a mismatched model at consumption fails closed." },
+        write: { type: "boolean", description: "Next-round write flag. Bound to the plan; a mismatched write at consumption fails closed." },
+        drift: {
+          type: "object",
+          additionalProperties: false,
+          description: "Optional caller-observed drift signals. The plugin also derives workspace/CLI/tool drift from in-process evidence. Any drift pushes auto toward fresh_handoff.",
+          properties: {
+            workspace: { type: "boolean" },
+            cli: { type: "boolean" },
+            tool: { type: "boolean" },
+          },
+        },
+        sessionPollution: { type: "boolean", description: "When true, the prior session is polluted and auto intent pushes toward fresh_handoff." }
+      },
+      required: ["cwd", "relationship", "contextValue", "userIntent", "correctionCount", "allowCompact", "write"]
     }
   }
 ];
@@ -789,8 +925,8 @@ async function handleDelegate(params, context = {}) {
   const effort = params.effort || null;
   const storedRequestedModel = model === null ? null : normalizeModelIdForStorage(model);
   const skipPerms = params.dangerouslySkipPermissions === true;
-  const resume = params.resume === true;
-  const resumeSession = params.resumeSession || null;
+  let resume = params.resume === true;
+  let resumeSession = params.resumeSession || null;
   if (params.resumeSession !== undefined && !isValidSessionId(params.resumeSession)) {
     return {
       content: [{
@@ -978,11 +1114,58 @@ async function handleDelegate(params, context = {}) {
   const childEnv = route.childEnv;
   const cliVersion = route.snapshot.cliVersion;
 
+  // ── Budget guard validation (fail-closed before Provider call) ──
+  // When maxBudgetUsd is requested but the CLI lacks --max-budget-usd, reject
+  // before any job creation or spawn. Omit maxBudgetUsd for uncapped runs.
+  const budgetValidation = validateMaxBudgetUsd(params, cwd);
+  if (!budgetValidation.ok) {
+    return {
+      content: [{ type: "text", text: `Error: ${budgetValidation.error}` }],
+      isError: true
+    };
+  }
+  const maxBudgetUsd = budgetValidation.value;
+
+  // ── Continuation plan consumption ──
+  // When a continuationPlan is supplied, consume it to enforce the chosen
+  // action and bind cwd/model/write. The plan sets resume/resumeSession:
+  //   fresh_handoff  → no resume flags, start a new session
+  //   resume         → resume the exact parent session
+  //   compact_resume → resume the exact parent session (after compact)
+  if (params.continuationPlan) {
+    try {
+      const consumed = continuationPlanner.consumeDelegatePlan(params.continuationPlan, {
+        cwd: workspaceRoot,
+        model,
+        write,
+        resume,
+        resumeSession,
+      });
+      if (consumed.action === ACTIONS.RESUME || consumed.action === ACTIONS.COMPACT_RESUME) {
+        resume = true;
+        resumeSession = consumed.parentSession;
+      } else {
+        // fresh_handoff — forbid any resume flags.
+        resume = false;
+        resumeSession = null;
+      }
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: ${err.message}` }],
+        isError: true
+      };
+    }
+  }
+
   // P0: Resume semantics — resolve resume=true to latest completed job
   let resolvedResumeSession = resumeSession;
   if (resume && !resumeSession) {
     const allJobs = listJobs(workspaceRoot);
-    const latestCompleted = findLatestCompletedJob(allJobs);
+    const latestCompleted = findLatestJob(
+      allJobs,
+      (job) => job.status === "completed"
+        && Boolean(job.claudeSessionId || job.claudeSessionUuid),
+    );
     if (latestCompleted?.claudeSessionId) {
       resolvedResumeSession = latestCompleted.claudeSessionId;
     } else {
@@ -1260,7 +1443,8 @@ async function handleDelegate(params, context = {}) {
     childEnv,
     routeSnapshot,
     cliVersion,
-    inlineSettings
+    inlineSettings,
+    maxBudgetUsd
   });
   foregroundHandle.execution = execution;
   updateJob(workspaceRoot, { id: jobId, pid: execution.pid });
@@ -1450,6 +1634,27 @@ async function handleDelegate(params, context = {}) {
         compactTrigger,
       } : null
     });
+
+    // Record in-memory evidence for the continuation planner. Best-effort:
+    // never affects job success, never persisted to state/artifact/log.
+    // Prefer Provider-reported contextWindow; an autoCompact window is only an
+    // unverified fallback and its target may lower the planner threshold.
+    try {
+      continuationPlanner.recordEvidence({
+        jobId,
+        sessionId: provisionalClaudeSessionId,
+        cwd: workspaceRoot,
+        model: storedRequestedModel,
+        write,
+        usage: result.usage || null,
+        contextWindow: result.contextWindow
+          || autoCompactAudit?.contextWindowTokens
+          || null,
+        autoCompactTarget: autoCompactAudit?.targetTokens || null,
+        cliVersion,
+        workspaceFingerprint: postRunFingerprint,
+      });
+    } catch { /* best effort — evidence is advisory */ }
 
     if (finalizedJob?.status === "cancelled") {
       appendLogLine(workspaceRoot, jobId, "Cancelled during post-result verification.");
@@ -2102,6 +2307,36 @@ async function handleCompact(params) {
     // The post-run collector will fail closed without a cursor.
   }
 
+  // ── Budget guard validation (fail-closed before Provider call) ──
+  const budgetValidation = validateMaxBudgetUsd(params, cwd);
+  if (!budgetValidation.ok) {
+    return {
+      content: [{ type: "text", text: `Error: ${budgetValidation.error}` }],
+      isError: true
+    };
+  }
+  const maxBudgetUsd = budgetValidation.value;
+
+  // ── Continuation plan: compact lifecycle (issued → compacted → consumed) ──
+  // When a continuationPlan is supplied, startCompact validates that it is a
+  // compact_resume plan and marks it as issued. completeCompact is called
+  // after the boundary result to advance or fail the lifecycle.
+  let compactPlanId = null;
+  if (params.continuationPlan) {
+    try {
+      const started = continuationPlanner.startCompact(params.continuationPlan, {
+        cwd: workspaceRoot,
+        parentSession: sessionId,
+      });
+      compactPlanId = started.planId;
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: ${err.message}` }],
+        isError: true
+      };
+    }
+  }
+
   // 3. Run read-only foreground /compact via the watchdog.
   //    write=false → read-only (Read, Glob, Grep only). No lease needed.
   //    resume=true + resumeSession → --resume <sessionId>. No --session-id.
@@ -2111,12 +2346,17 @@ async function handleCompact(params) {
     resume: true,
     resumeSession: sessionId,
     inlineSettings,
+    maxBudgetUsd,
   });
 
   const result = await execution.result;
 
   // If the compact invocation itself failed, report honestly.
   if (!result.ok) {
+    // Mark the compact plan as failed so it cannot be consumed by a resume.
+    if (compactPlanId) {
+      try { continuationPlanner.completeCompact(compactPlanId, { ok: false }); } catch { /* best effort */ }
+    }
     const safeError = buildSafeErrorMessage(
       result.failureStage || FAILURE_STAGES.PROVIDER_RESPONSE,
       result.error || "Compact invocation failed."
@@ -2153,6 +2393,19 @@ async function handleCompact(params) {
     };
   }
 
+  // Complete the compact plan lifecycle if one was started. The plan advances
+  // to "compacted" when ok && hasNewBoundary; a compact without a new boundary
+  // falls back to resume bound to the original session; a failure marks the
+  // plan as failed so it cannot be consumed by a resume.
+  if (compactPlanId) {
+    try {
+      continuationPlanner.completeCompact(compactPlanId, {
+        ok: true,
+        hasNewBoundary: boundary.compacted,
+      });
+    } catch { /* best effort — plan lifecycle must not affect compact result */ }
+  }
+
   // 5. Retrieve stored auto-compact policy from the job (if any).
   const requestedTarget = compactPolicy?.targetTokens ?? null;
   const effectiveWindow = compactPolicy?.effectiveWindow ?? null;
@@ -2183,6 +2436,8 @@ async function handleCompact(params) {
           observedBoundary: boundary.observedBoundary,
           requestedTarget,
           effectiveWindow,
+          cost: Number.isFinite(result.cost) ? result.cost : null,
+          duration: Number.isFinite(result.duration) ? result.duration : null,
           reason,
         },
       });
@@ -2201,13 +2456,22 @@ async function handleCompact(params) {
   if (requestedTarget !== null) lines.push(`**Requested target:** ${requestedTarget}`);
   if (effectiveWindow !== null) lines.push(`**Effective window:** ${effectiveWindow}`);
   if (boundary.observedBoundary !== null) lines.push(`**Observed boundary:** ${boundary.observedBoundary}`);
+  lines.push(`**Cost:** ${formatCost(result.cost)}`);
+  lines.push(`**Duration:** ${formatDuration(result.duration ? result.duration * 1000 : null)}`);
   if (reason) lines.push("", `**Reason:** ${reason}`);
 
   return {
     content: [{
       type: "text",
       text: lines.join("\n")
-    }]
+    }],
+    structuredContent: {
+      compacted: boundary.compacted,
+      observedBoundary: boundary.observedBoundary,
+      costUsd: Number.isFinite(result.cost) ? result.cost : null,
+      durationSeconds: Number.isFinite(result.duration) ? result.duration : null,
+      reason,
+    },
   };
 }
 
@@ -2508,16 +2772,11 @@ async function handleSetup(params) {
       // Use the same shell-free Windows `.cmd` shim resolution as watchdog
       // execution and binaryAvailable(). A direct spawn of `claude` cannot
       // reliably invoke npm's `.cmd` wrapper on Windows.
-      const resolvedHelpCommand = resolveCommandForSpawn("claude", ["--help"]);
-      const helpResult = spawnSync(resolvedHelpCommand.command, resolvedHelpCommand.args, {
-        cwd,
-        encoding: "utf8",
-        timeout: 10000,
-        stdio: "pipe",
-        shell: resolvedHelpCommand.shell,
-        windowsHide: true,
-      });
-      helpText = `${helpResult.stdout || ""}\n${helpResult.stderr || ""}`;
+      const helpResult = readClaudeHelp(cwd);
+      if (!helpResult.ok) {
+        throw new Error("claude --help exited unsuccessfully");
+      }
+      helpText = helpResult.text;
       const hasPrint = /--print\b/.test(helpText);
       const hasInputFormat = /--input-format\b/.test(helpText);
       const hasOutputFormat = /--output-format\b/.test(helpText);
@@ -2911,6 +3170,155 @@ async function handleSetup(params) {
   };
 }
 
+// cc_plan_continuation — read-only evidence-based continuation planner
+async function handlePlanContinuation(params) {
+  const cwd = getCwd(params);
+  // Bind the plan to the workspace root (git root if inside a repo) so that
+  // consumption in cc_delegate/cc_compact — which also resolves to the
+  // workspace root — sees the same cwd. Without this, a plan created from a
+  // git subdirectory would fail with cwd-mismatch at consumption time.
+  const planCwd = rememberWorkspaceRoot(cwd);
+  const jobs = listJobs(planCwd);
+  let parentJob = null;
+  if (params.parentJob) {
+    try {
+      parentJob = findJob(jobs, params.parentJob);
+    } catch (err) {
+      return {
+        content: [{ type: "text", text: `Error: ${err.message}` }],
+        isError: true,
+      };
+    }
+  } else if (params.parentSession) {
+    parentJob = jobs.find((job) => jobMatchesClaudeSession(job, params.parentSession)) || null;
+  } else if (params.userIntent === "same_session") {
+    parentJob = findLatestJob(
+      jobs,
+      (job) => job.status === "completed"
+        && Boolean(job.claudeSessionId || job.claudeSessionUuid),
+    );
+  }
+
+  const stateParentSession = parentJob
+    ? (parentJob.claudeSessionId || parentJob.claudeSessionUuid || null)
+    : null;
+  if (params.parentJob && !parentJob && params.userIntent === "same_session") {
+    return {
+      content: [{ type: "text", text: `Error: parent job "${params.parentJob}" was not found; same_session requires an exact resumable parent.` }],
+      isError: true,
+    };
+  }
+  if (params.parentSession && stateParentSession && params.parentSession !== stateParentSession) {
+    return {
+      content: [{ type: "text", text: "Error: parentJob and parentSession identify different Claude sessions." }],
+      isError: true,
+    };
+  }
+  const parentSession = stateParentSession || params.parentSession || null;
+  if (parentSession && !isValidSessionId(parentSession)) {
+    return {
+      content: [{ type: "text", text: "Error: parentSession must be a valid Claude session identifier." }],
+      isError: true,
+    };
+  }
+
+  const resolvedParentJob = parentJob?.id || params.parentJob || null;
+  const runtimeEvidence = continuationPlanner.getEvidence(
+    resolvedParentJob,
+    parentSession,
+  );
+  const runtimeDrift = {
+    workspace: params.drift?.workspace === true,
+    cli: params.drift?.cli === true,
+    tool: params.drift?.tool === true,
+  };
+  if (runtimeEvidence) {
+    if (runtimeEvidence.workspaceFingerprint instanceof Map) {
+      const currentFingerprint = captureWorkspaceFingerprint(planCwd);
+      runtimeDrift.workspace = runtimeDrift.workspace
+        || diffWorkspaceFingerprints(
+          runtimeEvidence.workspaceFingerprint,
+          currentFingerprint,
+        ).totalChanges > 0;
+    }
+    const currentCliVersion = getClaudeVersion(planCwd);
+    if (runtimeEvidence.cliVersion && currentCliVersion) {
+      runtimeDrift.cli = runtimeDrift.cli
+        || runtimeEvidence.cliVersion !== currentCliVersion;
+    }
+    if (typeof runtimeEvidence.write === "boolean") {
+      runtimeDrift.tool = runtimeDrift.tool
+        || runtimeEvidence.write !== params.write;
+    }
+  }
+
+  const input = {
+    cwd: planCwd,
+    parentJob: resolvedParentJob,
+    parentSession,
+    relationship: params.relationship,
+    contextValue: params.contextValue,
+    userIntent: params.userIntent,
+    correctionCount: params.correctionCount,
+    allowCompact: params.allowCompact,
+    model: params.model ?? null,
+    write: params.write,
+    drift: runtimeDrift,
+    sessionPollution: params.sessionPollution,
+  };
+
+  let plan;
+  try {
+    plan = continuationPlanner.planContinuation(input);
+  } catch (err) {
+    return {
+      content: [{ type: "text", text: `Error: ${err.message}` }],
+      isError: true
+    };
+  }
+
+  const lines = [
+    "## Continuation Plan",
+    "",
+    `**Action:** ${plan.action}`,
+    `**Plan ID:** ${plan.planId}`,
+    `**Evidence state:** ${plan.evidenceState}`,
+    `**Fallback action:** ${plan.fallbackAction}`,
+    `**Reason codes:** ${plan.reasonCodes.join(", ")}`,
+  ];
+  if (plan.pressure !== null) {
+    lines.push(`**Context pressure:** ${(plan.pressure * 100).toFixed(1)}% (threshold: ${(plan.pressureThreshold * 100).toFixed(0)}%)`);
+  }
+  lines.push(`**Expires at:** ${plan.planExpiresAt}`);
+
+  if (plan.action === ACTIONS.FRESH_HANDOFF && plan.handoffTemplate) {
+    lines.push("", "### Handoff Template", "", plan.handoffTemplate);
+  } else if (plan.action === ACTIONS.COMPACT_RESUME && plan.compactFocus) {
+    lines.push("", "### Compact Focus", "", plan.compactFocus);
+  } else if (plan.action === ACTIONS.RESUME && plan.resumeGuidance) {
+    lines.push("", "### Resume Guidance", "", plan.resumeGuidance);
+  }
+
+  lines.push("", "Pass this planId to cc_delegate or cc_compact as continuationPlan.");
+
+  return {
+    content: [{ type: "text", text: lines.join("\n") }],
+    structuredContent: {
+      action: plan.action,
+      planId: plan.planId,
+      reasonCodes: plan.reasonCodes,
+      evidenceState: plan.evidenceState,
+      fallbackAction: plan.fallbackAction,
+      pressure: plan.pressure,
+      pressureThreshold: plan.pressureThreshold,
+      planExpiresAt: plan.planExpiresAt,
+      ...(plan.handoffTemplate ? { handoffTemplate: plan.handoffTemplate } : {}),
+      ...(plan.compactFocus ? { compactFocus: plan.compactFocus } : {}),
+      ...(plan.resumeGuidance ? { resumeGuidance: plan.resumeGuidance } : {}),
+    },
+  };
+}
+
 // ─── Tool Router ────────────────────────────────────────────────────────────
 
 const HANDLERS = {
@@ -2921,7 +3329,8 @@ const HANDLERS = {
   cc_cancel: handleCancel,
   cc_review: handleReview,
   cc_setup: handleSetup,
-  cc_compact: handleCompact
+  cc_compact: handleCompact,
+  cc_plan_continuation: handlePlanContinuation
 };
 
 // ─── JSON-RPC Message Handling ──────────────────────────────────────────────
@@ -2951,7 +3360,7 @@ function handleMessage(msg) {
           protocolVersion: PROTOCOL_VERSION,
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: "claude-code-companion", version: SERVER_VERSION },
-          instructions: "Claude Code Companion: call cc_delegate directly and let its foreground tools/call remain pending until completion. Do not emulate it through shell/PTY, poll it, or emit periodic waiting commentary. For ordinary follow-up and review-fix work, start a fresh Claude Code session with a bounded handoff; preserve a prior Claude conversation only when the user explicitly requests same-session resume. Supports atomic per-job persistence, watchdog execution, session scoping, prefix matching, and explicit resume."
+          instructions: "Claude Code Companion: call cc_delegate directly and let its foreground tools/call remain pending until completion. Do not emulate it through shell/PTY, poll it, or emit periodic waiting commentary. For follow-up and review-fix work, call cc_plan_continuation first to select resume, compact_resume, or fresh_handoff based on evidence, then pass the returned planId to cc_delegate or cc_compact. Supports atomic per-job persistence, watchdog execution, session scoping, prefix matching, and explicit resume."
         });
         break;
       }

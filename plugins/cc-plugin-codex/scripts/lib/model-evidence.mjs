@@ -34,6 +34,8 @@ export {
   parseTranscriptModels,
   collectModelEvidence,
   extractUsageModelKeys,
+  extractUsageTokens,
+  extractContextWindow,
 } from "./model-evidence-collector.mjs";
 
 export {
