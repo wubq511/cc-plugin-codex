@@ -220,27 +220,26 @@ test("cc_compact rejects explicit resumeSession that matches a running job", asy
 });
 
 test("cc_compact rejects cancelling job", async (t) => {
-  const server = startServer(t, { env: { FAKE_CLAUDE_MODE: "hang-slow" } });
+  const server = startServer(t);
+  await server.send(0, "cc_check", { all: true });
+  const now = new Date().toISOString();
+  const cancellingJob = upsertJob(server.workspace, {
+    id: "cc-cancelling-seeded",
+    status: "cancelling",
+    phase: "cancelling",
+    ownerServerId: "test-owner",
+    claudeSessionId: "550e8400-e29b-41d4-a716-446655440000",
+    claudeSessionUuid: null,
+    createdAt: now,
+    updatedAt: now,
+  });
 
-  // Start a hanging delegation
-  const delegatePromise = server.send(1, "cc_delegate", { task: "hang-slow" });
-  const runningJob = await waitFor(() => {
-    return listJobs(server.workspace).find((j) => j.status === "running");
-  }, 5000);
-
-  // Cancel it — transitions to cancelling
-  const cancelPromise = server.send(2, "cc_cancel");
-  await waitFor(() => {
-    return listJobs(server.workspace).find((j) => j.status === "cancelling");
-  }, 5000);
-
-  // cc_compact must reject the cancelling job (by job ID)
-  const compactResult = await server.send(3, "cc_compact", { job: runningJob.id });
+  // Exercise the persisted-state guard directly. Cancellation transition and
+  // process settlement are covered by the dedicated end-to-end cancel tests;
+  // this assertion must not depend on a 20ms OS scheduling window.
+  const compactResult = await server.send(1, "cc_compact", { job: cancellingJob.id });
   assert.match(compactResult.result.content[0].text, /still cancelling/i);
   assert.equal(compactResult.result.isError, true);
-
-  await cancelPromise;
-  await delegatePromise.catch(() => {});
 });
 
 test("cc_compact returns error when no stopped session exists", async (t) => {

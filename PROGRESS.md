@@ -159,7 +159,7 @@ audit found and repaired these additional gaps:
 - [x] Rechecked remote divergence before publication: local `main` and
   `origin/main` were even before the closeout commit.
 - [x] Refreshed cachebuster and reinstalled the plugin. Final version:
-  `0.3.0+codex.20260729070734`.
+  `0.3.0+codex.20260729071934`.
 - [x] Final local gates: 416 pass / 0 skipped / 0 fail; source verification,
   plugin validator, delegate/setup/compact skill validation, full installed
   verification, and recursive source/cache comparison all green.
@@ -171,5 +171,12 @@ audit found and repaired these additional gaps:
   cancel handle before persisting `running`, used stdin EOF for the Windows
   graceful-shutdown path, and made `cc_setup` report the exported schema-v8
   constant instead of stale hard-coded v7 text.
-- [ ] Push the CI repair commit and observe its six GitHub Actions jobs to
-  terminal status.
+- [x] Published CI repair commit `c2babfd`. CI #13 passed five jobs; Windows
+  Node 24 reached 415/416 and exposed one remaining test-only timing dependency:
+  the cancelling-state guard test polled a 20ms transient status.
+- [x] Made the guard test deterministic by letting the server finish startup
+  reconciliation, then persisting a valid `cancelling` record and directly
+  verifying that `cc_compact` rejects it. Dedicated cancellation E2E tests
+  continue to cover the real running→cancelling→cancelled lifecycle.
+- [ ] Push the deterministic-test follow-up and observe all six GitHub Actions
+  jobs to terminal status.
