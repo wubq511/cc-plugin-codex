@@ -15,7 +15,7 @@ import path from "node:path";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 import { migrateV3ModelFields } from "./model-evidence.mjs";
 
-const STATE_VERSION = 8;
+export const STATE_VERSION = 8;
 const CONFIG_FILE_NAME = "config.json";
 const LEASE_FILE_NAME = "lease.lock";
 const JOBS_DIR_NAME = "jobs";

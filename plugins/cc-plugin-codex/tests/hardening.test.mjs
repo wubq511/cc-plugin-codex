@@ -729,6 +729,7 @@ test("cc_setup reports plugin version, state schema, and resolved paths without 
 
   assert.match(text, /Plugin Version/);
   assert.match(text, /State Schema/);
+  assert.match(text, /State Schema:\*\* v8/);
   assert.match(text, /Resolved Paths/);
   assert.match(text, /State dir/);
 
@@ -1396,8 +1397,13 @@ test("graceful shutdown drains foreground processes before releasing writer leas
   const leaseBefore = getWriterLeaseOwner(workspace);
   assert.ok(leaseBefore, "Lease must be held during running job");
 
-  // Send SIGTERM to trigger graceful shutdown
-  server.child.kill("SIGTERM");
+  // Windows implements child.kill("SIGTERM") as forceful termination, so use
+  // the cross-platform graceful EOF path there. POSIX still exercises SIGTERM.
+  if (process.platform === "win32") {
+    server.child.stdin.end();
+  } else {
+    server.child.kill("SIGTERM");
+  }
 
   // Wait for companion to exit
   await waitFor(() => server.child.exitCode !== null || server.child.signalCode !== null, 10000);

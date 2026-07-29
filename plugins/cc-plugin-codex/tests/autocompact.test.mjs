@@ -8,6 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { validateAutoCompact, computeEffectiveWindow, resolveScope, AUTO_COMPACT_PCT } from "../scripts/lib/autocompact.mjs";
+import { listJobs } from "../scripts/lib/state.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pluginRoot = path.resolve(here, "..");
@@ -569,7 +570,6 @@ test("cc_delegate without autoCompact works normally (no --settings)", async (t)
 });
 
 test("cc_delegate with autoCompact stores audit fields in job state", async (t) => {
-  const { listJobs } = await import(path.join(pluginRoot, "scripts", "lib", "state.mjs"));
   const server = startServer(t);
   await server.send(1, "cc_delegate", {
     task: "success",
@@ -604,7 +604,6 @@ test("cc_delegate with autoCompact stores audit fields in job state", async (t) 
 // ─── Scope inheritance integration tests ────────────────────────────────────
 
 test("session scope: replayed on resume without explicit autoCompact", async (t) => {
-  const { listJobs } = await import(path.join(pluginRoot, "scripts", "lib", "state.mjs"));
   const server = startServer(t);
 
   // First delegation: session-scope autoCompact
@@ -644,7 +643,6 @@ test("session scope: replayed on resume without explicit autoCompact", async (t)
 });
 
 test("resumed autoCompact records only a boundary appended during that delegation", async (t) => {
-  const { listJobs } = await import(path.join(pluginRoot, "scripts", "lib", "state.mjs"));
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-ac-boundary-cursor-"));
   const configDir = path.join(workspace, "claude-config");
   const projectDir = path.join(configDir, "projects", "test-project");
@@ -684,7 +682,6 @@ test("resumed autoCompact records only a boundary appended during that delegatio
 });
 
 test("task scope: new session inherits same taskScopeId", async (t) => {
-  const { listJobs } = await import(path.join(pluginRoot, "scripts", "lib", "state.mjs"));
   const server = startServer(t);
 
   // First delegation: task-scope autoCompact (generates taskScopeId)
@@ -751,7 +748,6 @@ test("task scope: unknown taskScopeId inheritance fails closed before spawn", as
 });
 
 test("explicit autoCompact=null means no autoCompact and no inheritance", async (t) => {
-  const { listJobs } = await import(path.join(pluginRoot, "scripts", "lib", "state.mjs"));
   const server = startServer(t);
 
   // First delegation: session-scope autoCompact
@@ -782,7 +778,6 @@ test("explicit autoCompact=null means no autoCompact and no inheritance", async 
 });
 
 test("explicit autoCompact=null persists a session clear tombstone", async (t) => {
-  const { listJobs } = await import(path.join(pluginRoot, "scripts", "lib", "state.mjs"));
   const server = startServer(t);
 
   await server.send(1, "cc_delegate", {
@@ -822,7 +817,6 @@ test("explicit autoCompact=null persists a session clear tombstone", async (t) =
 });
 
 test("task clear tombstone prevents later inheritance", async (t) => {
-  const { listJobs } = await import(path.join(pluginRoot, "scripts", "lib", "state.mjs"));
   const server = startServer(t);
   const first = await server.send(1, "cc_delegate", {
     task: "success",
@@ -859,7 +853,6 @@ test("task clear tombstone prevents later inheritance", async (t) => {
 });
 
 test("cc_delegate with taskScopeId:undefined (omitted) generates new ID for task scope", async (t) => {
-  const { listJobs } = await import(path.join(pluginRoot, "scripts", "lib", "state.mjs"));
   const server = startServer(t);
   const result = await server.send(1, "cc_delegate", {
     task: "success",

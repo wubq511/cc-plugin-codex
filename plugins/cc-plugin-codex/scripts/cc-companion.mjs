@@ -33,7 +33,7 @@ import {
   acquireWriterLease, updateWriterLeaseJobId, refreshWriterLease, releaseWriterLease,
   getWriterLeaseOwner, findJob, sortJobsNewestFirst, findLatestJob,
   findLatestActiveJob, findLatestCompletedJob, writeResultArtifact,
-  readResultArtifact, cleanupOldJobs, resolveStateDir
+  readResultArtifact, cleanupOldJobs, resolveStateDir, STATE_VERSION
 } from "./lib/state.mjs";
 import { binaryAvailable, resolveCommandForSpawn, terminateProcessTree } from "./lib/process.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -1210,8 +1210,11 @@ async function handleDelegate(params, context = {}) {
     autoCompact: autoCompactAudit
   };
 
-  updateJob(workspaceRoot, job);
+  // Publish the in-memory controller before the persisted running state. A
+  // concurrent cc_cancel may observe the job as soon as updateJob returns; at
+  // that point it must never see "running" without a cancellable handle.
   activeForegroundRuns.set(jobId, foregroundHandle);
+  updateJob(workspaceRoot, job);
 
   // Foreground mode (default)
   appendLogLine(workspaceRoot, jobId, "Running claude via watchdog; tools/call remains pending.");
@@ -2471,7 +2474,7 @@ async function handleSetup(params) {
 
   // Version info (no secrets)
   lines.push(`**Plugin Version:** ${SERVER_VERSION}`);
-  lines.push(`**State Schema:** v7 (task privacy boundary, native-Claude routing, route snapshots, failure diagnostics)`);
+  lines.push(`**State Schema:** v${STATE_VERSION} (task privacy boundary, native-Claude routing, temporary auto-compact policy, session/compact evidence, cancellation settlement)`);
 
   if (claudeStatus.available) {
     lines.push(`✅ Claude Code: ${claudeStatus.detail}`);
@@ -2557,7 +2560,7 @@ async function handleSetup(params) {
   } else {
     lines.push(`⚠️ Could not determine Claude CLI version (best-effort)`);
   }
-  lines.push(`✅ Companion server: v${SERVER_VERSION}, schema v7`);
+  lines.push(`✅ Companion server: v${SERVER_VERSION}, schema v${STATE_VERSION}`);
   lines.push(`✅ Watchdog protocol: --print --input-format text --output-format json (task via stdin, never argv)`);
 
   let sourceCacheOk = false;

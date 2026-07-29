@@ -159,9 +159,17 @@ audit found and repaired these additional gaps:
 - [x] Rechecked remote divergence before publication: local `main` and
   `origin/main` were even before the closeout commit.
 - [x] Refreshed cachebuster and reinstalled the plugin. Final version:
-  `0.3.0+codex.20260729065409`.
+  `0.3.0+codex.20260729070734`.
 - [x] Final local gates: 416 pass / 0 skipped / 0 fail; source verification,
   plugin validator, delegate/setup/compact skill validation, full installed
   verification, and recursive source/cache comparison all green.
-- [ ] Commit, push, and observe the six-job GitHub Actions matrix to terminal
-  status.
+- [x] Published implementation commit `41659ff`. CI #12 passed Linux/macOS but
+  exposed Windows-only failures: filesystem paths passed directly to ESM
+  `import()`, a running-state/cancel-handle publication race, and a POSIX-only
+  SIGTERM assumption in a graceful-shutdown test.
+- [x] Replaced dynamic test imports with a static module import, registered the
+  cancel handle before persisting `running`, used stdin EOF for the Windows
+  graceful-shutdown path, and made `cc_setup` report the exported schema-v8
+  constant instead of stale hard-coded v7 text.
+- [ ] Push the CI repair commit and observe its six GitHub Actions jobs to
+  terminal status.
