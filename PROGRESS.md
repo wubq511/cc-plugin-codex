@@ -178,5 +178,5 @@ audit found and repaired these additional gaps:
   reconciliation, then persisting a valid `cancelling` record and directly
   verifying that `cc_compact` rejects it. Dedicated cancellation E2E tests
   continue to cover the real running→cancelling→cancelled lifecycle.
-- [ ] Push the deterministic-test follow-up and observe all six GitHub Actions
-  jobs to terminal status.
+- [x] Published deterministic-test follow-up `f3b778d`. CI #14 completed green:
+  Ubuntu, macOS, and Windows on Node 22/24 all passed (six of six jobs).
