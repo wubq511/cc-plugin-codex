@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<!--
+  Claude 实时面板. Served as ONE response by dashboard.mjs:
+  dashboard-page.mjs inlines dashboard-page.css and dashboard-client.mjs
+  into the markers below at server load. No external requests, no build.
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude 实时面板</title>
+<style>%%DASHBOARD_CSS%%</style>
+</head>
+<body data-filter="all">
+
+<header class="topbar">
+  <div class="topbar-row">
+    <span class="brand">Claude 实时面板</span>
+    <span id="conn" class="conn off">等待</span>
+    <span id="currentJob" class="current-job"></span>
+    <span class="topbar-right">
+      <button id="soundBtn" class="sound-btn" aria-pressed="false" title="任务结束时播放提示音">提示音 关</button>
+      <button id="jobsBtn" class="jobs-btn" aria-haspopup="true" aria-expanded="false">切换任务 ▾</button>
+    </span>
+    <div class="jobs-pop" id="jobsPop" hidden></div>
+  </div>
+  <section class="status-zone" id="statusZone" aria-live="polite" hidden></section>
+</header>
+
+<div class="wrap">
+  <div class="filters" role="group" aria-label="事件过滤">
+    <button class="chip active" data-filter="all">全部</button>
+    <button class="chip" data-filter="errors">仅错误</button>
+    <button class="chip" data-filter="msgs">仅叙述</button>
+  </div>
+  <main class="tl" id="timeline"></main>
+</div>
+
+<button class="back-latest" id="backLatest"></button>
+
+<script type="module">%%DASHBOARD_JS%%</script>
+</body>
+</html>

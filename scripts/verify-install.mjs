@@ -407,7 +407,10 @@ if (!SOURCE_ONLY) {
   try {
     const testDir = path.join(activeCache.activePath, "tests");
     if (fs.existsSync(testDir)) {
-      run(`node --test "${testDir}"${path.sep}*.test.mjs`, { timeout: 60000, cwd: activeCache.activePath });
+      // The suite spawns real MCP servers in e2e tests and runs ~75s from
+      // source; the cache copy adds cold-start overhead. 60s was calibrated
+      // for a much smaller suite and now false-fails.
+      run(`node --test "${testDir}"${path.sep}*.test.mjs`, { timeout: 240000, cwd: activeCache.activePath });
       pass("Installed-cache tests passed");
     } else {
       warn("No tests/ directory in cache — skipping installed-cache tests");

@@ -10,16 +10,24 @@ import { renderDashboardPage } from "../scripts/lib/dashboard-page.mjs";
 
 // ─── Dashboard page: terminal resume affordance ─────────────────────────────
 
-test("dashboard page renders the terminal resume command affordance", () => {
+test("dashboard page renders the panel shell and terminal resume affordance", () => {
   const html = renderDashboardPage();
-  // The per-job resume card (deterministic channel — does not depend on the
-  // Codex model relaying the command from tool output).
+  // Panel skeleton: status zone, filter chips, back-to-latest affordance.
+  assert.match(html, /status-zone/);
+  assert.match(html, /data-filter="all"/);
+  assert.match(html, /back-latest/);
+  // The per-job resume affordance (deterministic channel — does not depend on
+  // the Codex model relaying the command from tool output). Rendered as a
+  // compact copy button in the status zone, not a standalone card.
   assert.match(html, /在终端继续此会话/);
   assert.match(html, /claude --resume /);
-  assert.match(html, /resume-box/);
   assert.match(html, /copy-btn/);
   // Session id source: the claudeSessionId field from GET /api/jobs.
   assert.match(html, /claudeSessionId/);
+  // Assets are fully inlined into one response: no external requests, and no
+  // unreplaced assembly markers left behind.
+  assert.doesNotMatch(html, /%%DASHBOARD_(CSS|JS)%%/);
+  assert.doesNotMatch(html, /<(script|link)[^>]+(src|href)="https?:/);
 });
 
 // ─── buildOpenCommand (platform mapping, pure) ─────────────────────────────
@@ -108,4 +116,19 @@ test("openOnce does not open on CI", async (t) => {
     assert.equal(dashboard.openOnce(), false);
     assert.equal(opened.length, 0);
   });
+});
+
+// ─── ingest: noise subtypes never reach the ring buffer ────────────────────
+
+test("dashboard ingest drops thinking_tokens so it cannot evict real events", async () => {
+  const dashboard = await createDashboard({ openBrowser: () => {} });
+  try {
+    dashboard.ingest("job-1", { type: "system", subtype: "thinking_tokens", estimated_tokens: 7 });
+    dashboard.ingest("job-1", { type: "system", subtype: "init" });
+    const buf = dashboard.ringBuffers.get("job-1");
+    assert.equal(buf.events.length, 1);
+    assert.equal(buf.events[0].event.subtype, "init");
+  } finally {
+    await dashboard.stop();
+  }
 });

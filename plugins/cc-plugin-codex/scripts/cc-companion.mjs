@@ -58,6 +58,7 @@ import {
 import {
   buildSafeErrorMessage, buildSafeErrorSummary, FAILURE_STAGES, buildFailureEnvelope, redactText
 } from "./lib/diagnostics.mjs";
+import { deriveTaskTitle } from "./lib/task-title.mjs";
 import {
   computeRouteStatus, ROUTE_STATUSES, describeRouteStatus
 } from "./lib/route-status.mjs";
@@ -195,10 +196,26 @@ let shuttingDown = false;
 let dashboard = null;
 let dashboardPromise = null;
 
+// Dashboard task titles, memory-only and bounded. The persisted job record
+// carries only a non-reversible taskRef (state.mjs privacy boundary), so a
+// human-meaningful title can only come from live task text held by this
+// process. Like the event ring buffer, titles are never written to disk;
+// jobs delegated by other processes simply have no title (null).
+const jobTaskTitles = new Map();
+const MAX_TASK_TITLES = 200;
+function registerJobTaskTitle(jobId, task) {
+  if (!jobId) return;
+  if (jobTaskTitles.size >= MAX_TASK_TITLES && !jobTaskTitles.has(jobId)) {
+    // FIFO eviction keeps the map bounded over a long-lived server.
+    jobTaskTitles.delete(jobTaskTitles.keys().next().value);
+  }
+  jobTaskTitles.set(jobId, deriveTaskTitle(task));
+}
+
 // Aggregate non-sensitive job metadata across all known workspaces for the
-// dashboard's GET /api/jobs endpoint. Returns only id/status/phase/timing —
-// no task content, no error detail, no diagnostics. The dashboard is a
-// read-only observer and must not expose task-bearing data over HTTP.
+// dashboard's GET /api/jobs endpoint. Returns id/status/phase/timing plus a
+// bounded, credential-redacted, memory-only taskTitle when available — never
+// full task content, error detail, or diagnostics.
 function getDashboardJobs() {
   const out = [];
   for (const workspaceRoot of workspaceRoots) {
@@ -210,6 +227,7 @@ function getDashboardJobs() {
           status: job.status,
           phase: job.phase || null,
           workspace: workspaceRoot,
+          taskTitle: jobTaskTitles.get(job.id) || null,
           requestedModel: job.requestedModel || null,
           effort: job.effort || null,
           createdAt: job.createdAt || null,
@@ -1366,6 +1384,10 @@ async function handleDelegate(params, context = {}) {
   const jobId = generateJobId("cc");
   const now = new Date().toISOString();
   const taskTitle = resume ? "Claude Code Resume" : "Claude Code Task";
+
+  // Dashboard display title: derived from live task text, held in companion
+  // memory only (registerJobTaskTitle bounds and credential-redacts it).
+  registerJobTaskTitle(jobId, task);
 
   // Pre-allocated session UUID for new (non-resume) delegations.
   // Generated before spawn, persisted immediately, and passed via --session-id.

@@ -109,8 +109,12 @@ export function createDashboard({ getJobs, openBrowser = defaultOpenBrowser } = 
   }
 
   // Add an intermediate event to a job's ring buffer and broadcast to SSE.
+  // High-frequency noise subtypes (thinking_tokens arrives once per thinking
+  // delta) are dropped here so they cannot evict real events from the
+  // bounded ring; the client reducer drops them again as a fallback.
   function ingest(jobId, event) {
     if (!jobId || !event || typeof event !== "object") return;
+    if (event.type === "system" && event.subtype === "thinking_tokens") return;
     const buf = ringBufferFor(jobId);
     const size = Buffer.byteLength(JSON.stringify(event), "utf8");
     buf.events.push({ event, size });

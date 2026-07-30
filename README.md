@@ -123,14 +123,14 @@ claude --resume <sessionId>
 - **`/claude:setup` 显示 URL** — 输出中包含 `**实时面板：** <url>?token=<token>`，可收藏备用
 - **`cc_delegate` / `cc_check` 返回附带 URL** — 任务结束后返回里也有同一行
 
-面板实时渲染 Claude 的每一步动作：
+面板（浅色主题）以降噪时间线实时渲染 Claude 的每一步动作：
 
-- **assistant 文本块** — Claude 的思考与回复文本
-- **tool_use 卡片** — 正在调用的工具（Read/Bash/Grep 等）及参数摘要，可折叠
-- **tool_result** — 工具返回结果，默认折叠
-- **最终 result** — 任务完成时的汇总
+- **assistant 文本块** — Claude 的叙述是主信号；思考过程折叠为可展开的一行指示
+- **工具卡** — tool_use 与 tool_result 配对成一张卡：参数摘要 + 耗时，成功输出折叠、错误输出自动展开并高亮
+- **系统事件** — 会话开始等渲染为分隔行；`thinking_tokens` 等高频噪音事件直接丢弃（server 进 buffer 前 + 客户端各一层）
+- **最终 result** — 任务完成时的汇总卡（费用、耗时、轮数）
 
-顶部状态条显示当前阶段和已耗时。左侧 job 列表可在多个任务间切换。每个任务顶部有「在终端继续此会话」卡片，显示可一键复制的 `claude --resume <sessionId>` 命令——这是恢复入口的确定性来源，不依赖模型转述。
+顶栏第二行的状态区显示当前动作（已剥掉 markdown 符号）、阶段、已耗时、轮数、工具调用数和费用（终值），区内的「resume」按钮一键复制 `claude --resume <sessionId>` 命令——这是恢复入口的确定性来源，不依赖模型转述。右上角「切换任务」在多个任务间切换。时间线在底部自动跟随最新事件，向上滚动暂停、点「回到最新」恢复；面板图标为 Claude 标志，任务完成时标签页标题加完成前缀、favicon 叠加绿/红状态点，可选提示音。
 
 面板是纯只读观察者：不改动取消/租约/foreground 任何契约。事件只存在于内存 ring buffer（≤500 事件/≤1MB 每 job），永不落盘。dashboard 绑定 `127.0.0.1`（不监听外部接口），URL 带随机 token 鉴权，无 token 请求一律 403。
 

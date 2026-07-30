@@ -531,3 +531,17 @@ audit found and repaired these additional gaps:
 - `stream-events.test.mjs` 新增回放测试：真实捕获经 watchdog 全链路解析，断言 result 文本/sessionId/cost/双模型 usageModelKeys/歧义 contextWindow=null/onEvent 转发 system+assistant。BLOCKED.md 对应项移除（清零）。
 
 **验证**：`npm test` 552 pass / 0 fail / 0 skipped；`npm run verify:ci` 全绿。
+
+## 2026-07-30 — Dashboard 浅色 UI 重构 + 真实使用反馈修复
+
+**背景**：实时面板 UI 全面重构（废弃 GLM 深色版），方向经原型对比定为浅色 VS Code Light+ 终端密度；重构交付后首次真实委托暴露两个问题：状态区作为悬浮卡片与时间线视觉割裂、thinking_tokens 系统事件刷屏（每个 thinking delta 一条，会挤占 ≤500 条 ring buffer 驱逐真实事件）。
+
+**改动**：
+- 页面装配改为多文件作者、单响应服务：`dashboard-page.html` / `dashboard-page.css` / `dashboard-client.mjs` 由 `dashboard-page.mjs` 在 server load 时内联成单一响应；无额外路由、无构建、无运行时依赖。
+- 信息架构：顶栏双行（行 1 品牌/连接状态/任务标题/切换任务，行 2 状态区——由内容列里的悬浮卡片改为 header 的一部分，无任务时整行隐藏）+ 降噪时间线；assistant 叙述为主信号，tool_use 与 tool_result 配对成工具卡（成功输出折叠、错误自动展开），思考折叠为可展开指示行，thinking_tokens 在 server ingest 与客户端 reducer 双层丢弃，未知/不可配对事件丢弃。
+- 交互：跟随滚动（底部锚定、用户上滚暂停、「回到最新」恢复并显示未读计数）、完成时标签页标题/favicon 通知 + 可选提示音、全部/仅错误/仅叙述三档过滤、「当前动作」标签经 actionLabel 剥离 markdown 符号、resume 按钮一键复制 `claude --resume <sessionId>`。
+- favicon：Claude 星标（Simple Icons CC0 SVG）内联为 data URI，无外部请求；完成/失败时角标叠加绿/红状态点。
+- `task-title.mjs`：任务标题 80 码点截断（先截断后 redactText 脱敏，避免触发诊断标记），仅存 companion 进程内存 Map（FIFO 上限 200），任务文本不落盘；`getDashboardJobs` 输出 `taskTitle`，面板顶栏与任务列表展示。
+- `verify-install.mjs` 缓存测试超时 60s→240s（套件 ~75s，旧阈值误失败）。
+
+**验证**：`npm test` 578 pass / 0 fail（新增 actionLabel 剥符号、reducer 丢弃 thinking_tokens、server ingest 过滤等 4 条）；装配页面真实浏览器渲染走查（双行 header、无 JS 错误、空态状态区隐藏）；`npm run verify:ci` 绿。

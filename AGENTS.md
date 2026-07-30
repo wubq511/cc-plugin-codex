@@ -34,9 +34,20 @@ Codex ↔ cc-companion.mjs ↔ claude-runner.mjs ↔ watchdog.mjs ↔ Claude Cod
   `compact_resume`, and `fresh_handoff`.
 - `scripts/lib/git.mjs`: bounded, secret-filtered review context and workspace
   fingerprints.
-- `scripts/lib/dashboard.mjs` and `dashboard-page.mjs`: read-only local dashboard
-  (127.0.0.1 only, random-token auth, SSE). Events live in per-job in-memory ring
-  buffers and must never be persisted to disk.
+- `scripts/lib/dashboard.mjs`: read-only local dashboard server (127.0.0.1 only,
+  random-token auth, SSE). Events live in per-job in-memory ring buffers and must
+  never be persisted to disk. High-frequency noise subtypes (thinking_tokens)
+  are dropped at ingest so they cannot evict real events from the bounded ring.
+- `scripts/lib/dashboard-page.mjs`: page assembly — inlines `dashboard-page.html`,
+  `dashboard-page.css`, and `dashboard-client.mjs` into one response at load.
+  Authored multi-file for review and tests, served single-response: no extra
+  routes, no build, no runtime dependencies.
+- `scripts/lib/dashboard-client.mjs`: dashboard browser logic. The DOM-free core
+  (timeline reducer, tool summarizers, follow-mode state machine) is exported
+  for `node --test`; the bootstrap only runs in a browser.
+- `scripts/lib/task-title.mjs`: bounded, credential-redacted dashboard task
+  titles derived from live task text. Titles are companion-memory only and
+  must never reach disk — the persisted record keeps only `taskRef`.
 
 ## Non-Negotiable Contracts
 

@@ -240,6 +240,12 @@ test("dashboard e2e: /api/jobs returns the delegate job", async (t) => {
     body.jobs.some((j) => j.status === "completed"),
     "/api/jobs should include the completed delegate job"
   );
+  // The dashboard job list carries a bounded, redacted, memory-only title so
+  // humans can tell jobs apart; this process delegated the job, so the title
+  // is available.
+  const completed = body.jobs.find((j) => j.status === "completed");
+  assert.equal(completed.taskTitle, "stream slow jobs test",
+    "/api/jobs should expose the in-memory task title for live-delegated jobs");
   // Every delegated job must carry a session id so the dashboard can render
   // the terminal resume command (claude --resume <id>).
   for (const job of body.jobs) {
