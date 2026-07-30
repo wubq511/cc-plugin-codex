@@ -2274,9 +2274,13 @@ async function handleCancel(params) {
   // by external state pollers before we signal the watchdog. Without this,
   // the process tree can die within the same event-loop turn, overwriting
   // cancelling→cancelled before any observer sees the intermediate state.
-  // The delay is bounded (20ms) and negligible compared to process-tree
-  // shutdown time in production.
-  await new Promise((r) => setTimeout(r, 20));
+  // The default delay is bounded (20ms) and negligible compared to
+  // process-tree shutdown time in production. Tests may widen the window via
+  // CC_TEST_CANCEL_OBSERVE_MS: on Windows, taskkill /T /F delivers no signal
+  // the child can trap, so without a wider window the transition is
+  // unobservable under CI load.
+  const cancelObserveMs = Number(process.env.CC_TEST_CANCEL_OBSERVE_MS) || 20;
+  await new Promise((r) => setTimeout(r, cancelObserveMs));
 
   // Signal the watchdog once. The watchdog terminates the Claude process tree.
   handle.cancelRequested = true;

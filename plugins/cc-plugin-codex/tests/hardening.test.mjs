@@ -1227,8 +1227,14 @@ test("cc_cancel transitions through cancelling status before cancelled", async (
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-cancelling-status-"));
   // No FAKE_CLAUDE_MODE env: the fake Claude reads the mode from stdin (the task text).
   // Using "hang-slow" which traps SIGTERM and waits 300ms before exiting, giving
-  // the test enough time to observe the cancelling status on disk.
-  const server = startServer(t, { workspace });
+  // the test enough time to observe the cancelling status on disk. On Windows,
+  // taskkill /T /F delivers no trappable signal, so the observation window is
+  // widened deterministically via CC_TEST_CANCEL_OBSERVE_MS instead of relying
+  // on the trap — polling under CI load would otherwise miss the transition.
+  const server = startServer(t, {
+    workspace,
+    env: { CC_TEST_CANCEL_OBSERVE_MS: "2000" },
+  });
 
   const delegate = server.send(1, "cc_delegate", { task: "hang-slow" });
   // Wait for job to be running
