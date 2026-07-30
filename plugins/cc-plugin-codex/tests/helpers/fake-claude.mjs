@@ -411,6 +411,18 @@ function handleMode(mode) {
     setTimeout(() => { process.stdout.write(a2 + "\n"); }, 120);
     setTimeout(() => { process.stdout.write(result + "\n"); }, 180);
     return;
+  } else if (mode === "stream-replay") {
+    // Replay a captured NDJSON stream verbatim from FAKE_CLAUDE_REPLAY_FILE.
+    // Used to run the watchdog against a real recorded Claude Code
+    // stream-json session (tests/fixtures/stream-json-real-success.ndjson).
+    const replayFile = process.env.FAKE_CLAUDE_REPLAY_FILE;
+    if (!replayFile) {
+      process.stderr.write("FAKE_CLAUDE_REPLAY_FILE not set\n");
+      process.exitCode = 1;
+      return;
+    }
+    process.stdout.write(require("fs").readFileSync(replayFile, "utf8"));
+    return;
   } else {
     success();
   }

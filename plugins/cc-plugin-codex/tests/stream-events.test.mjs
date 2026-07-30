@@ -218,3 +218,38 @@ test("stream events have bounded payload size", async () => {
     assert.ok(size <= 8192, `event payload ${size} bytes exceeds 8 KB bound`);
   }
 });
+
+// ─── Real captured stream-json (success path) ─────────────────────────
+
+test("stream-replay: real captured Claude Code stream-json session parses end-to-end", async () => {
+  // Fixture: real `claude --print --output-format stream-json --verbose` capture
+  // from 2026-07-30 (CLI 2.1.218, cost $0.129), sanitized of user paths.
+  const replayFile = path.join(here, "fixtures", "stream-json-real-success.ndjson");
+  const events = [];
+  const execution = runClaude("stream test", {
+    command: fakeClaude,
+    env: {
+      ...process.env,
+      FAKE_CLAUDE_MODE: "stream-replay",
+      FAKE_CLAUDE_REPLAY_FILE: replayFile,
+    },
+    onEvent: (event) => { events.push(event); },
+  });
+  const result = await execution.result;
+  assert.equal(result.ok, true);
+  assert.equal(result.result, "probe-ok");
+  assert.equal(result.sessionId, "92e38d52-348b-4568-af8b-cd38059e923a");
+  assert.ok(Math.abs(result.cost - 0.129277) < 1e-9, `cost ${result.cost}`);
+  assert.ok(result.usageModelKeys.includes("claude-haiku-4-5"),
+    `usageModelKeys ${JSON.stringify(result.usageModelKeys)} should include the real model key`);
+  assert.ok(result.usageModelKeys.includes("claude-opus-4-8[1m]"),
+    "the real session mixed two models; both usage keys must be preserved");
+  // The real session mixed a 200K (haiku) and a 1M (opus) context window.
+  // extractContextWindow deliberately returns null on ambiguity rather than
+  // picking one — assert that honesty rule against the real capture.
+  assert.equal(result.contextWindow, null);
+  // Intermediate events from the real session were forwarded (system/init + assistant)
+  const types = events.map((e) => e.type);
+  assert.ok(types.includes("system"), "should forward the real system/init event");
+  assert.ok(types.includes("assistant"), "should forward the real assistant events");
+});

@@ -512,3 +512,22 @@ audit found and repaired these additional gaps:
 **保留不改（有背书的判断项）**：dashboard URL 带 `?token=` 进入 delegate/cc_check/cc_setup 输出（即进 Codex transcript）——带外信道设计所需，hardening `/token/i` 断言已收窄豁免「实时面板」行；5 处取消模板重复拼接为既有模式延续。
 
 **验证**：`npm test` 551 pass / 0 fail / 0 skipped；`npm run verify:ci` 全绿；`git diff --check` clean。注：`hardening` 的 "cc_cancel transitions through cancelling status" 在本地全量并行与 CI（windows/22、macos/22）反复 flake，带诊断复现后确认是**两个测试侧竞态叠加**，非生产 bug：(1) **孤儿化竞态（主因）**——`listJobs()` 每进程每 workspace 首次访问会跑 `reconcileOrphans`（把活跃任务标记为 orphaned），测试进程首次轮询若晚于 server 落盘 job 文件，就把活任务孤儿化，cc_cancel 报「没有找到可取消的活跃任务」；修复：5 个测试文件的 `startServer` 在 workspace 为空时先调一次 `listJobs`  drain 掉首访 reconcile。(2) **pre-spawn 竞态**——取消落在 delegate pre-spawn 阶段时，delegate 自己的 pre-spawn 检查见 cancelling 立即 finalize，中间态毫秒级不可观测；修复：测试改用 `hang-pid` + `HANG_PID_FILE`（pid 文件出现 = 确定已 spawn）保证取消落在 post-spawn，再配合 `CC_TEST_CANCEL_HOLD_FILE` 交会（服务端保持 cancelling 直到测试确认，30s 有界兜底；默认 20ms yield 不变）。12 并发压力跑 fail 0。
+
+
+## 2026-07-30 — 真实 stream-json 探测补验成功（BLOCKED 项清零）
+
+**背景**：dashboard 任务书授权的 ≤$0.25 真实探测此前失败（`apiKeySource:"none"`，10 次 api_retry，$0），success 路径事件只能靠官方文档 schema 手写 fixture，记入 BLOCKED.md。实际认证来自 `~/.claude/settings.json` 的 `env.ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL`（settings 注入，非 shell 环境变量），本次直接在本机 shell 跑 `claude` 成功。
+
+**探测**：`claude --print --input-format text --output-format stream-json --verbose --max-budget-usd 0.25`（prompt 为单词回复），21 个真实事件（system/init、system/thinking_tokens ×17、assistant ×2、result/success），实际费用 **$0.1293**（预算内）。
+
+**schema 对比结论**（真实 vs 手写 fixture）：
+- result 事件字段与 watchdog 提取契约完全一致：`result`/`session_id`/`total_cost_usd`/`duration_ms`/`usage`/`modelUsage`/`is_error`/`subtype` 全部在场且形状正确；真实事件只多不少（多出 uuid/api_error_status/duration_api_ms/stop_reason/permission_denials 等附加字段，提取逻辑忽略）。
+- 真实 modelUsage 条目比 fixture 更丰富（含 canonicalModel/costUSD/provider/webSearchRequests）。
+- 一个实测行为：该会话混用两个模型（haiku 200K + opus 1M），`extractContextWindow` 对不一致窗口返回 null——既有「歧义不报」规则被真实数据印证，非缺陷。
+
+**改动**：
+- 真实捕获脱敏（用户名路径）后入库 `tests/fixtures/stream-json-real-success.ndjson`（21 行全量保留）。
+- fake-claude 新增 `stream-replay` 模式（`FAKE_CLAUDE_REPLAY_FILE` 原样回放文件）。
+- `stream-events.test.mjs` 新增回放测试：真实捕获经 watchdog 全链路解析，断言 result 文本/sessionId/cost/双模型 usageModelKeys/歧义 contextWindow=null/onEvent 转发 system+assistant。BLOCKED.md 对应项移除（清零）。
+
+**验证**：`npm test` 552 pass / 0 fail / 0 skipped；`npm run verify:ci` 全绿。
