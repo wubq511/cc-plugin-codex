@@ -75,36 +75,36 @@ export function formatModelEvidence({ requestedModel, requestMode, modelEvidence
   if (!modelEvidence) {
     // Legacy/fallback — should not happen in v4 but be safe
     if (requestedModel) {
-      return `**Requested model:** ${safeModelIdForDisplay(requestedModel)}`;
+      return `**请求的模型：** ${safeModelIdForDisplay(requestedModel)}`;
     }
-    return `**Model request:** inherited from Claude Code configuration`;
+    return `**模型请求：** 继承自 Claude Code 配置`;
   }
 
   const lines = [];
 
   // Request line — show selector kind when available (v7)
   if (selectorKind === "alias" && requestedModel) {
-    lines.push(`**Requested model:** ${safeModelIdForDisplay(requestedModel)} (alias)`);
+    lines.push(`**请求的模型：** ${safeModelIdForDisplay(requestedModel)} (alias)`);
   } else if (selectorKind === "native" && requestedModel) {
-    lines.push(`**Requested model:** ${safeModelIdForDisplay(requestedModel)} (native ID)`);
+    lines.push(`**请求的模型：** ${safeModelIdForDisplay(requestedModel)} (native ID)`);
   } else if (requestMode === "explicit" && requestedModel) {
-    lines.push(`**Requested model:** ${safeModelIdForDisplay(requestedModel)}`);
+    lines.push(`**请求的模型：** ${safeModelIdForDisplay(requestedModel)}`);
   } else {
-    lines.push(`**Model request:** inherited from Claude Code configuration`);
+    lines.push(`**模型请求：** 继承自 Claude Code 配置`);
   }
 
   // Route status — honest post-execution verification (v7)
   if (routeStatus && isValidRouteStatus(routeStatus)) {
     const statusLabels = {
-      resolved: "resolved (claim confirmed by execution evidence)",
-      accepted_but_unverified: "accepted but unverified (specific native model not confirmed)",
-      model_drift_possible: "model drift possible (claim and evidence disagree)",
-      rejected: "rejected (CLI or Provider failure)",
-      cancelled: "cancelled before route verification completed",
+      resolved: "resolved（声明已被执行证据确认）",
+      accepted_but_unverified: "accepted but unverified（具体原生模型未确认）",
+      model_drift_possible: "model drift possible（声明与证据不一致）",
+      rejected: "rejected（CLI 或 Provider 失败）",
+      cancelled: "cancelled（路由验证完成前已取消）",
     };
-    lines.push(`**Route status:** ${statusLabels[routeStatus]}`);
+    lines.push(`**路由状态：** ${statusLabels[routeStatus]}`);
   } else if (routeStatus) {
-    lines.push(`**Route status:** unavailable`);
+    lines.push(`**路由状态：** unavailable`);
   }
 
   // Execution models — re-sanitize at output boundary
@@ -112,12 +112,12 @@ export function formatModelEvidence({ requestedModel, requestMode, modelEvidence
     ? modelEvidence.executedModels.slice(0, 16)
     : [];
   if (executedModels.length === 0) {
-    lines.push(`**Claude-recorded execution model:** unavailable`);
+    lines.push(`**Claude 记录的执行模型：** unavailable`);
   } else if (executedModels.length === 1) {
     const m = executedModels[0];
-    lines.push(`**Claude-recorded execution model:** ${safeModelIdForDisplay(m?.id)}`);
+    lines.push(`**Claude 记录的执行模型：** ${safeModelIdForDisplay(m?.id)}`);
   } else {
-    lines.push(`**Claude-recorded execution models:**`);
+    lines.push(`**Claude 记录的执行模型：**`);
     for (const m of executedModels) {
       const scopes = Array.isArray(m?.scopes) ? m.scopes.slice(0, 2) : [];
       const scopeLabel = scopes.map(safeScope).join(", ") || "unknown-scope";
@@ -133,22 +133,22 @@ export function formatModelEvidence({ requestedModel, requestMode, modelEvidence
   if (usageKeys.length === 1) {
     lines.push(`**Provider usage key:** ${usageKeys[0]}`);
   } else if (usageKeys.length > 1) {
-    lines.push(`**Provider usage keys:** ${usageKeys.join(", ")}`);
+    lines.push(`**Provider usage key:** ${usageKeys.join(", ")}`);
   }
 
   // Evidence note
   const status = safeStatus(modelEvidence.status);
   if (status === "unavailable") {
-    lines.push(`_Evidence note: Claude transcript was not available; the usage key is not treated as an execution model._`);
+    lines.push(`_证据说明：Claude transcript 不可用；usage key 不被视为执行模型。_`);
   } else if (status === "partial") {
-    lines.push(`_Evidence note: model evidence is partial due to ${formatWarnings(modelEvidence.warnings)}._`);
+    lines.push(`_证据说明：模型证据不完整，原因：${formatWarnings(modelEvidence.warnings)}。_`);
   } else if (executedModels.length > 0 && usageKeys.length > 0) {
     // Check if execution models differ from usage keys (using normalized values for comparison)
     const execIds = executedModels.map((m) => normalizeModelIdForStorage(m?.id) || "");
     const usageIds = rawUsageKeys.map((k) => normalizeModelIdForStorage(k) || "");
     const hasOverlap = usageIds.some((k) => execIds.includes(k));
     if (!hasOverlap) {
-      lines.push(`_Note: execution labels and usage keys have different semantics and may differ._`);
+      lines.push(`_注意：执行标签与 usage key 语义不同，可能不一致。_`);
     }
   }
 
@@ -157,7 +157,7 @@ export function formatModelEvidence({ requestedModel, requestMode, modelEvidence
     const normalizedRequested = normalizeModelIdForStorage(requestedModel) || "";
     const allExecIds = executedModels.map((m) => normalizeModelIdForStorage(m?.id) || "");
     if (!allExecIds.includes(normalizedRequested)) {
-      lines.push(`_Note: Claude Code recorded a different execution label than the requested identifier._`);
+      lines.push(`_注意：Claude Code 记录的执行标签与请求的标识符不同。_`);
     }
   }
 
@@ -193,7 +193,7 @@ export function formatModelCompact({ requestedModel, requestMode, modelEvidence,
   if (requestMode === "explicit" && requestedModel) {
     return safeModelIdForDisplay(requestedModel);
   }
-  return `inherited${safeStatus(modelEvidence.status) === "unavailable" ? " (no transcript)" : ""}`;
+  return `inherited${safeStatus(modelEvidence.status) === "unavailable" ? "（无 transcript）" : ""}`;
 }
 
 /**
@@ -203,19 +203,19 @@ export function formatModelCompact({ requestedModel, requestMode, modelEvidence,
 export function formatWarnings(warnings) {
   if (!Array.isArray(warnings) || warnings.length === 0) return "";
   const labels = {
-    [WARNINGS.TRANSCRIPT_NOT_FOUND]: "transcript not found",
-    [WARNINGS.INVALID_JSON_LINES]: "invalid JSON lines in transcript",
-    [WARNINGS.SIZE_LIMIT]: "size limit reached",
-    [WARNINGS.LINE_TOO_LONG]: "line too long",
-    [WARNINGS.PATH_OUTSIDE_CONFIG_ROOT]: "path outside config root",
-    [WARNINGS.SCAN_DEADLINE]: "scan deadline reached",
-    [WARNINGS.INVALID_SESSION_ID]: "invalid session ID",
-    [WARNINGS.TOO_MANY_MODELS]: "too many unique models",
-    [WARNINGS.MODEL_ID_TRUNCATED]: "model ID truncated",
-    [WARNINGS.TOO_MANY_SUBAGENTS]: "too many subagent files",
-    [WARNINGS.TOO_MANY_LINES]: "line limit reached",
-    [WARNINGS.SYMLINK_ESCAPE]: "symlink escape attempt",
-    [WARNINGS.READ_ERROR]: "read error",
+    [WARNINGS.TRANSCRIPT_NOT_FOUND]: "未找到 transcript",
+    [WARNINGS.INVALID_JSON_LINES]: "transcript 中存在无效 JSON 行",
+    [WARNINGS.SIZE_LIMIT]: "达到大小限制",
+    [WARNINGS.LINE_TOO_LONG]: "行过长",
+    [WARNINGS.PATH_OUTSIDE_CONFIG_ROOT]: "路径在 config root 之外",
+    [WARNINGS.SCAN_DEADLINE]: "扫描截止",
+    [WARNINGS.INVALID_SESSION_ID]: "无效的 session ID",
+    [WARNINGS.TOO_MANY_MODELS]: "唯一模型过多",
+    [WARNINGS.MODEL_ID_TRUNCATED]: "模型 ID 被截断",
+    [WARNINGS.TOO_MANY_SUBAGENTS]: "subagent 文件过多",
+    [WARNINGS.TOO_MANY_LINES]: "达到行数限制",
+    [WARNINGS.SYMLINK_ESCAPE]: "symlink 逸出尝试",
+    [WARNINGS.READ_ERROR]: "读取错误",
   };
   return warnings.slice(0, 16).map((w) => labels[w] || "(unknown-warning)").join(", ");
 }

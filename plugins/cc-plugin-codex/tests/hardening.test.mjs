@@ -80,6 +80,7 @@ function startServer(t, opts = {}) {
     cwd: workspace,
     env: {
       ...process.env,
+      CC_COMPANION_DASHBOARD_OPEN: "off",
       ...opts.env,
       PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`
     },
@@ -369,7 +370,7 @@ test("read-only delegations do not take the writer lease", async (t) => {
 
   // Read-only delegate should succeed
   const readonly = await server.send(2, "cc_delegate", { task: "success", write: false });
-  assert.match(readonly.result.content[0].text, /Task Completed/);
+  assert.match(readonly.result.content[0].text, /任务完成/);
 
   // Cancel the first to clean up
   await server.send(3, "cc_cancel");
@@ -382,7 +383,7 @@ test("workspace changes are observed via before/after fingerprint comparison", a
   const server = startServer(t);
   // The fake-claude "success" mode creates no files, so we should see 0 changes
   const result = await server.send(1, "cc_delegate", { task: "success" });
-  assert.match(result.result.content[0].text, /Task Completed/);
+  assert.match(result.result.content[0].text, /任务完成/);
   // workspace changes section should not be present (no changes)
   const jobs = listJobs(server.workspace);
   const job = jobs.find((j) => j.status === "completed");
@@ -396,7 +397,7 @@ test("workspace changes are observed via before/after fingerprint comparison", a
 test("Claude is_error JSON produces failed job even with exit code zero", async (t) => {
   const server = startServer(t, { env: { FAKE_CLAUDE_MODE: "is_error" } });
   const result = await server.send(1, "cc_delegate", { task: "exercise structured error handling safely" });
-  assert.match(result.result.content[0].text, /Task Failed/);
+  assert.match(result.result.content[0].text, /任务失败/);
   // MCP output shows safe summary, not raw error detail
   assert.match(result.result.content[0].text, /\[provider_response\]/);
 
@@ -413,7 +414,7 @@ test("Claude is_error JSON produces failed job even with exit code zero", async 
 test("Claude error_subtype (nested result.error) produces failed job", async (t) => {
   const server = startServer(t);
   const result = await server.send(1, "cc_delegate", { task: "error_result_object" });
-  assert.match(result.result.content[0].text, /Task Failed/);
+  assert.match(result.result.content[0].text, /任务失败/);
   assert.match(result.result.content[0].text, /\[provider_response\]/);
   // Detailed error is in the private artifact
   const jobs = listJobs(server.workspace);
@@ -427,7 +428,7 @@ test("Claude error_subtype (nested result.error) produces failed job", async (t)
 test("Claude top-level subtype=error produces failed job even with exit code zero", async (t) => {
   const server = startServer(t);
   const result = await server.send(1, "cc_delegate", { task: "error_subtype" });
-  assert.match(result.result.content[0].text, /Task Failed/);
+  assert.match(result.result.content[0].text, /任务失败/);
   assert.match(result.result.content[0].text, /\[provider_response\]/);
   // Detailed error is in the private artifact
   const jobs = listJobs(server.workspace);
@@ -530,7 +531,7 @@ test("result truncation metadata is included when output exceeds presentation li
   // "flood" mode writes 4096 bytes — should still fit in 256KiB
   // But let's verify the truncation mechanism exists by checking the job metadata
   const result = await server.send(1, "cc_delegate", { task: "success" });
-  assert.match(result.result.content[0].text, /Task Completed/);
+  assert.match(result.result.content[0].text, /任务完成/);
 
   const jobs = listJobs(server.workspace);
   const job = jobs.find((j) => j.status === "completed");
@@ -727,17 +728,23 @@ test("cc_setup reports plugin version, state schema, and resolved paths without 
   const result = await server.send(1, "cc_setup");
   const text = result.result.content[0].text;
 
-  assert.match(text, /Plugin Version/);
-  assert.match(text, /State Schema/);
-  assert.match(text, /State Schema:\*\* v8/);
-  assert.match(text, /Resolved Paths/);
-  assert.match(text, /State dir/);
+  assert.match(text, /插件版本/);
+  assert.match(text, /状态 schema/);
+  assert.match(text, /状态 schema：\*\* v8/);
+  assert.match(text, /解析路径/);
+  assert.match(text, /状态目录/);
 
-  // Must not reveal secrets
-  assert.doesNotMatch(text, /ANTHROPIC_API_KEY/);
-  assert.doesNotMatch(text, /api_key/i);
-  assert.doesNotMatch(text, /token/i);
-  assert.doesNotMatch(text, /secret/i);
+  // Live dashboard URL is surfaced so the user gets the panel before any task
+  assert.match(text, /\*\*实时面板：\*\* http:\/\/127\.0\.0\.1:\d+\?token=/);
+
+  // Must not reveal secrets. The deliberate 实时面板 capability URL (a random
+  // per-boot localhost token shown to the local user by design) is exempt;
+  // every other line is still held to the no-token rule.
+  const withoutDashboardUrl = text.split("\n").filter((line) => !line.includes("实时面板")).join("\n");
+  assert.doesNotMatch(withoutDashboardUrl, /ANTHROPIC_API_KEY/);
+  assert.doesNotMatch(withoutDashboardUrl, /api_key/i);
+  assert.doesNotMatch(withoutDashboardUrl, /token/i);
+  assert.doesNotMatch(withoutDashboardUrl, /secret/i);
 });
 
 // ─── P2: Private Permissions ────────────────────────────────────────────────
@@ -1070,7 +1077,7 @@ test("write=false passes --allowedTools with only Read,Glob,Grep (no Bash/Edit/W
 
   const server = startServer(t, { workspace });
   const result = await server.send(1, "cc_delegate", { task: "echo-args", write: false });
-  assert.match(result.result.content[0].text, /Task Completed/);
+  assert.match(result.result.content[0].text, /任务完成/);
 
   // The echo-args mode echoes back the CLI args as a space-joined string
   const resultText = result.result.content[0].text;
@@ -1131,7 +1138,7 @@ process.stdout.write(JSON.stringify({
   const server = startServer(t, { workspace });
   // Read-only delegation: write=false
   const result = await server.send(1, "cc_delegate", { task: "mutation-test", write: false });
-  assert.match(result.result.content[0].text, /Task Completed/);
+  assert.match(result.result.content[0].text, /任务完成/);
 
   // The mutation marker must NOT exist because --allowedTools has only Read,Glob,Grep
   assert.ok(!fs.existsSync(markerPath),
@@ -1160,7 +1167,7 @@ test("read-only delegation leaves temporary workspace byte-for-byte unchanged", 
 
   const server = startServer(t, { workspace });
   const result = await server.send(1, "cc_delegate", { task: "success", write: false });
-  assert.match(result.result.content[0].text, /Task Completed/);
+  assert.match(result.result.content[0].text, /任务完成/);
 
   // Workspace must be unchanged
   const afterContent = fs.readFileSync(path.join(workspace, "existing.txt"), "utf8");
@@ -1207,7 +1214,7 @@ test("cc_cancel terminates Claude descendant processes before releasing control"
   assert.ok(Number.isFinite(descendantPid));
 
   const cancelled = await server.send(201, "cc_cancel");
-  assert.match(cancelled.result.content[0].text, /cancelled/i);
+  assert.match(cancelled.result.content[0].text, /已取消/i);
   await delegate;
   await waitFor(() => {
     try { process.kill(descendantPid, 0); return false; } catch { return true; }
@@ -1247,7 +1254,7 @@ test("cc_cancel transitions through cancelling status before cancelled", async (
     "Job must transition to cancelling status (not directly to cancelled)");
 
   const cancelled = await cancelPromise;
-  assert.match(cancelled.result.content[0].text, /cancelled/i);
+  assert.match(cancelled.result.content[0].text, /已取消/i);
 
   // Final state must be cancelled
   const jobs = listJobs(workspace);
@@ -1276,7 +1283,7 @@ test("cc_cancel returns only after writer lease is released", async (t) => {
   assert.ok(leaseBefore, "Writer lease must be held during running job");
 
   const cancelled = await server.send(2, "cc_cancel");
-  assert.match(cancelled.result.content[0].text, /cancelled/i);
+  assert.match(cancelled.result.content[0].text, /已取消/i);
 
   // After cc_cancel returns, the lease must be free
   const leaseAfter = getWriterLeaseOwner(workspace);
@@ -1284,7 +1291,7 @@ test("cc_cancel returns only after writer lease is released", async (t) => {
 
   // A new write delegation should be able to start immediately
   const newJob = await server.send(3, "cc_delegate", { task: "success" });
-  assert.match(newJob.result.content[0].text, /Task Completed/);
+  assert.match(newJob.result.content[0].text, /任务完成/);
 
   await delegate.catch(() => {});
 });
@@ -1305,7 +1312,7 @@ test("completed-vs-cancel race: cancelling wins over late success result", async
   // The cancel transitions to cancelling; when the result arrives,
   // the finalizer must write cancelled (not completed).
   const cancelled = await server.send(2, "cc_cancel");
-  assert.match(cancelled.result.content[0].text, /cancelled/i);
+  assert.match(cancelled.result.content[0].text, /已取消/i);
 
   await delegate.catch(() => {});
 
@@ -1331,11 +1338,11 @@ test("cancel during post-result verification returns cancelled consistently", as
   );
 
   const cancelled = await server.send(2, "cc_cancel", { job: verifyingJob.id });
-  assert.match(cancelled.result.content[0].text, /cancelled/i);
+  assert.match(cancelled.result.content[0].text, /已取消/i);
 
   const delegateResult = await delegate;
   assert.equal(delegateResult.result.isError, true);
-  assert.match(delegateResult.result.content[0].text, /Task Cancelled/i,
+  assert.match(delegateResult.result.content[0].text, /任务已取消/i,
     "The pending delegate response must agree with the cancelled terminal state");
 
   const finalJob = listJobs(workspace).find((j) => j.id === verifyingJob.id);
@@ -1355,7 +1362,7 @@ test("duplicate cc_cancel on same job is idempotent", async (t) => {
   }, 5000);
 
   const cancel1 = await server.send(2, "cc_cancel");
-  assert.match(cancel1.result.content[0].text, /cancelled/i);
+  assert.match(cancel1.result.content[0].text, /已取消/i);
 
   // Second cancel on the already-cancelled job should not error
   const cancel2 = await server.send(3, "cc_cancel");
@@ -1371,11 +1378,11 @@ test("cc_cancel on already-completed job reports honestly without lying", async 
 
   // Run a quick successful job
   const result = await server.send(1, "cc_delegate", { task: "success" });
-  assert.match(result.result.content[0].text, /Task Completed/);
+  assert.match(result.result.content[0].text, /任务完成/);
 
   // Cancel the completed job — should report "not running"
   const cancel = await server.send(2, "cc_cancel");
-  assert.match(cancel.result.content[0].text, /not running|already|Cannot cancel|No active/i);
+  assert.match(cancel.result.content[0].text, /没有找到可取消的活跃任务|未在运行|无法取消/i);
 });
 
 test("graceful shutdown drains foreground processes before releasing writer lease", async (t) => {
@@ -1520,6 +1527,7 @@ test("SIGKILL on companion kills watchdog and Claude (hard crash, no graceful cl
     cwd: workspace,
     env: {
       ...process.env,
+      CC_COMPANION_DASHBOARD_OPEN: "off",
       PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
       HANG_PID_FILE: pidFile
     },
@@ -1599,6 +1607,7 @@ test("cc_cancel terminates actual watchdog/Claude processes, not just job state"
     cwd: workspace,
     env: {
       ...process.env,
+      CC_COMPANION_DASHBOARD_OPEN: "off",
       PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
       HANG_PID_FILE: pidFile
     },
@@ -1670,7 +1679,7 @@ test("cc_cancel terminates actual watchdog/Claude processes, not just job state"
 
   // Cancel via cc_cancel
   const cancelled = await send(2, "cc_cancel");
-  assert.match(cancelled.result.content[0].text, /cancelled/);
+  assert.match(cancelled.result.content[0].text, /已取消/);
 
   // Wait with bounded retries for both processes to be dead
   const deadline = Date.now() + 10000;
@@ -1848,7 +1857,7 @@ test("resolveCommandForSpawn fails clearly when a Windows command is absent", as
 
 // ─── P3: Dynamic Model Routing — print-mode protocol, route resolution, diagnostics ──
 
-test("P0 REGRESSION: watchdog uses --print --input-format text --output-format json (not bare --output-format json)", async (t) => {
+test("P0 REGRESSION: watchdog uses --print --input-format text --output-format stream-json --verbose", async (t) => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-print-protocol-"));
   const binDir = path.join(workspace, "bin");
   fs.mkdirSync(binDir, { recursive: true });
@@ -1861,10 +1870,12 @@ test("P0 REGRESSION: watchdog uses --print --input-format text --output-format j
   const server = startServer(t, { workspace });
   const result = await server.send(200, "cc_delegate", { task: "echo-args" });
   const text = result.result.content[0].text;
-  // P0 fix: --output-format json requires --print in Claude Code 2.1.208+
+  // stream-json + --verbose: real-time event streaming for the dashboard.
+  // --print is still required; task still goes via stdin (--input-format text).
   assert.match(text, /--print/);
   assert.match(text, /--input-format text/);
-  assert.match(text, /--output-format json/);
+  assert.match(text, /--output-format stream-json/);
+  assert.match(text, /--verbose/);
 });
 
 test("P0 REGRESSION: print-strict mode fails without --print and succeeds with it", async (t) => {
@@ -1872,7 +1883,7 @@ test("P0 REGRESSION: print-strict mode fails without --print and succeeds with i
   const server = startServer(t);
   const result = await server.send(201, "cc_delegate", { task: "print-strict" });
   // With the P0 fix, --print is always passed, so print-strict mode should succeed
-  assert.match(result.result.content[0].text, /Task Completed/);
+  assert.match(result.result.content[0].text, /任务完成/);
 });
 
 test("cc_resolve_route is listed in tools/list with read-only schema", async (t) => {
@@ -1916,7 +1927,7 @@ test("cc_resolve_route fails closed on ambiguous selectors", async (t) => {
     arguments: { selector: "some-ambiguous-name" }
   });
   const text = response.result.content[0].text;
-  assert.match(text, /ambiguous|clarif|unknown|reject/i);
+  assert.match(text, /歧义|配置错误/i);
 });
 
 test("cc_resolve_route omitted selector returns inherited", async (t) => {
@@ -1938,7 +1949,7 @@ test("cc_setup reports native Claude model routing", async (t) => {
   const text = result.result.content[0].text;
 
   // Must show model routing section
-  assert.match(text, /Model Routing|model routing|selector classifier|inherited/i);
+  assert.match(text, /模型路由|选择器分类器|inherited/i);
 
   // Must NOT leak secret values from env vars
   assert.doesNotMatch(text, /sk-leak-test-secret-key-12345/);
@@ -1962,8 +1973,8 @@ process.exit(99);
   // Run cc_setup WITHOUT livenessProbe — must not invoke claude
   const result = await server.send(208, "cc_setup");
   const text = result.result.content[0].text;
-  assert.match(text, /Plugin Version/);
-  assert.match(text, /State Schema/);
+  assert.match(text, /插件版本/);
+  assert.match(text, /状态 schema/);
   // The trap claude must NOT have been called
   assert.doesNotMatch(text, /CLAUDE_WAS_CALLED_DURING_SETUP/);
 });
@@ -1998,10 +2009,10 @@ test("cc_setup liveness probe fails closed when CLI lacks budget guard (no Provi
   assert.match(text, /fail-closed/i);
   assert.match(text, /budget guard|--max-budget-usd/i);
   // Must NOT have made a Provider call
-  assert.doesNotMatch(text, /Provider liveness confirmed/i);
-  assert.doesNotMatch(text, /Provider liveness probe failed/i);
+  assert.doesNotMatch(text, /Provider 存活性已.*确认/i);
+  assert.doesNotMatch(text, /Provider 存活探测.*失败/i);
   // Must NOT show "Budget guard supported"
-  assert.doesNotMatch(text, /Budget guard supported/i);
+  assert.doesNotMatch(text, /预算保护已支持/i);
 });
 
 test("cc_setup performs real source/cache comparison", async (t) => {
@@ -2009,10 +2020,10 @@ test("cc_setup performs real source/cache comparison", async (t) => {
   const response = await server.send(212, "cc_setup");
   const text = response.result.content[0].text;
   // The source/cache comparison section must be present
-  assert.match(text, /Source\/Cache Compatibility/i);
+  assert.match(text, /源\/缓存一致性/i);
   // Must NOT print an unconditional green claim — it must show a real
   // comparison result (either not-installed, match, or differ)
-  assert.match(text, /not-installed|Source and cache match|Source and cache differ/i);
+  assert.match(text, /not-installed|源码与缓存一致|源码与缓存不一致/i);
 });
 
 test("cc_resolve_route returns bounded structuredContent with no secrets", async (t) => {
@@ -2226,7 +2237,7 @@ test("black-box echo: task text echoed by CLI never leaks into diagnostics, logs
   assert.doesNotMatch(checkText, /Error processing request/);
   assert.doesNotMatch(checkText, /Context:/);
   // cc_check shows only a safe diagnostic summary (stage, duration, structured-error flag).
-  assert.match(checkText, /Diagnostic Summary \(safe\)/);
+  assert.match(checkText, /诊断摘要（安全）/);
   assert.match(checkText, /provider_response/);
 });
 
@@ -2290,7 +2301,7 @@ async function runEchoEncodingCase(t, encoding, task, marker, expectFailSafe) {
   const checkResult = await server.send(231, "cc_check", { job: job.id });
   const checkText = checkResult.result.content[0].text;
   assert.doesNotMatch(checkText, markerRe);
-  assert.match(checkText, /Diagnostic Summary \(safe\)/);
+  assert.match(checkText, /诊断摘要（安全）/);
 }
 
 test("black-box raw task echo never leaks (variant redaction)", async (t) => {
@@ -2338,7 +2349,7 @@ test("black-box completed job stores taskRef, never task content, in state and c
   const task = `Implement the handler for ${marker} with tests.`;
   const delegateResult = await server.send(232, "cc_delegate", { task });
   const delegateText = delegateResult.result.content[0].text;
-  assert.match(delegateText, /Task Completed/);
+  assert.match(delegateText, /任务完成/);
   assert.doesNotMatch(delegateText, /SUCCESS_TASK_MARKER_8842/);
 
   const jobs = listJobs(server.workspace);
@@ -2354,7 +2365,7 @@ test("black-box completed job stores taskRef, never task content, in state and c
   const checkResult = await server.send(233, "cc_check", { job: job.id });
   const checkText = checkResult.result.content[0].text;
   assert.doesNotMatch(checkText, /SUCCESS_TASK_MARKER_8842/);
-  assert.match(checkText, /content withheld/);
+  assert.match(checkText, /内容已隐藏/);
 
   // cc_check all must show the taskRef, never the task content.
   const allResult = await server.send(234, "cc_check", { all: true });
@@ -2572,9 +2583,9 @@ test("preflight ambiguous-selector failure creates a rejected job without spawni
 
   // MCP output must show the category, a job ID, and a safe summary — never
   // the raw error message or a spawned-process failure.
-  assert.match(text, /Ambiguous Model Selector/);
-  assert.match(text, /Job ID:\*\* cc-/);
-  assert.match(text, /Category:\*\* ambiguous-selector/);
+  assert.match(text, /模型选择器歧义/);
+  assert.match(text, /任务 ID：\*\* cc-/);
+  assert.match(text, /类别：\*\* ambiguous-selector/);
   // Must not expose a provider_response stage (that would imply Claude ran).
   assert.doesNotMatch(text, /\[provider_response\]/);
   assert.doesNotMatch(text, /\[spawn\]/);
@@ -2601,7 +2612,7 @@ test("preflight ambiguous-selector failure creates a rejected job without spawni
   const checkResult = await server.send(223, "cc_check", { job: job.id });
   const checkText = checkResult.result.content[0].text;
   assert.match(checkText, /rejected/);
-  assert.match(checkText, /Diagnostic Summary \(safe\)/);
+  assert.match(checkText, /诊断摘要（安全）/);
   assert.match(checkText, /configuration/);
   // No raw error detail in MCP output.
   assert.doesNotMatch(checkText, /Error detail/i);
@@ -2612,7 +2623,7 @@ test("delegation succeeds with inherited native Claude configuration", async (t)
   const result = await server.send(224, "cc_delegate", { task: "success" });
   const text = result.result.content[0].text;
 
-  assert.match(text, /completed/i);
+  assert.match(text, /完成/i);
   assert.doesNotMatch(text, /Configuration Error/);
   assert.doesNotMatch(text, /rejected/);
 
@@ -2636,14 +2647,14 @@ test("legacy external routing inputs do not alter native Claude operations", asy
   });
 
   const delegated = await server.send(225, "cc_delegate", { task: "success", model: "Opus" });
-  assert.match(delegated.result.content[0].text, /completed/i);
+  assert.match(delegated.result.content[0].text, /完成/i);
 
   const resolved = await server.send(226, "cc_resolve_route", { selector: "Opus" });
   assert.equal(resolved.result.isError, undefined);
-  assert.match(resolved.result.content[0].text, /--model.*opus|CLI argument.*opus/i);
+  assert.match(resolved.result.content[0].text, /--model.*opus|CLI 参数.*opus/i);
 
   const setup = await server.send(227, "cc_setup", {});
-  assert.match(setup.result.content[0].text, /Model Routing/i);
+  assert.match(setup.result.content[0].text, /模型路由/i);
   assert.doesNotMatch(setup.result.content[0].text, /retired-fixture/);
 });
 
@@ -2670,12 +2681,12 @@ test("liveness probe persists private auditable artifact with route snapshot + h
   const text = response.result.content[0].text;
 
   // Probe must have succeeded.
-  assert.match(text, /Provider liveness confirmed/i);
+  assert.match(text, /Provider 存活性已.*确认/i);
   // Cost must be reported with provenance — never "$0.00" for a real probe.
-  assert.match(text, /Cost:\*\* \$0\.0100 \(provenance: provider_reported\)/i);
+  assert.match(text, /费用：\*\* \$0\.0100 \(provenance: provider_reported\)/i);
 
   // Extract the probe ID and read the private artifact.
-  const idMatch = text.match(/Probe ID:\*\* (probe-[a-z0-9-]+)/i);
+  const idMatch = text.match(/探测 ID：\*\* (probe-[a-z0-9-]+)/i);
   assert.ok(idMatch, "Probe ID must be present in MCP output");
   const probeId = idMatch[1];
   const artifact = readResultArtifact(server.workspace, probeId);
@@ -2715,12 +2726,12 @@ test("liveness probe reports unknown cost (never $0.00) when telemetry is missin
   const text = response.result.content[0].text;
 
   // Probe succeeded but telemetry was missing.
-  assert.match(text, /Provider liveness confirmed/i);
+  assert.match(text, /Provider 存活性已.*确认/i);
   // Cost must be "unknown" — NEVER "$0.00".
-  assert.match(text, /Cost:\*\* unknown \(provenance: unknown\)/i);
+  assert.match(text, /费用：\*\* unknown \(provenance: unknown\)/i);
   assert.doesNotMatch(text, /\$0\.00/);
 
-  const idMatch = text.match(/Probe ID:\*\* (probe-[a-z0-9-]+)/i);
+  const idMatch = text.match(/探测 ID：\*\* (probe-[a-z0-9-]+)/i);
   assert.ok(idMatch);
   const probeId = idMatch[1];
   const artifact = readResultArtifact(server.workspace, probeId);
@@ -2747,10 +2758,10 @@ test("liveness probe preserves its plugin-owned stage while redacting short-task
     maxBudgetUsd: 0.05,
   });
   const text = response.result.content[0].text;
-  assert.match(text, /Stage:\*\* provider_response/i);
-  assert.match(text, /Failure reason:\*\* (?:budget_rejected|authentication_rejected|rate_limited|model_unavailable|provider_unavailable|unclassified)/i);
+  assert.match(text, /阶段：\*\* provider_response/i);
+  assert.match(text, /失败原因：\*\* (?:budget_rejected|authentication_rejected|rate_limited|model_unavailable|provider_unavailable|unclassified)/i);
 
-  const probeId = text.match(/Probe ID:\*\* (probe-[a-z0-9-]+)/i)?.[1];
+  const probeId = text.match(/探测 ID：\*\* (probe-[a-z0-9-]+)/i)?.[1];
   assert.ok(probeId);
   const artifact = readResultArtifact(server.workspace, probeId);
   assert.equal(artifact.failureStage, "provider_response");
@@ -2772,8 +2783,8 @@ test("liveness probe preserves an explicit Provider-reported zero cost", async (
     maxBudgetUsd: 0.25,
   });
   const text = response.result.content[0].text;
-  assert.match(text, /Cost:\*\* \$0\.0000 \(provenance: provider_reported\)/);
-  const probeId = text.match(/Probe ID:\*\* (probe-[a-z0-9-]+)/i)?.[1];
+  assert.match(text, /费用：\*\* \$0\.0000 \(provenance: provider_reported\)/);
+  const probeId = text.match(/探测 ID：\*\* (probe-[a-z0-9-]+)/i)?.[1];
   assert.ok(probeId);
   const artifact = readResultArtifact(server.workspace, probeId);
   assert.equal(artifact.cost, 0);
@@ -2785,7 +2796,7 @@ test("cc_setup never reflects secrets from inherited native configuration", asyn
   const setup = await server.send(241, "cc_setup", {});
   const setupText = setup.result.content[0].text;
   assert.doesNotMatch(setupText, /sk-secret-0123456789/);
-  assert.match(setupText, /Model Routing|model routing|selector classifier/i);
+  assert.match(setupText, /模型路由|选择器分类器/i);
 
   const resolve = await server.send(242, "cc_resolve_route", { selector: "Opus" });
   assert.doesNotMatch(resolve.result.content[0].text, /sk-secret-0123456789/);
@@ -2807,9 +2818,9 @@ test("liveness probe with explicit Opus selector records route snapshot (no alia
     model: "Opus",
   });
   const text = response.result.content[0].text;
-  assert.match(text, /Provider liveness confirmed/i);
+  assert.match(text, /Provider 存活性已.*确认/i);
 
-  const idMatch = text.match(/Probe ID:\*\* (probe-[a-z0-9-]+)/i);
+  const idMatch = text.match(/探测 ID：\*\* (probe-[a-z0-9-]+)/i);
   const probeId = idMatch[1];
   const artifact = readResultArtifact(server.workspace, probeId);
   assert.ok(artifact);

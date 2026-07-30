@@ -1,7 +1,7 @@
 {
   "name": "cc-plugin-codex",
-  "version": "0.3.0+codex.20260729120039",
-  "description": "Delegate coding tasks to Claude Code from Codex, then review the results.",
+  "version": "0.3.0+codex.20260730040553",
+  "description": "从 Codex 把编码任务委托给 Claude Code，完成后审查结果。",
   "author": {
     "name": "Robert Wu"
   },
@@ -17,8 +17,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Claude",
-    "shortDescription": "Delegate coding tasks to Claude Code and review results",
-    "longDescription": "Use Claude Code as a coding companion from within Codex. Delegate implementation tasks, check execution status, review changes with adversarial mode, and manage running jobs.",
+    "shortDescription": "把编码任务委托给 Claude Code 并审查结果",
+    "longDescription": "在 Codex 中将 Claude Code 作为编码伙伴。委托实现任务、查看执行状态、以对抗模式审查变更，并管理运行中的任务。",
     "developerName": "Robert Wu",
     "category": "Developer Tools",
     "capabilities": [
@@ -26,8 +26,8 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Delegate a coding task to Claude Code",
-      "Have Claude Code implement this feature"
+      "把一个编码任务委托给 Claude Code",
+      "让 Claude Code 实现这个功能"
     ]
   }
 }

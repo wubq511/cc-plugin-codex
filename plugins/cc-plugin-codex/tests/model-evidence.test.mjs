@@ -540,10 +540,10 @@ test("formatModelEvidence: inherited mode with complete evidence", () => {
     },
   });
 
-  assert.match(text, /inherited from Claude Code configuration/);
+  assert.match(text, /继承自 Claude Code 配置/);
   assert.match(text, /mimo-v2\.5-pro/);
   assert.match(text, /Provider usage key.*mimo-v2\.5/);
-  assert.match(text, /execution labels and usage keys have different semantics/);
+  assert.match(text, /执行标签与 usage key 语义不同/);
   assert.doesNotMatch(text, /Observed Model/);
   assert.doesNotMatch(text, /\*\*Model:\*\* mimo-v2\.5$/m);
 });
@@ -561,9 +561,9 @@ test("formatModelEvidence: explicit model override", () => {
     },
   });
 
-  assert.match(text, /Requested model.*custom-provider\/model-pro/);
+  assert.match(text, /请求的模型.*custom-provider\/model-pro/);
   assert.match(text, /custom-provider\/model-pro-v202607/);
-  assert.match(text, /Provider usage keys.*model-pro, cache-tier-a/);
+  assert.match(text, /Provider usage key.*model-pro, cache-tier-a/);
 });
 
 test("formatModelEvidence: transcript unavailable", () => {
@@ -580,8 +580,8 @@ test("formatModelEvidence: transcript unavailable", () => {
   });
 
   assert.match(text, /unavailable/);
-  assert.match(text, /not treated as an execution model/);
-  assert.doesNotMatch(text, /execution model.*mimo-v2\.5/);
+  assert.match(text, /不被视为执行模型/);
+  assert.doesNotMatch(text, /执行模型.*mimo-v2\.5/);
 });
 
 test("formatModelEvidence: multi-model task", () => {
@@ -600,7 +600,7 @@ test("formatModelEvidence: multi-model task", () => {
     },
   });
 
-  assert.match(text, /execution models/);
+  assert.match(text, /Claude 记录的执行模型/);
   assert.match(text, /mimo-v2\.5-pro \(main, subagent\)/);
   assert.match(text, /glm-5\.1 \(subagent\)/);
 });
@@ -680,7 +680,7 @@ test("SECURITY: unknown persisted route status is rendered as a safe placeholder
     routeStatus: "unknown\n#injected",
     modelEvidence: { status: "complete", executedModels: [], usageModelKeys: [], usageSource: "claude-result-modelUsage", warnings: [] },
   });
-  assert.match(text, /Route status:\*\* unavailable/);
+  assert.match(text, /路由状态：\*\* unavailable/);
   assert.doesNotMatch(text, /#injected/);
 });
 
@@ -754,7 +754,7 @@ test("SECURITY: unknown status → unknown", () => {
 test("SECURITY: unknown warning code → (unknown-warning), not raw value", () => {
   const evilWarning = "evil" + String.fromCharCode(10) + "#injected-warning";
   const text = formatWarnings(["transcript-not-found", evilWarning]);
-  assert.match(text, /transcript not found/);
+  assert.match(text, /未找到 transcript/);
   assert.match(text, /\(unknown-warning\)/);
   assert.doesNotMatch(text, /#injected-warning/);
 });

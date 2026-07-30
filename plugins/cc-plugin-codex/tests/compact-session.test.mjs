@@ -47,6 +47,7 @@ function startServer(t, opts = {}) {
     cwd: workspace,
     env: {
       ...process.env,
+      CC_COMPANION_DASHBOARD_OPEN: "off",
       ...opts.env,
       PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
     },
@@ -96,7 +97,7 @@ function startServer(t, opts = {}) {
 
 // Helper: extract CLI args from echo-args result
 function extractArgs(resultText) {
-  const argsMatch = resultText.match(/### Result\n([\s\S]*?)(\n\n|\n---)/);
+  const argsMatch = resultText.match(/### 结果\n([\s\S]*?)(\n\n|\n---)/);
   return argsMatch ? argsMatch[1].trim() : "";
 }
 
@@ -106,7 +107,7 @@ test("cc_delegate pre-allocates claudeSessionUuid for new sessions", async (t) =
   const server = startServer(t);
   const result = await server.send(1, "cc_delegate", { task: "echo-args" });
   const text = result.result.content[0].text;
-  assert.match(text, /Task Completed/);
+  assert.match(text, /任务完成/);
 
   // The job record must have a claudeSessionUuid before spawn.
   // We verify by checking the args contain --session-id <uuid>.
@@ -120,7 +121,7 @@ test("cc_delegate does not pass --session-id on resume", async (t) => {
 
   // First delegation: create a session
   const first = await server.send(1, "cc_delegate", { task: "success" });
-  assert.match(first.result.content[0].text, /Task Completed/);
+  assert.match(first.result.content[0].text, /任务完成/);
 
   // Get the claudeSessionId from the first job
   const jobs = listJobs(server.workspace);
@@ -133,7 +134,7 @@ test("cc_delegate does not pass --session-id on resume", async (t) => {
     resumeSession: firstJob.claudeSessionId,
   });
   const secondText = second.result.content[0].text;
-  assert.match(secondText, /Task Completed/);
+  assert.match(secondText, /任务完成/);
 
   // Resume must use --resume, NOT --session-id
   const args = extractArgs(secondText);
@@ -146,7 +147,7 @@ test("cc_delegate does not pass --session-id on resume", async (t) => {
 test("cc_delegate persists claudeSessionUuid in job state before spawn", async (t) => {
   const server = startServer(t);
   const result = await server.send(1, "cc_delegate", { task: "success" });
-  assert.match(result.result.content[0].text, /Task Completed/);
+  assert.match(result.result.content[0].text, /任务完成/);
 
   const jobs = listJobs(server.workspace);
   const job = jobs.find((j) => j.status === "completed");
@@ -192,7 +193,7 @@ test("cc_compact rejects running job", async (t) => {
 
   // cc_compact must reject the running job (by job ID)
   const compactResult = await server.send(2, "cc_compact", { job: runningJob.id });
-  assert.match(compactResult.result.content[0].text, /still running/i);
+  assert.match(compactResult.result.content[0].text, /仍处于 running 状态/i);
   assert.equal(compactResult.result.isError, true);
 
   // Cleanup: cancel the hanging job
@@ -213,7 +214,7 @@ test("cc_compact rejects explicit resumeSession that matches a running job", asy
     resumeSession: sessionId,
   });
   assert.equal(compactResult.result.isError, true);
-  assert.match(compactResult.result.content[0].text, /still running|active/i);
+  assert.match(compactResult.result.content[0].text, /仍处于 running 状态/i);
 
   await server.send(3, "cc_cancel");
   await delegatePromise;
@@ -238,7 +239,7 @@ test("cc_compact rejects cancelling job", async (t) => {
   // process settlement are covered by the dedicated end-to-end cancel tests;
   // this assertion must not depend on a 20ms OS scheduling window.
   const compactResult = await server.send(1, "cc_compact", { job: cancellingJob.id });
-  assert.match(compactResult.result.content[0].text, /still cancelling/i);
+  assert.match(compactResult.result.content[0].text, /仍处于 cancelling 状态/i);
   assert.equal(compactResult.result.isError, true);
 });
 
@@ -246,7 +247,7 @@ test("cc_compact returns error when no stopped session exists", async (t) => {
   const server = startServer(t);
 
   const result = await server.send(1, "cc_compact");
-  assert.match(result.result.content[0].text, /No stopped Claude Code session/i);
+  assert.match(result.result.content[0].text, /未找到.*已停止.*会话/i);
   assert.equal(result.result.isError, true);
 });
 
@@ -290,17 +291,17 @@ test("cc_compact on stopped session without transcript returns compacted:false",
 
   // Run a successful delegation
   const delegateResult = await server.send(1, "cc_delegate", { task: "success" });
-  assert.match(delegateResult.result.content[0].text, /Task Completed/);
+  assert.match(delegateResult.result.content[0].text, /任务完成/);
 
   // Compact the stopped session
   const compactResult = await server.send(2, "cc_compact");
   const compactText = compactResult.result.content[0].text;
 
   // No transcript in test env → compacted:false + reason
-  assert.match(compactText, /Compacted:\*\*\s*false/i);
-  assert.match(compactText, /Reason:/i);
+  assert.match(compactText, /已压缩：\*\*\s*false/i);
+  assert.match(compactText, /原因：/i);
   // observedBoundary must be null (not fabricated)
-  assert.doesNotMatch(compactText, /Observed boundary:\*\*\s*\d/i,
+  assert.doesNotMatch(compactText, /观察到的边界：\*\*\s*\d/i,
     "observedBoundary must not be fabricated when no transcript exists");
 
   const persisted = listJobs(server.workspace).find((j) => j.status === "completed");
@@ -325,7 +326,7 @@ test("cc_compact does not count a historical boundary as this invocation's succe
 
   // Run a successful delegation to create a job with a claudeSessionId
   const delegateResult = await server.send(1, "cc_delegate", { task: "success" });
-  assert.match(delegateResult.result.content[0].text, /Task Completed/);
+  assert.match(delegateResult.result.content[0].text, /任务完成/);
 
   const jobs = listJobs(workspace);
   const job = jobs.find((j) => j.status === "completed");
@@ -348,8 +349,8 @@ test("cc_compact does not count a historical boundary as this invocation's succe
   const compactResult = await server.send(2, "cc_compact");
   const compactText = compactResult.result.content[0].text;
 
-  assert.match(compactText, /Compacted:\*\*\s*false/i);
-  assert.doesNotMatch(compactText, /Observed boundary:\*\*\s*45000/i);
+  assert.match(compactText, /已压缩：\*\*\s*false/i);
+  assert.doesNotMatch(compactText, /观察到的边界：\*\*\s*45000/i);
 });
 
 test("cc_compact returns compacted:true only for a boundary appended by this invocation", async (t) => {
@@ -370,10 +371,10 @@ test("cc_compact returns compacted:true only for a boundary appended by this inv
   const compactResult = await server.send(2, "cc_compact");
   const compactText = compactResult.result.content[0].text;
 
-  assert.match(compactText, /Compacted:\*\*\s*true/i);
-  assert.match(compactText, /Pre-compaction tokens:\*\*\s*47000/i);
-  assert.match(compactText, /Trigger:\*\*\s*manual/i);
-  assert.match(compactText, /Observed boundary:\*\*\s*47000/i);
+  assert.match(compactText, /已压缩：\*\*\s*true/i);
+  assert.match(compactText, /压缩前 token：\*\*\s*47000/i);
+  assert.match(compactText, /触发器：\*\*\s*manual/i);
+  assert.match(compactText, /观察到的边界：\*\*\s*47000/i);
 
   const persisted = listJobs(workspace).find((j) => j.status === "completed");
   assert.equal(persisted.compactResult.compacted, true);
@@ -393,7 +394,7 @@ test("cc_compact observedBoundary is null when transcript has no boundary", asyn
   });
 
   const delegateResult = await server.send(1, "cc_delegate", { task: "success" });
-  assert.match(delegateResult.result.content[0].text, /Task Completed/);
+  assert.match(delegateResult.result.content[0].text, /任务完成/);
 
   const job = listJobs(workspace).find((j) => j.status === "completed");
 
@@ -404,8 +405,8 @@ test("cc_compact observedBoundary is null when transcript has no boundary", asyn
   const compactResult = await server.send(2, "cc_compact");
   const compactText = compactResult.result.content[0].text;
 
-  assert.match(compactText, /Compacted:\*\*\s*false/i);
-  assert.doesNotMatch(compactText, /Observed boundary:\*\*\s*\d/i,
+  assert.match(compactText, /已压缩：\*\*\s*false/i);
+  assert.doesNotMatch(compactText, /观察到的边界：\*\*\s*\d/i,
     "observedBoundary must be null when no boundary in transcript");
 });
 
@@ -685,7 +686,7 @@ test("cancel preserves claudeSessionId, claudeSessionUuid, and autoCompact polic
   const delegateResult = await delegatePromise;
   assert.match(
     delegateResult.result.content[0].text,
-    /Auto-compact taskScopeId:\*\*\s*[0-9a-f-]{36}/i,
+    /自动压缩 taskScopeId：\*\*\s*[0-9a-f-]{36}/i,
     "Cancelled delegation must return the generated taskScopeId for later fresh sessions",
   );
 });
@@ -711,10 +712,10 @@ test("cc_compact locates cancelled new session via its pre-allocated canonical I
   assert.equal(cancelledJob.claudeSessionId, cancelledJob.claudeSessionUuid);
 
   // cc_compact(job) must locate the session via claudeSessionUuid fallback,
-  // NOT return "No stopped Claude Code session".
+  // NOT return "未找到.*已停止.*会话".
   const compactResult = await server.send(3, "cc_compact", { job: runningJob.id });
   const compactText = compactResult.result.content[0].text;
-  assert.doesNotMatch(compactText, /No stopped Claude Code session/i,
+  assert.doesNotMatch(compactText, /未找到.*已停止.*会话/i,
     "cc_compact must fall back to claudeSessionUuid when claudeSessionId is null");
 
   await delegatePromise.catch(() => {});
@@ -748,7 +749,7 @@ test("end-to-end: cancel → compact → resume the same pre-allocated session",
 
   // 2. Compact the stopped session (no transcript → compacted:false, but no crash)
   const compactResult = await server.send(3, "cc_compact", { job: firstJob.id });
-  assert.match(compactResult.result.content[0].text, /Compact Result/i);
+  assert.match(compactResult.result.content[0].text, /压缩结果/i);
 
   // 3. Resume the same session
   const resumeResult = await server.send(4, "cc_delegate", {
@@ -756,7 +757,7 @@ test("end-to-end: cancel → compact → resume the same pre-allocated session",
     resumeSession: firstJob.claudeSessionId,
   });
   const resumeText = resumeResult.result.content[0].text;
-  assert.match(resumeText, /Task Completed/);
+  assert.match(resumeText, /任务完成/);
 
   // Verify resume used --resume, not --session-id
   const args = extractArgs(resumeText);

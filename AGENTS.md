@@ -34,6 +34,9 @@ Codex ↔ cc-companion.mjs ↔ claude-runner.mjs ↔ watchdog.mjs ↔ Claude Cod
   `compact_resume`, and `fresh_handoff`.
 - `scripts/lib/git.mjs`: bounded, secret-filtered review context and workspace
   fingerprints.
+- `scripts/lib/dashboard.mjs` and `dashboard-page.mjs`: read-only local dashboard
+  (127.0.0.1 only, random-token auth, SSE). Events live in per-job in-memory ring
+  buffers and must never be persisted to disk.
 
 ## Non-Negotiable Contracts
 

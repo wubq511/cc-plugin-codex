@@ -56,6 +56,7 @@ function startServer(t, { env: extraEnv } = {}) {
     cwd: workspace,
     env: {
       ...process.env,
+      CC_COMPANION_DASHBOARD_OPEN: "off",
       PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
       ...extraEnv
     },
@@ -138,7 +139,7 @@ test("foreground delegate stays pending and returns exactly once without cc_chec
   assert.equal((await ping).id, 2, "readline must remain responsive while delegate is pending");
 
   const completed = await delegate;
-  assert.match(completed.result.content[0].text, /Task Completed/);
+  assert.match(completed.result.content[0].text, /任务完成/);
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal(server.messages.filter((message) => message.id === 1).length, 1);
 });
@@ -149,14 +150,14 @@ test("cc_cancel terminates a pending foreground delegate and preserves cancelled
   await new Promise((resolve) => setTimeout(resolve, 100));
 
   const cancelled = await server.send(11, "cc_cancel");
-  assert.match(cancelled.result.content[0].text, /cancelled/);
+  assert.match(cancelled.result.content[0].text, /已取消/);
 
   const delegateResult = await delegate;
-  assert.match(delegateResult.result.content[0].text, /Task Cancelled/);
+  assert.match(delegateResult.result.content[0].text, /任务已取消/);
 
   const status = await server.send(12, "cc_check");
-  assert.match(status.result.content[0].text, /\*\*Status:\*\* cancelled/);
-  assert.doesNotMatch(status.result.content[0].text, /\*\*Status:\*\* failed/);
+  assert.match(status.result.content[0].text, /\*\*状态：\*\* cancelled/);
+  assert.doesNotMatch(status.result.content[0].text, /\*\*状态：\*\* failed/);
   assert.equal(server.messages.filter((message) => message.id === 10).length, 1);
 });
 
@@ -243,8 +244,8 @@ test("adversarial working-tree review works without a recorded Claude Code job",
     scope: "working-tree",
     adversarial: true
   });
-  assert.match(review.result.content[0].text, /## Review: Job working-tree/);
-  assert.match(review.result.content[0].text, /Review Mode:\*\* Adversarial/);
+  assert.match(review.result.content[0].text, /## 审查：任务working-tree/);
+  assert.match(review.result.content[0].text, /审查模式：\*\* Adversarial/);
   assert.match(review.result.content[0].text, /example\.txt/);
 });
 
@@ -329,7 +330,7 @@ test("delegate accepts an arbitrary custom model identifier and passes it throug
     task: "success",
     model: "mimo-v2.5-pro"
   });
-  assert.match(completed.result.content[0].text, /Task Completed/);
+  assert.match(completed.result.content[0].text, /任务完成/);
   // The job should record the requested model
   const jobs = listJobs(server.workspace);
   const job = jobs.find((j) => j.requestedModel === "mimo-v2.5-pro");
@@ -340,7 +341,7 @@ test("delegate accepts an arbitrary custom model identifier and passes it throug
 test("delegate without model omits --model and records inherited requestMode", async (t) => {
   const server = startServer(t);
   const completed = await server.send(81, "cc_delegate", { task: "success" });
-  assert.match(completed.result.content[0].text, /Task Completed/);
+  assert.match(completed.result.content[0].text, /任务完成/);
   const jobs = listJobs(server.workspace);
   const job = jobs.find((j) => j.id);
   assert.ok(job);
@@ -381,7 +382,7 @@ test("cc_list_models contains no hard-coded official catalogue", async (t) => {
   // Must describe inherited configuration
   assert.match(text, /inherited|Provider/i);
   // Must mention optional override
-  assert.match(text, /override|free-form/i);
+  assert.match(text, /覆盖|free-form/i);
 });
 
 test("cc_list_models does not recommend specific models for task types", async (t) => {
@@ -431,7 +432,7 @@ test("delegate accepts a valid positive integer timeoutSeconds", async (t) => {
     task: "success",
     timeoutSeconds: 60
   });
-  assert.match(completed.result.content[0].text, /Task Completed/);
+  assert.match(completed.result.content[0].text, /任务完成/);
 });
 
 // ─── No default timeout — delayed task completes ───────────────────────────
@@ -439,7 +440,7 @@ test("delegate accepts a valid positive integer timeoutSeconds", async (t) => {
 test("foreground delegate with no timeoutSeconds completes a delayed task", async (t) => {
   const server = startServer(t);
   const completed = await server.send(94, "cc_delegate", { task: "delay:200" });
-  assert.match(completed.result.content[0].text, /Task Completed/);
+  assert.match(completed.result.content[0].text, /任务完成/);
   assert.match(completed.result.content[0].text, /delayed result/);
 });
 
@@ -449,8 +450,8 @@ test("foreground delegate with explicit short timeoutSeconds terminates a hangin
     task: "hang",
     timeoutSeconds: 1
   });
-  assert.match(completed.result.content[0].text, /Task Failed/);
-  assert.match(completed.result.content[0].text, /timed out/);
+  assert.match(completed.result.content[0].text, /任务失败/);
+  assert.match(completed.result.content[0].text, /超时/);
 });
 
 // ─── requestedModel vs modelEvidence ───────────────────────────────────────
@@ -484,7 +485,7 @@ test("cc_check shows requested model and usage key with new terminology", async 
   });
   const status = await server.send(98, "cc_check");
   const text = status.result.content[0].text;
-  assert.match(text, /Requested model.*custom-model-v1/);
+  assert.match(text, /请求的模型.*custom-model-v1/);
   assert.match(text, /Provider usage key.*mimo-v2\.5/);
   // Must NOT use old "Observed Model" terminology
   assert.doesNotMatch(text, /Observed Model/);
@@ -498,15 +499,15 @@ test("delegate passes model identifier to claude CLI exactly unchanged", async (
     task: "echo the command line arguments please",
     model: "mimo-v2.5-pro"
   });
-  assert.match(completed.result.content[0].text, /Task Completed/);
+  assert.match(completed.result.content[0].text, /任务完成/);
   // The "args" mode echoes back the CLI args as a space-joined string.
   // Verify --model was passed with the exact value, no trimming or rewriting.
   const text = completed.result.content[0].text;
   assert.match(text, /--model mimo-v2\.5-pro/);
   // Also verify the model wasn't trimmed (if it had been, the surrounding
   // args context would show it differently). Check exact arg boundary:
-  // P0 fix: print-mode JSON protocol is now `--print --input-format text --output-format json`.
-  assert.match(text, /--print --input-format text --output-format json --model mimo-v2\.5-pro/);
+  // stream-json + --verbose protocol: `--print --input-format text --output-format stream-json --verbose`.
+  assert.match(text, /--print --input-format text --output-format stream-json --verbose --model mimo-v2\.5-pro/);
 });
 
 // ─── timeoutSeconds upper bound ────────────────────────────────────────────
@@ -527,7 +528,7 @@ test("delegate accepts timeoutSeconds at the 604800 boundary", async (t) => {
     task: "success",
     timeoutSeconds: 604800
   });
-  assert.match(completed.result.content[0].text, /Task Completed/);
+  assert.match(completed.result.content[0].text, /任务完成/);
 });
 
 // ─── cc_list_models optional cwd ───────────────────────────────────────────
@@ -540,7 +541,7 @@ test("cc_list_models without cwd reports from session workspaces (generic no-cwd
   // Now call cc_list_models without cwd — should find the job from the session workspace
   const response = await server.send(104, "cc_list_models");
   const text = response.result.content[0].text;
-  assert.match(text, /Latest Completed Job/);
+  assert.match(text, /最近完成的任务/);
   assert.match(text, /test-model-v1/);
 });
 
@@ -578,7 +579,7 @@ test("cc_list_models with cwd loads history from that workspace directly", async
   // Call cc_list_models with explicit cwd
   const response = await server.send(105, "cc_list_models", { cwd: target });
   const text = response.result.content[0].text;
-  assert.match(text, /Latest Completed Job/);
+  assert.match(text, /最近完成的任务/);
   assert.match(text, /cc-list-models-test/);
   assert.match(text, /workspace-model-xyz/);
 });
@@ -603,7 +604,7 @@ test("REGRESSION: cc_delegate output uses new model evidence terminology", async
   });
   const text = result.result.content[0].text;
   // Must use new terminology
-  assert.match(text, /Requested model.*mimo-v2\.5-pro/);
+  assert.match(text, /请求的模型.*mimo-v2\.5-pro/);
   assert.match(text, /Provider usage key.*mimo-v2\.5/);
   // Must NOT use old terminology
   assert.doesNotMatch(text, /Observed Model/);
@@ -618,7 +619,7 @@ test("REGRESSION: cc_check single job uses new model evidence terminology", asyn
   const status = await server.send(112, "cc_check");
   const text = status.result.content[0].text;
   // Must use new terminology
-  assert.match(text, /Model request.*inherited/);
+  assert.match(text, /模型请求.*继承/);
   assert.match(text, /Provider usage key.*mimo-v2\.5/);
   // Must NOT use old terminology
   assert.doesNotMatch(text, /Observed Model/);
@@ -633,7 +634,7 @@ test("REGRESSION: cc_check all=true table uses Model Evidence header", async (t)
   const status = await server.send(114, "cc_check", { all: true });
   const text = status.result.content[0].text;
   // Table header must say "Model Evidence", not "Model"
-  assert.match(text, /\| Model Evidence \|/);
+  assert.match(text, /\| 模型证据 \|/);
   assert.doesNotMatch(text, /\| Model \|/);
 });
 
@@ -651,7 +652,7 @@ test("REGRESSION: cc_review uses Model Evidence label", async (t) => {
   const review = await server.send(116, "cc_review");
   const text = review.result.content[0].text;
   // Must use "Model Evidence" label, not "Model"
-  assert.match(text, /\*\*Model Evidence:\*\*/);
+  assert.match(text, /\*\*模型证据：\*\*/);
   assert.doesNotMatch(text, /\*\*Model:\*\*/);
 });
 
@@ -723,13 +724,13 @@ test("REGRESSION: full transcript→executedModels chain across all display surf
     // 4. cc_check single job
     const checkResult = await server.send(121, "cc_check");
     const checkText = checkResult.result.content[0].text;
-    assert.match(checkText, /Claude-recorded execution model.*mimo-v2\.5-pro/);
+    assert.match(checkText, /Claude 记录的执行模型.*mimo-v2\.5-pro/);
     assert.match(checkText, /Provider usage key.*mimo-v2\.5/);
 
     // 5. cc_check all=true
     const allResult = await server.send(122, "cc_check", { all: true });
     const allText = allResult.result.content[0].text;
-    assert.match(allText, /\| Model Evidence \|/);
+    assert.match(allText, /\| 模型证据 \|/);
     assert.match(allText, /mimo-v2\.5-pro/);
 
     // 6. cc_list_models
@@ -740,10 +741,50 @@ test("REGRESSION: full transcript→executedModels chain across all display surf
     // 7. cc_review
     const reviewResult = await server.send(124, "cc_review");
     const reviewText = reviewResult.result.content[0].text;
-    assert.match(reviewText, /\*\*Model Evidence:\*\*[\s\S]*mimo-v2\.5-pro/);
+    assert.match(reviewText, /\*\*模型证据：\*\*[\s\S]*mimo-v2\.5-pro/);
     assert.match(reviewText, /Provider usage key.*mimo-v2\.5/);
   } finally {
     // Cleanup
     fs.rmSync(claudeConfigDir, { recursive: true, force: true });
   }
+});
+
+test("delegate success response embeds a terminal resume command with the real session id", async (t) => {
+  const server = startServer(t);
+  const completed = await server.send(200, "cc_delegate", { task: "do work" });
+  const text = completed.result.content[0].text;
+  assert.match(text, /任务完成/);
+  assert.match(text, /### 在终端继续此会话/);
+  const jobs = listJobs(server.workspace);
+  const job = jobs.find((j) => j.status === "completed");
+  assert.ok(job, "completed job should exist");
+  const sid = job.claudeSessionId || job.claudeSessionUuid;
+  assert.ok(sid, "job should have a session id");
+  assert.ok(
+    text.includes(`claude --resume ${sid}`),
+    "response should embed the real session id in the resume command"
+  );
+});
+
+test("delegate preflight rejection omits the terminal resume section", async (t) => {
+  const server = startServer(t);
+  // "deepseek" has no digit and is not a known alias → ambiguous selector,
+  // rejected before any Claude session is spawned (no claudeSessionId).
+  const rejected = await server.send(201, "cc_delegate", { task: "x", model: "deepseek" });
+  const text = rejected.result.content[0].text;
+  assert.match(text, /模型选择器歧义|配置错误/);
+  assert.doesNotMatch(text, /### 在终端继续此会话/);
+  assert.doesNotMatch(text, /claude --resume/);
+});
+
+test("cc_check single-job output includes the terminal resume section for a completed job", async (t) => {
+  const server = startServer(t);
+  await server.send(202, "cc_delegate", { task: "do work" });
+  const check = await server.send(203, "cc_check");
+  const text = check.result.content[0].text;
+  assert.match(text, /### 在终端继续此会话/);
+  const jobs = listJobs(server.workspace);
+  const job = jobs.find((j) => j.status === "completed");
+  const sid = job.claudeSessionId || job.claudeSessionUuid;
+  assert.ok(text.includes(`claude --resume ${sid}`));
 });

@@ -44,6 +44,7 @@ function startServer(t, opts = {}) {
     cwd: workspace,
     env: {
       ...process.env,
+      CC_COMPANION_DASHBOARD_OPEN: "off",
       ...opts.env,
       PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
     },
@@ -407,9 +408,9 @@ test("cc_delegate with autoCompact passes --settings with two env keys", async (
   });
   const text = result.result.content[0].text;
   // The fake Claude echoes its CLI args as the result
-  assert.match(text, /Task Completed/);
+  assert.match(text, /任务完成/);
   // Extract the args portion from the result
-  const argsMatch = text.match(/### Result\n([\s\S]*?)(\n\n|\n---)/);
+  const argsMatch = text.match(/### 结果\n([\s\S]*?)(\n\n|\n---)/);
   assert.ok(argsMatch, "Result section must be present");
   const args = argsMatch[1].trim();
   // --settings must be present
@@ -519,7 +520,7 @@ test("cc_delegate with task scope generates and returns taskScopeId", async (t) 
     },
   });
   const text = result.result.content[0].text;
-  assert.match(text, /Task Completed/);
+  assert.match(text, /任务完成/);
   assert.match(text, /taskScopeId=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
 });
 
@@ -535,8 +536,8 @@ test("failed task-scoped delegation still returns its generated taskScopeId", as
   });
   const text = result.result.content[0].text;
   assert.equal(result.result.isError, true);
-  assert.match(text, /Task Failed/i);
-  assert.match(text, /Auto-compact taskScopeId:\*\*\s*[0-9a-f-]{36}/i);
+  assert.match(text, /任务失败/i);
+  assert.match(text, /自动压缩 taskScopeId：\*\*\s*[0-9a-f-]{36}/i);
 });
 
 test("cc_delegate with task scope and explicit taskScopeId carries it forward", async (t) => {
@@ -552,7 +553,7 @@ test("cc_delegate with task scope and explicit taskScopeId carries it forward", 
     },
   });
   const text = result.result.content[0].text;
-  assert.match(text, /Task Completed/);
+  assert.match(text, /任务完成/);
   assert.match(text, new RegExp(`taskScopeId=${explicitId}`));
 });
 
@@ -562,11 +563,11 @@ test("cc_delegate without autoCompact works normally (no --settings)", async (t)
     task: "echo-args",
   });
   const text = result.result.content[0].text;
-  assert.match(text, /Task Completed/);
+  assert.match(text, /任务完成/);
   // --settings should NOT be present
   assert.doesNotMatch(text, /--settings/);
   // Auto-compact section should NOT be present
-  assert.doesNotMatch(text, /Auto-compact/);
+  assert.doesNotMatch(text, /自动压缩/);
 });
 
 test("cc_delegate with autoCompact stores audit fields in job state", async (t) => {
@@ -615,7 +616,7 @@ test("session scope: replayed on resume without explicit autoCompact", async (t)
       scope: "session",
     },
   });
-  assert.match(first.result.content[0].text, /Task Completed/);
+  assert.match(first.result.content[0].text, /任务完成/);
 
   // Get the claudeSessionId from the completed job
   const jobs = listJobs(server.workspace);
@@ -628,11 +629,11 @@ test("session scope: replayed on resume without explicit autoCompact", async (t)
     resumeSession: completedJob.claudeSessionId,
   });
   const text = resumed.result.content[0].text;
-  assert.match(text, /Task Completed/);
+  assert.match(text, /任务完成/);
   // --settings must be present (replayed from session scope)
   assert.match(text, /--settings/);
   // Verify the effectiveWindow matches the original policy
-  const argsMatch = text.match(/### Result\n([\s\S]*?)(\n\n|\n---)/);
+  const argsMatch = text.match(/### 结果\n([\s\S]*?)(\n\n|\n---)/);
   assert.ok(argsMatch);
   const args = argsMatch[1].trim();
   const settingsIdx = args.indexOf("--settings");
@@ -694,7 +695,7 @@ test("task scope: new session inherits same taskScopeId", async (t) => {
     },
   });
   const firstText = first.result.content[0].text;
-  assert.match(firstText, /Task Completed/);
+  assert.match(firstText, /任务完成/);
   // Extract the generated taskScopeId
   const idMatch = firstText.match(/taskScopeId=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
   assert.ok(idMatch, "First task-scope delegation must generate and return taskScopeId");
@@ -706,11 +707,11 @@ test("task scope: new session inherits same taskScopeId", async (t) => {
     autoCompact: { scope: "task", taskScopeId },
   });
   const secondText = second.result.content[0].text;
-  assert.match(secondText, /Task Completed/);
+  assert.match(secondText, /任务完成/);
   // --settings must be present (inherited from task scope)
   assert.match(secondText, /--settings/);
   // Verify the effectiveWindow matches the original policy (300000 → 333334)
-  const argsMatch = secondText.match(/### Result\n([\s\S]*?)(\n\n|\n---)/);
+  const argsMatch = secondText.match(/### 结果\n([\s\S]*?)(\n\n|\n---)/);
   assert.ok(argsMatch);
   const args = argsMatch[1].trim();
   const settingsIdx = args.indexOf("--settings");
@@ -759,7 +760,7 @@ test("explicit autoCompact=null means no autoCompact and no inheritance", async 
       scope: "session",
     },
   });
-  assert.match(first.result.content[0].text, /Task Completed/);
+  assert.match(first.result.content[0].text, /任务完成/);
 
   const jobs = listJobs(server.workspace);
   const completedJob = jobs.find((j) => j.status === "completed");
@@ -772,7 +773,7 @@ test("explicit autoCompact=null means no autoCompact and no inheritance", async 
     autoCompact: null,
   });
   const text = resumed.result.content[0].text;
-  assert.match(text, /Task Completed/);
+  assert.match(text, /任务完成/);
   // --settings should NOT be present (explicit null blocks inheritance)
   assert.doesNotMatch(text, /--settings/);
 });
@@ -811,7 +812,7 @@ test("explicit autoCompact=null persists a session clear tombstone", async (t) =
     task: "echo-args",
     resumeSession: firstJob.claudeSessionId,
   });
-  assert.match(resumedAgain.result.content[0].text, /Task Completed/);
+  assert.match(resumedAgain.result.content[0].text, /任务完成/);
   assert.doesNotMatch(resumedAgain.result.content[0].text, /--settings/,
     "A later resume must not resurrect an older session policy after clear");
 });
@@ -839,7 +840,7 @@ test("task clear tombstone prevents later inheritance", async (t) => {
     task: "success",
     autoCompact: { scope: "task", taskScopeId, clear: true },
   });
-  assert.match(cleared.result.content[0].text, /Task Completed/);
+  assert.match(cleared.result.content[0].text, /任务完成/);
   assert.doesNotMatch(cleared.result.content[0].text, /--settings/);
 
   await server.send(3, "cc_compact", { job: firstJob.id });
@@ -863,7 +864,7 @@ test("cc_delegate with taskScopeId:undefined (omitted) generates new ID for task
       // taskScopeId omitted — should generate
     },
   });
-  assert.match(result.result.content[0].text, /Task Completed/);
+  assert.match(result.result.content[0].text, /任务完成/);
   const job = listJobs(server.workspace).find((j) => j.status === "completed");
   assert.ok(job.autoCompact.taskScopeId,
     "Omitted taskScopeId with task scope must generate a new ID");

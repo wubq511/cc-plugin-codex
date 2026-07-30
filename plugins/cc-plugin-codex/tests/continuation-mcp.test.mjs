@@ -41,6 +41,7 @@ function startServer(t, opts = {}) {
     cwd: workspace,
     env: {
       ...process.env,
+      CC_COMPANION_DASHBOARD_OPEN: "off",
       ...opts.env,
       PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
     },
@@ -89,7 +90,7 @@ function startServer(t, opts = {}) {
 }
 
 function extractArgs(resultText) {
-  const argsMatch = resultText.match(/### Result\n([\s\S]*?)(\n\n|\n---)/);
+  const argsMatch = resultText.match(/### 结果\n([\s\S]*?)(\n\n|\n---)/);
   return argsMatch ? argsMatch[1].trim() : "";
 }
 
@@ -327,7 +328,7 @@ test("cc_delegate consumes a fresh continuationPlan and rejects replay", async (
     task: "success",
     continuationPlan: planId,
   });
-  assert.match(delegated.result.content[0].text, /Task Completed/);
+  assert.match(delegated.result.content[0].text, /任务完成/);
 
   // Replay must be rejected.
   const replay = await server.send(3, "cc_delegate", {
@@ -396,7 +397,7 @@ test("cc_delegate resume plan resumes the exact parent session", async (t) => {
   const server = startServer(t);
   // First delegation creates a session.
   const first = await server.send(1, "cc_delegate", { task: "success" });
-  assert.match(first.result.content[0].text, /Task Completed/);
+  assert.match(first.result.content[0].text, /任务完成/);
   const jobs = listJobs(server.workspace);
   const firstJob = jobs.find((j) => j.status === "completed");
   assert.ok(firstJob?.claudeSessionId, "first job must have a claudeSessionId");
@@ -422,7 +423,7 @@ test("cc_delegate resume plan resumes the exact parent session", async (t) => {
     task: "echo-args",
     continuationPlan: planId,
   });
-  assert.match(resumed.result.content[0].text, /Task Completed/);
+  assert.match(resumed.result.content[0].text, /任务完成/);
   const args = extractArgs(resumed.result.content[0].text);
   assert.match(args, /--resume/);
   assert.ok(args.includes(firstJob.claudeSessionId), "must resume the exact parent session id");
@@ -461,7 +462,7 @@ test("cc_delegate with maxBudgetUsd passes --max-budget-usd through when CLI sup
     task: "echo-args",
     maxBudgetUsd: 5,
   });
-  assert.match(res.result.content[0].text, /Task Completed/);
+  assert.match(res.result.content[0].text, /任务完成/);
   const args = extractArgs(res.result.content[0].text);
   assert.match(args, /--max-budget-usd 5/);
 });
@@ -486,7 +487,7 @@ test("cc_delegate rejects non-positive maxBudgetUsd", async (t) => {
 test("cc_delegate without maxBudgetUsd is unaffected (no budget guard check)", async (t) => {
   const server = startServer(t, { env: { FAKE_CLAUDE_HELP_BUDGET_GUARD: "0" } });
   const res = await server.send(1, "cc_delegate", { task: "success" });
-  assert.match(res.result.content[0].text, /Task Completed/);
+  assert.match(res.result.content[0].text, /任务完成/);
 });
 
 // ─── cc_compact with continuationPlan ────────────────────────────────────────
@@ -526,7 +527,7 @@ test("cc_compact with maxBudgetUsd fails closed when CLI lacks --max-budget-usd"
 test("cc_delegate without continuationPlan preserves existing fresh-default behavior", async (t) => {
   const server = startServer(t);
   const res = await server.send(1, "cc_delegate", { task: "success" });
-  assert.match(res.result.content[0].text, /Task Completed/);
+  assert.match(res.result.content[0].text, /任务完成/);
   // No resume flags by default.
   const args = extractArgs(res.result.content[0].text);
   assert.doesNotMatch(args, /--resume/);
@@ -604,6 +605,7 @@ test("cc_plan_continuation from a git subdirectory binds to workspace root for d
     cwd: workspace,
     env: {
       ...process.env,
+      CC_COMPANION_DASHBOARD_OPEN: "off",
       PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
     },
     stdio: ["pipe", "pipe", "pipe"],
@@ -668,7 +670,7 @@ test("cc_plan_continuation from a git subdirectory binds to workspace root for d
     task: "success",
     continuationPlan: planId,
   });
-  assert.match(delegated.result.content[0].text, /Task Completed/);
+  assert.match(delegated.result.content[0].text, /任务完成/);
 });
 
 // ─── Fix: drift parameter type validation ────────────────────────────────────
@@ -693,7 +695,7 @@ test("cc_plan_continuation accepts object drift with boolean fields", async (t) 
   const server = startServer(t);
   // First delegation creates evidence so drift can be detected.
   const first = await server.send(1, "cc_delegate", { task: "success" });
-  assert.match(first.result.content[0].text, /Task Completed/);
+  assert.match(first.result.content[0].text, /任务完成/);
   const jobs = listJobs(server.workspace);
   const firstJob = jobs.find((j) => j.status === "completed");
   assert.ok(firstJob, "first delegation must complete to create evidence");

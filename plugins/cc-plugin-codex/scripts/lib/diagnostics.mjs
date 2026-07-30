@@ -488,17 +488,17 @@ export function buildFailureEnvelope(options) {
  */
 export function buildSafeErrorSummary(stage, fallbackMessage) {
   const messages = {
-    [FAILURE_STAGES.SPAWN]: "Failed to start Claude Code. The CLI binary may be missing or not executable.",
-    [FAILURE_STAGES.CLI_CONTRACT]: "Claude CLI protocol error. The installed CLI may not support print-mode JSON output. Try updating Claude Code.",
-    [FAILURE_STAGES.CONFIGURATION]: "Configuration error. The model selector could not be safely resolved.",
-    [FAILURE_STAGES.PROVIDER_HANDSHAKE]: "Provider authentication or authorization failed. Check native Claude Code credentials and configuration.",
-    [FAILURE_STAGES.PROVIDER_RESPONSE]: "Provider returned an error. The model may be unavailable, rate-limited, or rejected.",
-    [FAILURE_STAGES.JSON_PROTOCOL]: "Claude CLI produced non-JSON output. The CLI version may be incompatible.",
-    [FAILURE_STAGES.TIMEOUT]: "Claude task timed out and was terminated.",
-    [FAILURE_STAGES.CANCELLED]: "Claude task was cancelled.",
+    [FAILURE_STAGES.SPAWN]: "启动 Claude Code 失败。CLI 二进制文件可能缺失或不可执行。",
+    [FAILURE_STAGES.CLI_CONTRACT]: "Claude CLI 协议错误。已安装的 CLI 可能不支持 print 模式 JSON 输出。请尝试更新 Claude Code。",
+    [FAILURE_STAGES.CONFIGURATION]: "配置错误。模型选择器无法被安全解析。",
+    [FAILURE_STAGES.PROVIDER_HANDSHAKE]: "Provider 认证或授权失败。请检查原生 Claude Code 凭据和配置。",
+    [FAILURE_STAGES.PROVIDER_RESPONSE]: "Provider 返回错误。模型可能不可用、被限流或被拒绝。",
+    [FAILURE_STAGES.JSON_PROTOCOL]: "Claude CLI 输出了非 JSON 内容。CLI 版本可能不兼容。",
+    [FAILURE_STAGES.TIMEOUT]: "Claude 任务超时并被终止。",
+    [FAILURE_STAGES.CANCELLED]: "Claude 任务已取消。",
   };
 
-  const message = messages[stage] || fallbackMessage || "Claude task failed.";
+  const message = messages[stage] || fallbackMessage || "Claude 任务失败。";
   // Bound the message size
   if (Buffer.byteLength(message, "utf8") > MAX_SAFE_ERROR_BYTES) {
     return message.slice(0, MAX_SAFE_ERROR_BYTES) + "...";

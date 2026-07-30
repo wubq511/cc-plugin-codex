@@ -345,9 +345,94 @@ function handleMode(mode) {
       process.exitCode = 7;
     });
     return;
+  } else if (mode === "stream-success") {
+    // Emit a complete stream-json NDJSON sequence mirroring the real Claude
+    // Code event schema (system/init, assistant with tool_use, user
+    // tool_result, assistant text, type:result). See
+    // tests/fixtures/stream-json-success-sample.ndjson. Exit 0.
+    emitStreamSequence("fake-stream-session", "target.json 的 name 字段值是 probe-target。", false);
+    return;
+  } else if (mode === "stream-big-field") {
+    // Emit an assistant event whose text block far exceeds the per-field
+    // truncation cap, then a normal result. Tests watchdog payload bounding.
+    const sid = "fake-stream-big";
+    const big = "A".repeat(20000); // 20 KB, well over the 4 KB cap
+    const lines = [
+      JSON.stringify({ type: "system", subtype: "init", session_id: sid, model: "claude-sonnet-4-5" }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: big }] }, session_id: sid }),
+      JSON.stringify({ type: "result", subtype: "success", result: "big done", session_id: sid, total_cost_usd: 0.01, duration_ms: 10, is_error: false, usage: { input_tokens: 100, output_tokens: 10, type: "message" }, modelUsage: { "claude-sonnet-4-5": { inputTokens: 100, outputTokens: 10, contextWindow: 200000 } } }),
+    ];
+    process.stdout.write(lines.join("\n") + "\n");
+    return;
+  } else if (mode === "stream-split") {
+    // Emit events where one NDJSON line is split across two stdout chunks,
+    // testing the watchdog's incremental line reassembly.
+    const sid = "fake-stream-split";
+    const ev1 = JSON.stringify({ type: "system", subtype: "init", session_id: sid, model: "claude-sonnet-4-5" });
+    const ev2 = JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "reassembled split event" }] }, session_id: sid });
+    const ev3 = JSON.stringify({ type: "result", subtype: "success", result: "split done", session_id: sid, total_cost_usd: 0.01, duration_ms: 10, is_error: false, usage: { input_tokens: 100, output_tokens: 10, type: "message" }, modelUsage: { "claude-sonnet-4-5": { inputTokens: 100, outputTokens: 10, contextWindow: 200000 } } });
+    process.stdout.write(ev1 + "\n" + ev2.slice(0, 20));
+    setImmediate(() => {
+      process.stdout.write(ev2.slice(20) + "\n" + ev3 + "\n");
+    });
+    return;
+  } else if (mode === "stream-huge-line") {
+    // Emit a single newline-free line far above the watchdog's line-buffer
+    // cap, then a normal result event. Tests that the watchdog bounds its
+    // incremental line buffer instead of growing memory until the 8 MiB
+    // capture cap.
+    const sid = "fake-stream-huge-line";
+    process.stdout.write("x".repeat(2 * 1024 * 1024) + "\n");
+    process.stdout.write(JSON.stringify({ type: "result", subtype: "success", result: "huge line done", session_id: sid, total_cost_usd: 0.01, duration_ms: 10, is_error: false, usage: { input_tokens: 100, output_tokens: 10, type: "message" }, modelUsage: { "claude-sonnet-4-5": { inputTokens: 100, outputTokens: 10, contextWindow: 200000 } } }) + "\n");
+    return;
+  } else if (mode === "stream-no-result") {
+    // Emit intermediate events but NO type:result event (truncated stream),
+    // then exit 0. Tests watchdog fallback / error handling.
+    const sid = "fake-stream-noresult";
+    const lines = [
+      JSON.stringify({ type: "system", subtype: "init", session_id: sid, model: "claude-sonnet-4-5" }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "no result coming" }] }, session_id: sid }),
+    ];
+    process.stdout.write(lines.join("\n") + "\n");
+    return;
+  } else if (mode === "stream-slow") {
+    // Emit a stream-json sequence with deliberate delays between events so the
+    // dashboard e2e test can connect SSE and observe ≥2 intermediate events
+    // arriving in real time BEFORE the final result event. The delays are
+    // small (40ms) but sufficient for IPC + SSE broadcast to deliver each
+    // event to a connected EventSource within the same event loop.
+    const sid = "fake-stream-slow";
+    const init = JSON.stringify({ type: "system", subtype: "init", cwd: process.cwd(), session_id: sid, tools: ["Read", "Grep", "Glob", "Bash"], model: "claude-sonnet-4-5", permissionMode: "default", claude_code_version: "1.0.0-fake" });
+    const a1 = JSON.stringify({ type: "assistant", message: { id: "msg_01", type: "message", role: "assistant", model: "claude-sonnet-4-5", content: [{ type: "text", text: "正在分析任务…" }], stop_reason: "end_turn", usage: { input_tokens: 100, output_tokens: 20, type: "message" } }, session_id: sid });
+    const a2 = JSON.stringify({ type: "assistant", message: { id: "msg_02", type: "message", role: "assistant", model: "claude-sonnet-4-5", content: [{ type: "text", text: "任务完成。" }], stop_reason: "end_turn", usage: { input_tokens: 150, cache_read_input_tokens: 100, output_tokens: 15, type: "message" } }, session_id: sid });
+    const result = JSON.stringify({ type: "result", subtype: "success", result: "slow done", session_id: sid, total_cost_usd: 0.01, duration_ms: 30, num_turns: 2, is_error: false, usage: { input_tokens: 250, cache_read_input_tokens: 100, output_tokens: 35, iterations: [{ input_tokens: 100, output_tokens: 20, type: "message" }, { input_tokens: 150, cache_read_input_tokens: 100, output_tokens: 15, type: "message" }] }, modelUsage: { "claude-sonnet-4-5": { inputTokens: 250, cacheReadInputTokens: 100, outputTokens: 35, contextWindow: 200000 } } });
+    process.stdout.write(init + "\n");
+    setTimeout(() => { process.stdout.write(a1 + "\n"); }, 60);
+    setTimeout(() => { process.stdout.write(a2 + "\n"); }, 120);
+    setTimeout(() => { process.stdout.write(result + "\n"); }, 180);
+    return;
   } else {
     success();
   }
+}
+
+// Emit a complete stream-json NDJSON success sequence. If includeToolUse is
+// true, the first assistant event contains a Read tool_use block and a user
+// tool_result follows. Mirrors tests/fixtures/stream-json-success-sample.ndjson.
+function emitStreamSequence(sessionId, resultText, includeToolUse) {
+  const sid = sessionId;
+  const lines = [
+    JSON.stringify({ type: "system", subtype: "init", cwd: process.cwd(), session_id: sid, tools: ["Read", "Grep", "Glob", "Bash"], model: "claude-sonnet-4-5", permissionMode: "default", claude_code_version: "1.0.0-fake" }),
+  ];
+  if (includeToolUse) {
+    lines.push(JSON.stringify({ type: "assistant", message: { id: "msg_01", type: "message", role: "assistant", model: "claude-sonnet-4-5", content: [{ type: "text", text: "我先读取 target.json 文件。" }, { type: "tool_use", id: "toolu_01", name: "Read", input: { file_path: path.join(process.cwd(), "target.json") } }], stop_reason: "tool_use", usage: { input_tokens: 120, output_tokens: 40, type: "message" } }, session_id: sid }));
+    lines.push(JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_01", content: '{\n  "name": "probe-target"\n}', is_error: false }] }, session_id: sid }));
+  } else {
+    lines.push(JSON.stringify({ type: "assistant", message: { id: "msg_01", type: "message", role: "assistant", model: "claude-sonnet-4-5", content: [{ type: "text", text: resultText }], stop_reason: "end_turn", usage: { input_tokens: 120, output_tokens: 40, type: "message" } }, session_id: sid }));
+  }
+  lines.push(JSON.stringify({ type: "assistant", message: { id: "msg_02", type: "message", role: "assistant", model: "claude-sonnet-4-5", content: [{ type: "text", text: resultText }], stop_reason: "end_turn", usage: { input_tokens: 180, cache_read_input_tokens: 120, output_tokens: 25, type: "message" } }, session_id: sid }));
+  lines.push(JSON.stringify({ type: "result", subtype: "success", result: resultText, session_id: sid, total_cost_usd: 0.01, duration_ms: 25, num_turns: 2, is_error: false, usage: { input_tokens: 300, cache_read_input_tokens: 120, output_tokens: 65, iterations: [{ input_tokens: 120, output_tokens: 40, type: "message" }, { input_tokens: 180, cache_read_input_tokens: 120, output_tokens: 25, type: "message" }] }, modelUsage: { "claude-sonnet-4-5": { inputTokens: 300, cacheReadInputTokens: 120, outputTokens: 65, contextWindow: 200000 } } }));
+  process.stdout.write(lines.join("\n") + "\n");
 }
 
 // Determine mode from env, args, or stdin

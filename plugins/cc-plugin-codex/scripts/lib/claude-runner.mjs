@@ -33,6 +33,7 @@ export function runClaude(task, options = {}) {
   const timeoutMs = options.timeout ?? null;
   const maxCaptureBytes = options.maxCaptureBytes ?? MAX_CAPTURE_BYTES;
   const command = options.command || "claude";
+  const onEvent = typeof options.onEvent === "function" ? options.onEvent : null;
 
   const watchdogConfig = {
     task,
@@ -76,6 +77,18 @@ export function runClaude(task, options = {}) {
   }
 
   child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+
+  // Forward intermediate stream-json events from the watchdog (process.send)
+  // to the caller's onEvent callback. The watchdog sends
+  // { kind: "claude_event", event: <bounded> } for each non-result NDJSON line.
+  // The final result still arrives via stdout (unchanged contract).
+  if (onEvent) {
+    child.on("message", (msg) => {
+      if (msg && msg.kind === "claude_event" && msg.event) {
+        try { onEvent(msg.event); } catch { /* callback error must not break the run */ }
+      }
+    });
+  }
 
   const result = new Promise((resolve, reject) => {
     const stdoutChunks = [];

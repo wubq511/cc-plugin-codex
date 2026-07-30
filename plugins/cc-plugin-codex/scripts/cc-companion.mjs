@@ -28,6 +28,7 @@ import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
 import { runClaude, getClaudeAvailability } from "./lib/claude-runner.mjs";
+import { createDashboard } from "./lib/dashboard.mjs";
 import {
   generateJobId, upsertJob, listJobs, reconcileOrphans,
   acquireWriterLease, updateWriterLeaseJobId, refreshWriterLease, releaseWriterLease,
@@ -182,6 +183,82 @@ const WRITER_TOKEN = randomBytes(16).toString("hex");
 
 const workspaceRoots = new Set();
 let shuttingDown = false;
+
+// Live dashboard — read-only HTTP/SSE observer. Started eagerly at boot
+// (CC_COMPANION_DASHBOARD=off disables it from every entry point) with a lazy
+// fallback on first use, so the panel URL exists before the first delegation —
+// the foreground MCP call can only return after completion. Binds 127.0.0.1
+// with a random token; intermediate events live in-memory only (never written
+// to disk). The dashboard is a read-only observer: it does not cancel, lease,
+// or alter the foreground/cancel/lease contracts. Boot-time start rationale:
+// PROGRESS.md 2026-07-30.
+let dashboard = null;
+let dashboardPromise = null;
+
+// Aggregate non-sensitive job metadata across all known workspaces for the
+// dashboard's GET /api/jobs endpoint. Returns only id/status/phase/timing —
+// no task content, no error detail, no diagnostics. The dashboard is a
+// read-only observer and must not expose task-bearing data over HTTP.
+function getDashboardJobs() {
+  const out = [];
+  for (const workspaceRoot of workspaceRoots) {
+    try {
+      const jobs = listJobs(workspaceRoot);
+      for (const job of jobs) {
+        out.push({
+          id: job.id,
+          status: job.status,
+          phase: job.phase || null,
+          workspace: workspaceRoot,
+          requestedModel: job.requestedModel || null,
+          effort: job.effort || null,
+          createdAt: job.createdAt || null,
+          startedAt: job.startedAt || null,
+          completedAt: job.completedAt || null,
+          claudeSessionId: job.claudeSessionId || job.claudeSessionUuid || null,
+        });
+      }
+    } catch { /* best effort — skip unreadable workspaces */ }
+  }
+  return out;
+}
+
+// Start the live dashboard (eagerly at boot, or on first use). Idempotent:
+// the first caller creates and caches the server; later callers reuse it.
+// Every caller with a workspace announces connection metadata
+// (url/token/pid/startedAt — no event/task content) to its state dir as
+// dashboard.json via atomic tmp+rename — the announce must NOT be skipped on
+// a cache hit, or a boot-started dashboard would never be discoverable.
+// Never throws — a dashboard failure must not break delegation; the URL line
+// is simply omitted.
+async function ensureDashboard(workspaceRoot) {
+  // CC_COMPANION_DASHBOARD=off disables the dashboard from every entry point
+  // (boot, delegate, setup) — not just the boot branch. Returning null here
+  // also suppresses the browser auto-open, which is gated on a non-null dash.
+  if (process.env.CC_COMPANION_DASHBOARD === "off") return null;
+  if (!dashboard) {
+    if (!dashboardPromise) {
+      dashboardPromise = createDashboard({ getJobs: () => getDashboardJobs() }).catch((err) => {
+        logError(`Dashboard start failed: ${err?.message || err}`);
+        dashboardPromise = null;
+        return null;
+      });
+    }
+    dashboard = await dashboardPromise;
+  }
+  if (dashboard && workspaceRoot) {
+    try { await dashboard.announceStateDir(resolveStateDir(workspaceRoot)); } catch { /* best effort */ }
+  }
+  return dashboard;
+}
+
+// Build the "**实时面板：**" markdown line shown in delegate/cc_check/cc_setup
+// responses. Returns "" when the dashboard is not running, so the section is
+// omitted entirely rather than showing an empty/broken URL.
+function formatDashboardSection() {
+  if (!dashboard) return "";
+  return `\n\n**实时面板：** ${dashboard.url}?token=${dashboard.token}`;
+}
 
 const activeForegroundRuns = new Map();
 const pendingToolCalls = new Map();
@@ -471,7 +548,7 @@ function taskRef(task) {
 /** Render a safe task-reference label for MCP output (never task content). */
 function taskRefLabel(job) {
   const ref = job?.taskRef || null;
-  return ref ? `${ref} (content withheld)` : "(content withheld)";
+  return ref ? `${ref}（内容已隐藏）` : "（内容已隐藏）";
 }
 
 function boundedText(value, maxBytes) {
@@ -619,7 +696,7 @@ const CWD_SCHEMA = {
 const TOOLS = [
   {
     name: "cc_delegate",
-    description: "Delegate a coding task to Claude Code. All tasks keep one foreground tool call pending and return automatically on completion. Call this registered tool directly: while it is pending, do not manually launch the MCP server, poll, or emit periodic 'still running' commentary. background=true is deprecated and rejected. Task prompts are sent via stdin for privacy. For follow-up and review-fix work, call cc_plan_continuation first and pass the returned planId as continuationPlan: the plan enforces the chosen action (resume, compact_resume, or fresh_handoff) and prevents replay. Without a plan, delegation starts a fresh session by default. Use resume only when the user explicitly requests preservation of the same Claude Code conversation. By default, delegation inherits the user's current Claude Code Provider and model configuration — do not pass --model unless the user explicitly names one.",
+    description: "Delegate a coding task to Claude Code. All tasks keep one foreground tool call pending and return automatically on completion. Call this registered tool directly: while it is pending, do not manually launch the MCP server, poll, or emit periodic 'still running' commentary. background=true is deprecated and rejected. Task prompts are sent via stdin for privacy. For follow-up and review-fix work, call cc_plan_continuation first and pass the returned planId as continuationPlan: the plan enforces the chosen action (resume, compact_resume, or fresh_handoff) and prevents replay. Without a plan, delegation starts a fresh session by default. Use resume only when the user explicitly requests preservation of the same Claude Code conversation. By default, delegation inherits the user's current Claude Code Provider and model configuration — do not pass --model unless the user explicitly names one. When the response contains a 实时面板 (live dashboard) URL, always relay it verbatim to the user — it opens a real-time browser view of Claude's progress. When the response contains a 在终端继续此会话 section with a `claude --resume` command, always relay that command verbatim to the user as well.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -676,7 +753,7 @@ const TOOLS = [
   },
   {
     name: "cc_check",
-    description: "Check job status or get results. With only the required workspace cwd, returns the latest job. Pass a job ID (or prefix) for details. Set all=true to list all jobs. Set wait=true to wait for a running job to complete. Set session=true to filter by current session.",
+    description: "Check job status or get results. With only the required workspace cwd, returns the latest job. Pass a job ID (or prefix) for details. Set all=true to list all jobs. Set wait=true to wait for a running job to complete. Set session=true to filter by current session. When the output contains a 实时面板 (live dashboard) URL or a 在终端继续此会话 section with a `claude --resume` command, always relay them verbatim to the user.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -722,7 +799,7 @@ const TOOLS = [
   },
   {
     name: "cc_setup",
-    description: "Check if Claude Code is installed and ready to use. Performs static checks (zero model calls): CLI protocol verification (print-mode JSON support), real source-vs-cache comparison, model routing classifier status, and state schema health. Set livenessProbe=true to run a real Provider liveness probe — this makes one model call and incurs a cost. The probe accepts the same optional `model` selector as cc_delegate, requires a positive `timeoutSeconds`, a positive `maxBudgetUsd`, and a CLI budget-guard capability that is verified before the paid call. If the budget guard is unsupported the probe fails closed without a Provider call.",
+    description: "Check if Claude Code is installed and ready to use. Performs static checks (zero model calls): CLI protocol verification (print-mode JSON support), real source-vs-cache comparison, model routing classifier status, and state schema health. Set livenessProbe=true to run a real Provider liveness probe — this makes one model call and incurs a cost. The probe accepts the same optional `model` selector as cc_delegate, requires a positive `timeoutSeconds`, a positive `maxBudgetUsd`, and a CLI budget-guard capability that is verified before the paid call. If the budget guard is unsupported the probe fails closed without a Provider call. When the output contains a 实时面板 (live dashboard) URL, always relay it verbatim to the user.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -883,8 +960,20 @@ function formatTaskScopeIdLine(autoCompact) {
     clear: true,
   });
   return validation.valid
-    ? `\n**Auto-compact taskScopeId:** ${autoCompact.taskScopeId}`
+    ? `\n**自动压缩 taskScopeId：** ${autoCompact.taskScopeId}`
     : "";
+}
+
+/**
+ * Build the "resume in terminal" section for MCP responses. Shown only when
+ * the job has a claudeSessionId (falls back to the pre-allocated
+ * claudeSessionUuid). Claude Code `-p` sessions do not appear in the
+ * interactive /resume picker, so the user must resume by ID. Returns "" when
+ * no session id is available, so the section is omitted entirely.
+ */
+function formatTerminalResumeSection(sessionId) {
+  if (!sessionId) return "";
+  return `\n\n### 在终端继续此会话\n\n在 workspace 根目录运行以下命令可继续此会话（claude \`-p\` 会话不进 /resume 列表，需按 ID 恢复）：\n\n\`\`\`\nclaude --resume ${sessionId}\n\`\`\``;
 }
 
 // ─── Tool Handlers ──────────────────────────────────────────────────────────
@@ -1092,13 +1181,13 @@ async function handleDelegate(params, context = {}) {
     cleanupOldJobs(workspaceRoot);
 
     const guidance = err instanceof AmbiguousSelectorError
-      ? `\n\nTo resolve:\n- Use a Claude alias: \`opus\`, \`fable\`, \`sonnet\`, \`haiku\` (case-insensitive)\n- Use a full native model ID with version (e.g., \`deepseek-v4-pro\`, \`glm-5.2\`)\n- Omit \`model\` entirely for inherited (default) behavior`
-      : `\n\nThe model selector could not be resolved. Fix the selector or omit it to use inherited (default) behavior.`;
+      ? `\n\n解决方法：\n- 使用 Claude 别名：\`opus\`、\`fable\`、\`sonnet\`、\`haiku\`（大小写不敏感）\n- 使用带版本的完整原生模型 ID（如 \`deepseek-v4-pro\`、\`glm-5.2\`）\n- 省略 \`model\` 以使用继承（默认）行为`
+      : `\n\n模型选择器无法被解析。请修正选择器或省略以使用继承（默认）行为。`;
 
     return {
       content: [{
         type: "text",
-        text: `## ${err instanceof AmbiguousSelectorError ? "Ambiguous Model Selector" : "Configuration Error"}\n\n**Job ID:** ${rejectedJobId}\n**Category:** ${rejectedCategory}\n**Task ref:** ${taskRef(task.trim()) || "(withheld)"} (content withheld)\n\n${rejectedSafeSummary}${guidance}`
+        text: `## ${err instanceof AmbiguousSelectorError ? "模型选择器歧义" : "配置错误"}\n\n**任务 ID：** ${rejectedJobId}\n**类别：** ${rejectedCategory}\n**任务引用：** ${taskRef(task.trim()) || "（已隐藏）"}（内容已隐藏）\n\n${rejectedSafeSummary}${guidance}`
       }],
       isError: true
     };
@@ -1285,6 +1374,10 @@ async function handleDelegate(params, context = {}) {
   // the auto-compact policy so a stopped session can be compacted/resumed later.
   const claudeSessionUuid = (!resume && !resolvedResumeSession) ? randomUUID() : null;
   const provisionalClaudeSessionId = resolvedResumeSession || claudeSessionUuid;
+  const terminalResumeSection = formatTerminalResumeSection(provisionalClaudeSessionId);
+  // Populated by ensureDashboard() just before spawn. Empty until the
+  // dashboard is running, so pre-spawn error returns omit the section.
+  let dashboardSection = "";
 
   let leaseHeartbeat = null;
   if (leaseOwner) {
@@ -1414,6 +1507,14 @@ async function handleDelegate(params, context = {}) {
     }
   }
 
+  // Start the live dashboard before spawn so every return path (including
+  // pre-spawn cancellation) can surface the URL. Intermediate stream-json
+  // events from the watchdog are fed to the dashboard's in-memory ring buffer
+  // and broadcast over SSE. Best-effort: a dashboard failure leaves
+  // dashboardSection empty and does not affect delegation.
+  const dash = await ensureDashboard(workspaceRoot);
+  dashboardSection = formatDashboardSection();
+
   if (foregroundHandle.cancelRequested
     || listJobs(workspaceRoot).find((candidate) => candidate.id === jobId)?.status === "cancelling") {
     if (leaseHeartbeat) clearInterval(leaseHeartbeat);
@@ -1428,11 +1529,19 @@ async function handleDelegate(params, context = {}) {
     return {
       content: [{
         type: "text",
-        text: `## Task Cancelled\n\n**Job ID:** ${jobId}${formatTaskScopeIdLine(autoCompactAudit)}\n\nThe pending Claude Code task was cancelled before Claude Code started.`,
+        text: `## 任务已取消\n\n**任务 ID：** ${jobId}${formatTaskScopeIdLine(autoCompactAudit)}\n\nClaude Code 任务在启动前已被取消。${terminalResumeSection}${dashboardSection}`,
       }],
       isError: true,
     };
   }
+
+  // Open the panel in the user's default browser right before Claude spawns —
+  // after the pre-spawn cancellation check, so a job cancelled before spawn
+  // never pops a browser window. The foreground MCP call can only return
+  // after completion, so auto-open is the only channel guaranteed to reach
+  // the user during execution. At most once per server boot;
+  // CC_COMPANION_DASHBOARD_OPEN=off opts out.
+  if (dash) dash.openOnce();
 
   execution = runClaude(task, {
     cwd: workspaceRoot, write, model: resolvedModel, effort,
@@ -1444,7 +1553,13 @@ async function handleDelegate(params, context = {}) {
     routeSnapshot,
     cliVersion,
     inlineSettings,
-    maxBudgetUsd
+    maxBudgetUsd,
+    // Feed intermediate stream-json events (assistant text, tool_use,
+    // tool_result) to the dashboard's in-memory ring buffer + SSE broadcast.
+    // The final result contract is unchanged — events are a side channel.
+    onEvent: dash
+      ? (event) => { try { dash.ingest(jobId, event); } catch { /* best effort — dashboard must not break the run */ } }
+      : null,
   });
   foregroundHandle.execution = execution;
   updateJob(workspaceRoot, { id: jobId, pid: execution.pid });
@@ -1495,7 +1610,7 @@ async function handleDelegate(params, context = {}) {
     return {
       content: [{
         type: "text",
-        text: `## Task Cancelled\n\n**Job ID:** ${jobId}${formatTaskScopeIdLine(autoCompactAudit)}\n\nThe pending Claude Code task was cancelled.`,
+        text: `## 任务已取消\n\n**任务 ID：** ${jobId}${formatTaskScopeIdLine(autoCompactAudit)}\n\nClaude Code 任务已取消。${terminalResumeSection}${dashboardSection}`,
       }],
       isError: true
     };
@@ -1662,7 +1777,7 @@ async function handleDelegate(params, context = {}) {
       return {
         content: [{
           type: "text",
-          text: `## Task Cancelled\n\n**Job ID:** ${jobId}${formatTaskScopeIdLine(autoCompactAudit)}\n\nThe pending Claude Code task was cancelled during final verification.`,
+          text: `## 任务已取消\n\n**任务 ID：** ${jobId}${formatTaskScopeIdLine(autoCompactAudit)}\n\nClaude Code 任务在最终验证期间被取消。${terminalResumeSection}${dashboardSection}`,
         }],
         isError: true,
       };
@@ -1678,7 +1793,7 @@ async function handleDelegate(params, context = {}) {
     ]);
     const omittedTouchedFiles = workspaceChanges.totalChanges - responseTouchedFiles.length;
     const filesSection = workspaceChanges.totalChanges > 0
-      ? `### Workspace Changes (observed during this job)\n${workspaceChanges.summary}\n${responseTouchedFiles.map((f) => `- ${f}`).join("\n")}${omittedTouchedFiles > 0 ? `\n- ... ${omittedTouchedFiles} additional path(s) omitted` : ""}`
+      ? `### 工作区变更（本任务观察）\n${workspaceChanges.summary}\n${responseTouchedFiles.map((f) => `- ${f}`).join("\n")}${omittedTouchedFiles > 0 ? `\n- ... 另有 ${omittedTouchedFiles} 个路径已省略` : ""}`
       : "";
 
     // Use unified formatter for model evidence display
@@ -1691,7 +1806,7 @@ async function handleDelegate(params, context = {}) {
     });
 
     const truncationNote = truncation
-      ? `\n\n_Note: result truncated for presentation (${presentation.originalSize} bytes original). Full result stored in artifact._`
+      ? `\n\n_注意：结果为展示而截断（原始 ${presentation.originalSize} 字节）。完整结果存储在 artifact 中。_`
       : "";
 
     // Auto-compact info: include taskScopeId when generated so the caller can
@@ -1703,7 +1818,7 @@ async function handleDelegate(params, context = {}) {
       if (autoCompactAudit.cleared === true) {
         const parts = [`cleared scope=${autoCompactAudit.scope}`];
         if (autoCompactAudit.taskScopeId) parts.push(`taskScopeId=${autoCompactAudit.taskScopeId}`);
-        compactSection = `\n**Auto-compact:** ${parts.join(", ")}`;
+        compactSection = `\n**自动压缩：** ${parts.join(", ")}`;
       } else {
         const parts = [
           `scope=${autoCompactAudit.scope}`,
@@ -1715,14 +1830,14 @@ async function handleDelegate(params, context = {}) {
           parts.push(`observedBoundary=${observedBoundary}`);
           if (compactTrigger) parts.push(`trigger=${compactTrigger}`);
         }
-        compactSection = `\n**Auto-compact:** ${parts.join(", ")}`;
+        compactSection = `\n**自动压缩：** ${parts.join(", ")}`;
       }
     }
 
     return {
       content: [{
         type: "text",
-        text: `## Task Completed\n\n**Job ID:** ${jobId}\n**Duration:** ${formatDuration(result.duration ? result.duration * 1000 : null)}\n**Cost:** ${formatCost(result.cost)}\n${modelLine}${compactSection}\n\n### Result\n${presentation.text}${truncationNote}\n\n${filesSection}\n\n---\n💡 Run \`/claude:review\` to review the changes, or \`/claude:review --adversarial\` for an adversarial review.`
+        text: `## 任务完成\n\n**任务 ID：** ${jobId}\n**耗时：** ${formatDuration(result.duration ? result.duration * 1000 : null)}\n**费用：** ${formatCost(result.cost)}\n${modelLine}${compactSection}\n\n### 结果\n${presentation.text}${truncationNote}\n\n${filesSection}\n\n---\n💡 运行 \`/claude:review\` 审查变更，或 \`/claude:review --adversarial\` 进行对抗审查。${terminalResumeSection}${dashboardSection}`
       }]
     };
   } else {
@@ -1779,7 +1894,7 @@ async function handleDelegate(params, context = {}) {
       return {
         content: [{
           type: "text",
-          text: `## Task Cancelled\n\n**Job ID:** ${jobId}${formatTaskScopeIdLine(autoCompactAudit)}\n\nThe pending Claude Code task was cancelled.`,
+          text: `## 任务已取消\n\n**任务 ID：** ${jobId}${formatTaskScopeIdLine(autoCompactAudit)}\n\nClaude Code 任务已取消。${terminalResumeSection}${dashboardSection}`,
         }],
         isError: true,
       };
@@ -1792,7 +1907,7 @@ async function handleDelegate(params, context = {}) {
     return {
       content: [{
         type: "text",
-        text: `## Task Failed\n\n**Job ID:** ${jobId}${formatTaskScopeIdLine(autoCompactAudit)}\n**Error:** ${boundedText(safeError, MAX_ERROR_MESSAGE_BYTES)}\n\nCheck \`/claude:status\` for details.`
+        text: `## 任务失败\n\n**任务 ID：** ${jobId}${formatTaskScopeIdLine(autoCompactAudit)}\n**错误：** ${boundedText(safeError, MAX_ERROR_MESSAGE_BYTES)}\n\n查看 \`/claude:status\` 获取详情。${terminalResumeSection}${dashboardSection}`
       }],
       isError: true
     };
@@ -1834,28 +1949,28 @@ function handleListModels(params = {}) {
       });
       jobInfo = [
         "",
-        "### Latest Completed Job",
-        `- **Job ID:** ${latest.id}`,
+        "### 最近完成的任务",
+        `- **任务 ID：** ${latest.id}`,
         modelLines,
         "",
-        "_Model evidence is historical from a past run, not a guarantee of current availability._"
+        "_模型证据来自过去运行的历史记录，不保证当前可用。_"
       ].join("\n");
     }
   } catch { /* best effort */ }
 
   const text = [
-    "## Model Configuration",
+    "## 模型配置",
     "",
-    "Model resolution is owned by Claude Code and its configured Provider. This plugin does not maintain, validate, or enumerate a model catalogue.",
+    "模型解析由 Claude Code 及其配置的 Provider 负责。本插件不维护、不验证、不枚举模型目录。",
     "",
-    "### Default Behavior",
-    "When `model` is omitted from `cc_delegate`, Claude Code uses its current configured default. No model is selected or injected by the plugin.",
+    "### 默认行为",
+    "当 `cc_delegate` 省略 `model` 时，Claude Code 使用当前配置的默认模型。插件不会选择或注入任何模型。",
     "",
-    "### Explicit Override",
-    "Supply a `model` selector to `cc_delegate` to override the default for a single delegation. Accepted forms: a Claude alias (opus, fable, sonnet, haiku — case-insensitive) or a bounded native model ID (e.g., deepseek-v4-pro, glm-5.2). Ambiguous selectors are rejected — the plugin does not guess or silently fall back.",
+    "### 显式覆盖",
+    "向 `cc_delegate` 传入 `model` 选择器可覆盖单次委托的默认行为。接受的形式：Claude 别名（opus、fable、sonnet、haiku，大小写不敏感）或有界的原生模型 ID（如 deepseek-v4-pro、glm-5.2）。不明确的选择器会被拒绝——插件不会猜测或静默回退。",
     "",
-    "### Effort",
-    "`effort` is an independent Claude CLI control (low, medium, high, xhigh, max). It is not coupled to any specific model.",
+    "### 努力程度",
+    "`effort` 是独立的 Claude CLI 控制（low、medium、high、xhigh、max），不与任何具体模型绑定。",
     jobInfo
   ].filter(Boolean).join("\n");
 
@@ -1883,7 +1998,7 @@ function handleResolveRoute(params) {
       return {
         content: [{
           type: "text",
-          text: `## Ambiguous Model Selector\n\nThe supplied model selector could not be safely resolved to a Claude alias or native model ID.\n\n${buildSafeErrorSummary(FAILURE_STAGES.CONFIGURATION, err.message)}\n\nTo resolve:\n- Use a Claude alias: \`opus\`, \`fable\`, \`sonnet\`, \`haiku\` (case-insensitive)\n- Use a full native model ID with version (e.g., \`deepseek-v4-pro\`, \`glm-5.2\`)\n\nOmit the selector entirely for inherited (default) behavior.`
+          text: `## 模型选择器歧义\n\n提供的模型选择器无法被安全解析为 Claude 别名或原生模型 ID。\n\n${buildSafeErrorSummary(FAILURE_STAGES.CONFIGURATION, err.message)}\n\n解决方法：\n- 使用 Claude 别名：\`opus\`、\`fable\`、\`sonnet\`、\`haiku\`（大小写不敏感）\n- 使用带版本的完整原生模型 ID（如 \`deepseek-v4-pro\`、\`glm-5.2\`）\n\n省略选择器以使用继承（默认）行为。`
         }],
         isError: true
       };
@@ -1892,32 +2007,32 @@ function handleResolveRoute(params) {
     return {
       content: [{
         type: "text",
-        text: `## Configuration Error\n\nThe model route could not be resolved.\n\n${buildSafeErrorSummary(FAILURE_STAGES.CONFIGURATION, err.message)}`
+        text: `## 配置错误\n\n模型路由无法被解析。\n\n${buildSafeErrorSummary(FAILURE_STAGES.CONFIGURATION, err.message)}`
       }],
       isError: true
     };
   }
 
-  const lines = ["## Model Route Resolution\n"];
-  lines.push(`**Selector kind:** ${resolution.selectorKind}`);
+  const lines = ["## 模型路由解析\n"];
+  lines.push(`**选择器类型：** ${resolution.selectorKind}`);
   if (resolution.requestedValue) {
-    lines.push(`**Requested value:** \`${resolution.requestedValue}\``);
+    lines.push(`**请求值：** \`${resolution.requestedValue}\``);
   }
   if (resolution.cliArg) {
-    lines.push(`**CLI argument:** \`--model ${resolution.cliArg}\``);
+    lines.push(`**CLI 参数：** \`--model ${resolution.cliArg}\``);
   }
   if (resolution.canonicalAlias) {
-    lines.push(`**Canonical alias:** ${resolution.canonicalAlias}`);
+    lines.push(`**规范别名：** ${resolution.canonicalAlias}`);
   }
   if (resolution.resolvedFrom) {
-    lines.push(`**Resolved from:** ${resolution.resolvedFrom}`);
+    lines.push(`**解析来源：** ${resolution.resolvedFrom}`);
   }
   if (resolution.cliVersion) {
-    lines.push(`**Claude CLI version:** ${resolution.cliVersion}`);
+    lines.push(`**Claude CLI 版本：** ${resolution.cliVersion}`);
   }
 
   lines.push("");
-  lines.push(`_Note: ${resolution.note}_`);
+  lines.push(`_注意：${resolution.note}_`);
 
   return {
     content: [{ type: "text", text: lines.join("\n") }],
@@ -1937,14 +2052,14 @@ async function handleCheck(params) {
 
   if (params.all === true) {
     if (jobs.length === 0) {
-      return { content: [{ type: "text", text: "No jobs found." }] };
+      return { content: [{ type: "text", text: "未找到任务。" }] };
     }
     const sorted = sortJobsNewestFirst(jobs);
     const table = [
-      "| Job ID | Status | Phase | Task | Model Evidence | Duration |",
+      "| 任务 ID | 状态 | 阶段 | 任务 | 模型证据 | 耗时 |",
       "|--------|--------|-------|------|----------------|----------|",
       ...sorted.map((j) => {
-        const taskDisplay = j.taskRef || "(withheld)";
+        const taskDisplay = j.taskRef || "（已隐藏）";
         const modelDisplay = formatModelCompact({
           requestedModel: j.requestedModel,
           requestMode: j.requestMode || (j.requestedModel ? "explicit" : "inherited"),
@@ -1954,7 +2069,7 @@ async function handleCheck(params) {
         return `| ${j.id} | ${j.status} | ${j.phase || "—"} | ${taskDisplay} | ${modelDisplay} | ${formatDuration(j.duration ? j.duration * 1000 : null)} |`;
       })
     ].join("\n");
-    return { content: [{ type: "text", text: `## All Jobs${params.session ? " (current session)" : ""}\n\n${table}` }] };
+    return { content: [{ type: "text", text: `## 全部任务${params.session ? "（当前会话）" : ""}\n\n${table}` }] };
   }
 
   const jobIdOrPrefix = params.job;
@@ -1966,12 +2081,12 @@ async function handleCheck(params) {
       return { content: [{ type: "text", text: err.message }], isError: true };
     }
     if (!job) {
-      return { content: [{ type: "text", text: `Job "${jobIdOrPrefix}" not found.` }], isError: true };
+      return { content: [{ type: "text", text: `未找到任务 "${jobIdOrPrefix}"。` }], isError: true };
     }
   } else {
     job = findLatestJob(jobs);
     if (!job) {
-      return { content: [{ type: "text", text: "No jobs found." }] };
+      return { content: [{ type: "text", text: "未找到任务。" }] };
     }
   }
 
@@ -1987,7 +2102,7 @@ async function handleCheck(params) {
       await new Promise((resolve) => setTimeout(resolve, 2000));
     }
     if (job && (job.status === "running" || job.status === "queued")) {
-      return { content: [{ type: "text", text: `Job ${job.id} is still running after 4 minutes. Use \`cc_check\` to check again later.` }] };
+      return { content: [{ type: "text", text: `任务 ${job.id} 在 4 分钟后仍在运行。请稍后使用 \`cc_check\` 再次查看。` }] };
     }
   }
 
@@ -2008,36 +2123,36 @@ async function handleCheck(params) {
   let diagnosticSection = "";
   if ((job.status === "failed" || job.status === "cancelled" || job.status === "rejected") && artifact?.diagnostics) {
     const diag = artifact.diagnostics;
-    const diagLines = ["### Diagnostic Summary (safe)"];
+    const diagLines = ["### 诊断摘要（安全）"];
     if (diag.stage) {
-      diagLines.push(`- **Failure stage:** ${diag.stage}`);
+      diagLines.push(`- **失败阶段：** ${diag.stage}`);
     }
     if (diag.durationMs != null) {
-      diagLines.push(`- **Duration:** ${formatDuration(diag.durationMs)}`);
+      diagLines.push(`- **耗时：** ${formatDuration(diag.durationMs)}`);
     }
     if (diag.structuredError != null) {
-      diagLines.push(`- **Structured CLI error:** ${diag.structuredError ? "yes" : "no"}`);
+      diagLines.push(`- **结构化 CLI 错误：** ${diag.structuredError ? "yes" : "no"}`);
     }
     diagnosticSection = diagLines.join("\n");
   }
 
   const resultPresentation = truncateForPresentation(fullResult);
-  const resultSection = resultPresentation.text ? `### Result\n${resultPresentation.text}` : "";
+  const resultSection = resultPresentation.text ? `### 结果\n${resultPresentation.text}` : "";
   const filesSection = (job.workspaceChanges)
-    ? `### Workspace Changes (observed)\n${job.workspaceChanges}\n${(job.touchedFiles || []).map((f) => `- ${f}`).join("\n")}`
+    ? `### 工作区变更（观察）\n${job.workspaceChanges}\n${(job.touchedFiles || []).map((f) => `- ${f}`).join("\n")}`
     : (job.touchedFiles && job.touchedFiles.length > 0)
-      ? `### Files Changed\n${job.touchedFiles.map((f) => `- ${f}`).join("\n")}`
+      ? `### 变更文件\n${job.touchedFiles.map((f) => `- ${f}`).join("\n")}`
       : "";
 
   const progressPreview = readLogTail(workspaceRoot, job.id, 4);
   const progressSection = progressPreview.length > 0
-    ? `### Progress\n${progressPreview.map((l) => `- ${l}`).join("\n")}`
+    ? `### 进度\n${progressPreview.map((l) => `- ${l}`).join("\n")}`
     : "";
 
   const elapsed = (job.status === "running" || job.status === "queued")
     ? formatElapsedDuration(job.startedAt ?? job.createdAt)
     : null;
-  const elapsedSection = elapsed ? `**Elapsed:** ${elapsed}\n` : "";
+  const elapsedSection = elapsed ? `**已用时间：** ${elapsed}\n` : "";
 
   const phase = job.phase || inferPhaseFromLog(readLogTail(workspaceRoot, job.id, 20));
 
@@ -2049,15 +2164,17 @@ async function handleCheck(params) {
     selectorKind: job.selectorKind || null
   });
   const taskScopeLine = formatTaskScopeIdLine(job.autoCompact);
+  const terminalResumeSection = formatTerminalResumeSection(job.claudeSessionId || job.claudeSessionUuid);
+  const dashboardSection = formatDashboardSection();
 
   const truncationNote = resultPresentation.truncated
-    ? `\n_Result truncated for presentation (original: ${resultPresentation.originalSize} bytes)_`
+    ? `\n_结果为展示而截断（原始：${resultPresentation.originalSize} 字节）_`
     : "";
 
   return {
     content: [{
       type: "text",
-      text: `## Job: ${job.id}\n\n**Status:** ${job.status}\n**Phase:** ${phase} (${phaseDescription(phase)})\n**Task:** ${taskRefLabel(job)}\n${modelLine}${taskScopeLine}\n**Effort:** ${job.effort || "—"}\n**Duration:** ${formatDuration(job.duration ? job.duration * 1000 : null)}\n**Cost:** ${formatCost(job.cost)}\n${elapsedSection}**Started:** ${job.startedAt || job.createdAt || "—"}\n**Completed:** ${job.completedAt || "—"}\n\n${resultSection}${truncationNote}\n\n${filesSection}\n\n${progressSection}\n\n${diagnosticSection}`
+      text: `## 任务：${job.id}\n\n**状态：** ${job.status}\n**阶段：** ${phase} (${phaseDescription(phase)})\n**任务：** ${taskRefLabel(job)}\n${modelLine}${taskScopeLine}\n**思考强度：** ${job.effort || "—"}\n**耗时：** ${formatDuration(job.duration ? job.duration * 1000 : null)}\n**费用：** ${formatCost(job.cost)}\n${elapsedSection}**开始时间：** ${job.startedAt || job.createdAt || "—"}\n**完成时间：** ${job.completedAt || "—"}\n\n${resultSection}${truncationNote}\n\n${filesSection}\n\n${progressSection}\n\n${diagnosticSection}${terminalResumeSection}${dashboardSection}`
     }]
   };
 }
@@ -2077,18 +2194,18 @@ async function handleCancel(params) {
       return { content: [{ type: "text", text: err.message }], isError: true };
     }
     if (!job) {
-      return { content: [{ type: "text", text: `Job "${jobIdOrPrefix}" not found.` }], isError: true };
+      return { content: [{ type: "text", text: `未找到任务 "${jobIdOrPrefix}"。` }], isError: true };
     }
   } else {
     job = findLatestActiveJob(jobs);
     if (!job) {
-      return { content: [{ type: "text", text: "No active job found to cancel." }] };
+      return { content: [{ type: "text", text: "没有找到可取消的活跃任务。" }] };
     }
   }
 
   // Already terminal — honest report, no lie.
   if (TERMINAL_STATUSES.has(job.status)) {
-    return { content: [{ type: "text", text: `Job ${job.id} is not running (status: ${job.status}). Cannot cancel.` }] };
+    return { content: [{ type: "text", text: `任务 ${job.id} 未在运行（状态：${job.status}）。无法取消。` }] };
   }
 
   // Cancelling in progress — await settlement (idempotent duplicate cancel).
@@ -2101,23 +2218,23 @@ async function handleCancel(params) {
         return {
           content: [{
             type: "text",
-            text: `Job ${job.id} cancelled.${formatTaskScopeIdLine(settled.autoCompact)}`,
+            text: `任务 ${job.id} 已取消。${formatTaskScopeIdLine(settled.autoCompact)}`,
           }],
         };
       }
       return {
         content: [{
           type: "text",
-          text: `Job ${job.id} settled as ${settled?.status || "unknown"} before cancellation completed.`,
+          text: `任务 ${job.id} 在取消完成前已收口为 ${settled?.status || "unknown"}。`,
         }],
         isError: true,
       };
     }
-    return { content: [{ type: "text", text: `Job ${job.id} is cancelling but no live handle is available.` }], isError: true };
+    return { content: [{ type: "text", text: `任务 ${job.id} 正在取消，但没有可用的 live handle。` }], isError: true };
   }
 
   if (job.status !== "running" && job.status !== "queued") {
-    return { content: [{ type: "text", text: `Job ${job.id} is not running (status: ${job.status}). Cannot cancel.` }] };
+    return { content: [{ type: "text", text: `任务 ${job.id} 未在运行（状态：${job.status}）。无法取消。` }] };
   }
 
   // P0: Safe cancellation — only cancel if owned by current server
@@ -2125,7 +2242,7 @@ async function handleCancel(params) {
     return {
       content: [{
         type: "text",
-        text: `Job ${job.id} is owned by another companion server session (${job.ownerServerId || "unknown"}). Cannot safely cancel a foreign-owned job. The job may be orphaned — it will be reconciled on the next server restart.`
+        text: `任务 ${job.id} 归另一个 companion server 会话所有（${job.ownerServerId || "unknown"}）。无法安全取消非本服务拥有的任务。该任务可能已被孤立——下次 server 重启时会被重整。`
       }],
       isError: true
     };
@@ -2137,7 +2254,7 @@ async function handleCancel(params) {
     return {
       content: [{
         type: "text",
-        text: `Job ${job.id} has no live process handle. The process may have already exited; cannot safely cancel.`
+        text: `任务 ${job.id} 没有 live 进程 handle。进程可能已退出；无法安全取消。`
       }],
       isError: true
     };
@@ -2183,7 +2300,7 @@ async function handleCancel(params) {
   return {
     content: [{
       type: "text",
-      text: `Job ${job.id} cancelled.${formatTaskScopeIdLine(settled.autoCompact)}`
+      text: `任务 ${job.id} 已取消。${formatTaskScopeIdLine(settled.autoCompact)}`
     }]
   };
 }
@@ -2222,7 +2339,7 @@ async function handleCompact(params) {
       return { content: [{ type: "text", text: err.message }], isError: true };
     }
     if (!job) {
-      return { content: [{ type: "text", text: `Job "${params.job}" not found.` }], isError: true };
+      return { content: [{ type: "text", text: `未找到任务 "${params.job}"。` }], isError: true };
     }
     // 2. Reject active/cancelling jobs BEFORE checking claudeSessionId.
     //    A running job may not have a claudeSessionId yet, but it must still be
@@ -2231,7 +2348,7 @@ async function handleCompact(params) {
       return {
         content: [{
           type: "text",
-          text: `Job ${job.id} is still ${job.status}. cc_compact only accepts stopped sessions. Wait for completion or cancel it first.`
+          text: `任务 ${job.id} 仍处于 ${job.status} 状态。cc_compact 只接受已停止的会话。请等待完成或先取消。`
         }],
         isError: true
       };
@@ -2253,7 +2370,7 @@ async function handleCompact(params) {
     return {
       content: [{
         type: "text",
-        text: "No stopped Claude Code session with a claudeSessionId was found in this workspace. Run a delegation first."
+        text: "在此工作区中未找到带有 claudeSessionId 的已停止 Claude Code 会话。请先运行一次委托。"
       }],
       isError: true
     };
@@ -2280,7 +2397,7 @@ async function handleCompact(params) {
     return {
       content: [{
         type: "text",
-        text: `Job ${activeMatch.id} is still ${activeMatch.status}. cc_compact only accepts stopped sessions. Wait for completion or cancel it first.`,
+        text: `任务 ${activeMatch.id} 仍处于 ${activeMatch.status} 状态。cc_compact 只接受已停止的会话。请等待完成或先取消。`,
       }],
       isError: true,
     };
@@ -2364,7 +2481,7 @@ async function handleCompact(params) {
     return {
       content: [{
         type: "text",
-        text: `## Compact Failed\n\n**Session:** ${sessionId}\n**Error:** ${boundedText(safeError, MAX_ERROR_MESSAGE_BYTES)}`
+        text: `## 压缩失败\n\n**会话：** ${sessionId}\n**错误：** ${boundedText(safeError, MAX_ERROR_MESSAGE_BYTES)}`
       }],
       isError: true
     };
@@ -2411,18 +2528,18 @@ async function handleCompact(params) {
   const effectiveWindow = compactPolicy?.effectiveWindow ?? null;
 
   const boundaryWarnings = {
-    "transcript-not-found": "Transcript not found — cannot confirm a compact boundary was crossed.",
-    "transcript-replaced": "Transcript file changed identity during compact; evidence was rejected.",
-    "transcript-truncated": "Transcript was truncated during compact; evidence was rejected.",
-    "invalid-cursor": "The pre-compact transcript cursor was invalid; evidence was rejected.",
-    "scan-deadline": "Transcript evidence scan exceeded its deadline.",
-    "read-error": "Transcript evidence could not be read safely.",
-    "symlink-escape": "Transcript path escaped the configured Claude directory and was rejected.",
+    "transcript-not-found": "未找到 transcript——无法确认跨越了压缩边界。",
+    "transcript-replaced": "compact 期间 transcript 文件身份变更；证据已被拒绝。",
+    "transcript-truncated": "compact 期间 transcript 被截断；证据已被拒绝。",
+    "invalid-cursor": "compact 前的 transcript 游标无效；证据已被拒绝。",
+    "scan-deadline": "transcript 证据扫描超时。",
+    "read-error": "无法安全读取 transcript 证据。",
+    "symlink-escape": "transcript 路径逸出已配置的 Claude 目录，已被拒绝。",
   };
   const reason = boundary.compacted
     ? null
     : (boundaryWarnings[boundary.warning]
-      || "No new compact boundary was observed after this invocation. The session may have too few messages to compact.");
+      || "本次调用后未观察到新的压缩边界。会话消息可能太少，无需压缩。");
 
   // 6. Persist compact result to the job record (if we located via job).
   if (job) {
@@ -2446,19 +2563,19 @@ async function handleCompact(params) {
 
   // 7. Build honest response.
   const lines = [
-    "## Compact Result",
+    "## 压缩结果",
     "",
-    `**Session:** ${effectiveSessionId}`,
-    `**Compacted:** ${boundary.compacted ? "true" : "false"}`,
+    `**会话：** ${effectiveSessionId}`,
+    `**已压缩：** ${boundary.compacted ? "true" : "false"}`,
   ];
-  if (boundary.preTokens !== null) lines.push(`**Pre-compaction tokens:** ${boundary.preTokens}`);
-  if (boundary.trigger !== null) lines.push(`**Trigger:** ${boundary.trigger}`);
-  if (requestedTarget !== null) lines.push(`**Requested target:** ${requestedTarget}`);
-  if (effectiveWindow !== null) lines.push(`**Effective window:** ${effectiveWindow}`);
-  if (boundary.observedBoundary !== null) lines.push(`**Observed boundary:** ${boundary.observedBoundary}`);
-  lines.push(`**Cost:** ${formatCost(result.cost)}`);
-  lines.push(`**Duration:** ${formatDuration(result.duration ? result.duration * 1000 : null)}`);
-  if (reason) lines.push("", `**Reason:** ${reason}`);
+  if (boundary.preTokens !== null) lines.push(`**压缩前 token：** ${boundary.preTokens}`);
+  if (boundary.trigger !== null) lines.push(`**触发器：** ${boundary.trigger}`);
+  if (requestedTarget !== null) lines.push(`**请求目标：** ${requestedTarget}`);
+  if (effectiveWindow !== null) lines.push(`**有效窗口：** ${effectiveWindow}`);
+  if (boundary.observedBoundary !== null) lines.push(`**观察到的边界：** ${boundary.observedBoundary}`);
+  lines.push(`**费用：** ${formatCost(result.cost)}`);
+  lines.push(`**耗时：** ${formatDuration(result.duration ? result.duration * 1000 : null)}`);
+  if (reason) lines.push("", `**原因：** ${reason}`);
 
   return {
     content: [{
@@ -2618,7 +2735,7 @@ function handleReview(params) {
       return { content: [{ type: "text", text: err.message }], isError: true };
     }
     if (!job) {
-      return { content: [{ type: "text", text: `Job "${jobIdOrPrefix}" not found.` }], isError: true };
+      return { content: [{ type: "text", text: `未找到任务 "${jobIdOrPrefix}"。` }], isError: true };
     }
   } else {
     job = findLatestCompletedJob(jobs);
@@ -2656,7 +2773,7 @@ function handleReview(params) {
   try {
     context = collectReviewContext(workspaceRoot, target);
   } catch (err) {
-    return { content: [{ type: "text", text: `Failed to collect review context: ${err.message}` }], isError: true };
+    return { content: [{ type: "text", text: `收集审查上下文失败：${err.message}` }], isError: true };
   }
 
   const reviewPrompt = adversarial
@@ -2676,7 +2793,7 @@ function handleReview(params) {
   return {
     content: [{
       type: "text",
-      text: `## Review: Job ${job.id}\n\n**Task:** ${taskRefLabel(job)}\n**Model Evidence:**\n${reviewModel}\n**Review Mode:** ${adversarial ? "Adversarial" : "Standard"}\n**Target:** ${target.label}\n**Files:** ${context.fileCount}\n**Diff Size:** ${context.diffBytes} bytes\n**Input Mode:** ${context.inputMode}\n\n### Review Instructions\n${reviewPrompt}\n\n<repository_context>\n${context.content}\n</repository_context>\n\n${schemaRef}`
+      text: `## 审查：任务${job.id}\n\n**任务：** ${taskRefLabel(job)}\n**模型证据：**\n${reviewModel}\n**审查模式：** ${adversarial ? "Adversarial" : "Standard"}\n**目标：** ${target.label}\n**文件：** ${context.fileCount}\n**Diff 大小：** ${context.diffBytes} bytes\n**输入模式：** ${context.inputMode}\n\n### 审查指令\n${reviewPrompt}\n\n<repository_context>\n${context.content}\n</repository_context>\n\n${schemaRef}`
     }]
   };
 }
@@ -2734,35 +2851,35 @@ async function handleSetup(params) {
     }
   }
 
-  const lines = ["## Claude Code Companion Setup\n"];
+  const lines = ["## Claude Code 伴生设置\n"];
 
   // Version info (no secrets)
-  lines.push(`**Plugin Version:** ${SERVER_VERSION}`);
-  lines.push(`**State Schema:** v${STATE_VERSION} (task privacy boundary, native-Claude routing, temporary auto-compact policy, session/compact evidence, cancellation settlement)`);
+  lines.push(`**插件版本：** ${SERVER_VERSION}`);
+  lines.push(`**状态 schema：** v${STATE_VERSION} (task privacy boundary, native-Claude routing, temporary auto-compact policy, session/compact evidence, cancellation settlement)`);
 
   if (claudeStatus.available) {
-    lines.push(`✅ Claude Code: ${claudeStatus.detail}`);
+    lines.push(`✅ Claude Code：${claudeStatus.detail}`);
   } else {
-    lines.push(`❌ Claude Code: ${claudeStatus.detail}`);
+    lines.push(`❌ Claude Code：${claudeStatus.detail}`);
   }
 
   if (nodeStatus.available) {
-    lines.push(`✅ Node.js: ${nodeStatus.detail}`);
+    lines.push(`✅ Node.js：${nodeStatus.detail}`);
   } else {
-    lines.push(`❌ Node.js: ${nodeStatus.detail}`);
+    lines.push(`❌ Node.js：${nodeStatus.detail}`);
   }
 
   const gitStatus = binaryAvailable("git", ["--version"], { cwd });
   if (gitStatus.available) {
-    lines.push(`✅ Git: ${gitStatus.detail}`);
+    lines.push(`✅ Git：${gitStatus.detail}`);
   } else {
-    lines.push(`⚠️ Git: not found (review features need git)`);
+    lines.push(`⚠️ Git：未找到（审查功能需要 git）`);
   }
 
   // ── Static CLI Protocol Check (zero model calls) ──
   // Verifies that the Claude CLI supports print-mode JSON output by inspecting
   // `claude --help` for the required flags. No model is invoked.
-  lines.push(`\n### Static CLI Protocol Check (zero model calls)`);
+  lines.push(`\n### 静态 CLI 协议检查（零模型调用）`);
   let cliProtocolOk = false;
   let cliProtocolDetail = "";
   let budgetGuardSupported = false;
@@ -2782,29 +2899,29 @@ async function handleSetup(params) {
       const hasOutputFormat = /--output-format\b/.test(helpText);
       if (hasPrint && hasInputFormat && hasOutputFormat) {
         cliProtocolOk = true;
-        cliProtocolDetail = "print-mode JSON protocol supported (--print, --input-format, --output-format all recognized)";
+        cliProtocolDetail = "print 模式 JSON 协议已支持（--print、--input-format、--output-format 均已识别）";
         lines.push(`✅ ${cliProtocolDetail}`);
       } else {
         const missing = [];
         if (!hasPrint) missing.push("--print");
         if (!hasInputFormat) missing.push("--input-format");
         if (!hasOutputFormat) missing.push("--output-format");
-        cliProtocolDetail = `Claude CLI may not support print-mode JSON (missing: ${missing.join(", ")}). Update Claude Code.`;
+        cliProtocolDetail = `Claude CLI 可能不支持 print 模式 JSON（缺失：${missing.join(", ")}）。请更新 Claude Code。`;
         lines.push(`❌ ${cliProtocolDetail}`);
       }
       // Budget guard capability check (for liveness probe safety)
       budgetGuardSupported = /--max-budget-usd\b/.test(helpText);
       if (budgetGuardSupported) {
-        lines.push(`✅ Budget guard supported (--max-budget-usd recognized)`);
+        lines.push(`✅ 预算保护已支持（Budget guard supported，已识别 --max-budget-usd）`);
       } else {
-        lines.push(`⚠️ Budget guard not supported (--max-budget-usd not found in --help)`);
+        lines.push(`⚠️ 预算保护未支持（--help 中未找到 --max-budget-usd）`);
       }
     } catch (err) {
-      cliProtocolDetail = `Could not run claude --help: ${err.message}`;
+      cliProtocolDetail = `无法运行 claude --help：${err.message}`;
       lines.push(`⚠️ ${cliProtocolDetail}`);
     }
   } else {
-    cliProtocolDetail = "Claude CLI not available — cannot check protocol";
+    cliProtocolDetail = "Claude CLI 不可用——无法检查协议";
     lines.push(`⚠️ ${cliProtocolDetail}`);
   }
 
@@ -2812,15 +2929,15 @@ async function handleSetup(params) {
   // Compares the loaded source against the active installed cache using the
   // existing install-cache helpers. Never prints a green compatibility claim
   // without a real comparison.
-  lines.push(`\n### Source/Cache Compatibility (zero model calls)`);
+  lines.push(`\n### 源/缓存一致性（零模型调用）`);
   const cliVersion = getClaudeVersion(cwd);
   if (cliVersion) {
-    lines.push(`✅ Claude CLI version: ${cliVersion}`);
+    lines.push(`✅ Claude CLI 版本：${cliVersion}`);
   } else {
-    lines.push(`⚠️ Could not determine Claude CLI version (best-effort)`);
+    lines.push(`⚠️ 无法确定 Claude CLI 版本（best-effort）`);
   }
-  lines.push(`✅ Companion server: v${SERVER_VERSION}, schema v${STATE_VERSION}`);
-  lines.push(`✅ Watchdog protocol: --print --input-format text --output-format json (task via stdin, never argv)`);
+  lines.push(`✅ Companion server：v${SERVER_VERSION}, schema v${STATE_VERSION}`);
+  lines.push(`✅ Watchdog 协议：--print --input-format text --output-format stream-json --verbose（任务经 stdin，绝不经 argv；中间事件经 IPC 实时上送）`);
 
   let sourceCacheOk = false;
   // Compare plugin root with cache root (not scripts/ with cache root).
@@ -2838,31 +2955,31 @@ async function handleSetup(params) {
       homeDir: process.env.HOME || "",
     });
     if (!activeCache.activePath) {
-      lines.push(`ℹ️ Installed cache not found (running from source or not installed). Status: not-installed`);
+      lines.push(`ℹ️ 未找到已安装的缓存（从源码运行或未安装）。状态：not-installed`);
       sourceCacheOk = true; // not-installed is an acceptable state when running from source
     } else {
-      lines.push(`✅ Active cache path: ${activeCache.activePath}`);
+      lines.push(`✅ 活动缓存路径：${activeCache.activePath}`);
       if (activeCache.version) {
-        lines.push(`- **Cache version:** ${activeCache.version}`);
+        lines.push(`- **缓存版本：** ${activeCache.version}`);
       }
       // Real recursive comparison
       const comparison = compareSourceCache(pluginDir, activeCache.activePath);
       if (comparison.diffs === 0) {
-        lines.push(`✅ Source and cache match (${comparison.sourceFileCount} files compared)`);
+        lines.push(`✅ 源码与缓存一致（比较了 ${comparison.sourceFileCount} 个文件）`);
         sourceCacheOk = true;
       } else {
-        lines.push(`❌ Source and cache differ (${comparison.diffs} file(s) differ out of ${comparison.sourceFileCount} source / ${comparison.cacheFileCount} cache)`);
+        lines.push(`❌ 源码与缓存不一致（${comparison.diffs} 个文件不同，源码 ${comparison.sourceFileCount} / 缓存 ${comparison.cacheFileCount}）`);
         for (const detail of comparison.diffDetails.slice(0, 5)) {
           lines.push(`  - ${detail}`);
         }
         if (comparison.diffDetails.length > 5) {
-          lines.push(`  - ... ${comparison.diffDetails.length - 5} more`);
+          lines.push(`  - ... 另有 ${comparison.diffDetails.length - 5} 条`);
         }
         sourceCacheOk = false;
       }
     }
   } catch (err) {
-    lines.push(`⚠️ Could not compare source/cache: ${err.message}`);
+    lines.push(`⚠️ 无法比较源码/缓存：${err.message}`);
     sourceCacheOk = false;
   }
 
@@ -2870,8 +2987,8 @@ async function handleSetup(params) {
   // The plugin delegates to native Claude only. Model selection is inherited
   // from native Claude configuration unless a validated selector is forwarded
   // directly to `claude`.
-  lines.push(`\n### Model Routing (zero model calls)`);
-  lines.push(`✅ Model routing: selector classifier active (inherited / alias / native). No external routing configuration is read.`);
+  lines.push(`\n### 模型路由（零模型调用）`);
+  lines.push(`✅ 模型路由：选择器分类器已激活（inherited / alias / native）。不读取任何外部路由配置。`);
 
   const workspaceRoot = rememberWorkspaceRoot(cwd);
   let defaultBranch = "HEAD~1";
@@ -2891,38 +3008,45 @@ async function handleSetup(params) {
     if (orphanedCount > 0) stateHealth = `${orphanedCount} orphaned job(s)`;
   } catch { stateHealth = "no state yet" }
 
-  lines.push(`\n### Workspace State`);
-  lines.push(`**Workspace:** ${workspaceRoot}`);
-  lines.push(`**Default branch:** ${defaultBranch}`);
-  lines.push(`**Session ID:** ${SESSION_ID}`);
-  lines.push(`**State health:** ${stateHealth}`);
+  lines.push(`\n### 工作区状态`);
+  lines.push(`**工作区：** ${workspaceRoot}`);
+  lines.push(`**默认分支：** ${defaultBranch}`);
+  lines.push(`**会话 ID：** ${SESSION_ID}`);
+  lines.push(`**状态健康：** ${stateHealth}`);
+  // Live dashboard: surface the URL here so a session that starts with setup
+  // (rather than delegate) still hands the user the panel before any task.
+  const setupDash = await ensureDashboard(workspaceRoot);
+  if (setupDash) {
+    lines.push(`**实时面板：** ${setupDash.url}?token=${setupDash.token}`);
+    lines.push(`（收藏此链接——delegate 执行期间在浏览器实时查看 Claude 的每一步；首次 delegate 也会自动打开）`);
+  }
   if (staleCount > 0) {
-    lines.push(`**Active jobs:** ${staleCount}`);
+    lines.push(`**活跃任务：** ${staleCount}`);
   }
 
   // Resolved paths (no secrets)
-  lines.push(`\n### Resolved Paths`);
-  lines.push(`- **State dir:** ${stateDir}`);
-  lines.push(`- **Node:** ${process.execPath}`);
-  lines.push(`- **Platform:** ${process.platform} ${process.arch}`);
+  lines.push(`\n### 解析路径`);
+  lines.push(`- **状态目录：** ${stateDir}`);
+  lines.push(`- **Node：** ${process.execPath}`);
+  lines.push(`- **平台：** ${process.platform} ${process.arch}`);
 
   // ── Optional Liveness Probe (cost-bearing, explicitly authorized) ──
   // Requires: livenessProbe=true, positive timeoutSeconds, positive maxBudgetUsd,
   // CLI budget-guard support and CLI protocol availability.
   // Fails closed (no Provider call) if any prerequisite is unmet.
   if (livenessProbe) {
-    lines.push(`\n### Provider Liveness Probe (COST-BEARING — one model call)`);
-    lines.push(`⚠️ This probe makes a real model call and incurs a cost. Budget: ${probeTimeoutSeconds}s, max $${probeMaxBudgetUsd}.`);
+    lines.push(`\n### Provider 存活探测（产生费用——一次模型调用）`);
+    lines.push(`⚠️ 本探测会发起一次真实模型调用并产生费用。预算：${probeTimeoutSeconds}s，上限 $${probeMaxBudgetUsd}。`);
 
     // Fail-closed gates — checked BEFORE any Provider call
     if (!claudeStatus.available) {
-      lines.push(`❌ Probe refused (fail-closed): Claude CLI not available`);
+      lines.push(`❌ 探测已被拒绝（fail-closed）：Claude CLI 不可用`);
     } else if (!cliProtocolOk) {
-      lines.push(`❌ Probe refused (fail-closed): CLI protocol check failed`);
+      lines.push(`❌ 探测已被拒绝（fail-closed）：CLI 协议检查失败`);
     } else if (!budgetGuardSupported) {
       // Budget guard unsupported — MUST fail closed, no Provider call
-      lines.push(`❌ Probe refused (fail-closed): CLI does not support --max-budget-usd budget guard.`);
-      lines.push(`   The liveness probe requires a verified budget guard. Update Claude Code or do not use livenessProbe.`);
+      lines.push(`❌ 探测已被拒绝（fail-closed）：CLI 不支持 --max-budget-usd 预算保护。`);
+      lines.push(`   存活探测需要已验证的预算保护。请更新 Claude Code 或不使用 livenessProbe。`);
     } else {
       // All prerequisites met — resolve the route (with model selector if provided)
       // and run the probe with the budget guard.
@@ -2939,7 +3063,7 @@ async function handleSetup(params) {
         } catch (routeErr) {
           // Req 5: don't echo raw error text. Use safe category + summary.
           const routeCategory = routeErr instanceof AmbiguousSelectorError ? "ambiguous-selector" : "configuration";
-          lines.push(`❌ Probe refused (fail-closed): route resolution failed (${routeCategory}).`);
+          lines.push(`❌ 探测已被拒绝（fail-closed）：路由解析失败（${routeCategory}）。`);
           lines.push(`   ${buildSafeErrorSummary(FAILURE_STAGES.CONFIGURATION, routeErr.message)}`);
           // Persist a private rejected probe artifact for auditability.
           writeResultArtifact(workspaceRoot, probeJobId, {
@@ -2958,10 +3082,10 @@ async function handleSetup(params) {
             modelEvidence: { status: "unavailable", executedModels: [], usageModelKeys: [], warnings: ["preflight-route-failure"] },
             usageKeyIsNotExecutionProof: true,
           });
-          lines.push(`- **Probe ID:** ${probeJobId} (private artifact persisted)`);
+          lines.push(`- **探测 ID：** ${probeJobId} (private artifact persisted)`);
           // Skip the probe — route is not resolvable
           const staticChecksOk = claudeStatus.available && nodeStatus.available && cliProtocolOk && sourceCacheOk;
-          lines.push("\n" + (staticChecksOk ? "✅ Static checks passed (zero model calls)" : "❌ Setup incomplete"));
+          lines.push("\n" + (staticChecksOk ? "✅ 静态检查通过（零模型调用）" : "❌ 设置未完成"));
           return { content: [{ type: "text", text: lines.join("\n") }] };
         }
 
@@ -2969,10 +3093,10 @@ async function handleSetup(params) {
         const probeStart = Date.now();
         probeStartedAt = new Date(probeStart).toISOString();
         if (probeRoute.selector.kind !== "inherited") {
-          lines.push(`- **Model selector:** ${probeRoute.selector.kind} → ${probeRoute.selector.cliArg || "(inherited)"}`);
+          lines.push(`- **模型选择器：** ${probeRoute.selector.kind} → ${probeRoute.selector.cliArg || "(inherited)"}`);
         }
-        lines.push(`- **Budget guard:** --max-budget-usd ${probeMaxBudgetUsd}`);
-        lines.push(`- **Probe ID:** ${probeJobId}`);
+        lines.push(`- **预算保护：** --max-budget-usd ${probeMaxBudgetUsd}`);
+        lines.push(`- **探测 ID：** ${probeJobId}`);
 
         // Create the audit record before a paid Provider call. If a later
         // runner/collection step throws, the route and explicit budget remain
@@ -3079,19 +3203,19 @@ async function handleSetup(params) {
         });
 
         if (probeResult.ok) {
-          lines.push(`✅ Provider liveness confirmed in ${probeDurationLabel}s`);
-          lines.push(`- **Cost:** ${honestCost != null ? formatCost(honestCost) : "unknown"} (provenance: ${costProvenance})`);
-          lines.push(`- **Duration:** ${probeDurationLabel}s`);
-          lines.push(`- **Route status:** ${describeRouteStatus(probeRouteStatus)}`);
-          lines.push(`- **Private evidence:** artifact ${probeJobId} (route snapshot, model evidence, diagnostics)`);
+          lines.push(`✅ Provider 存活性已在 ${probeDurationLabel}s 内确认`);
+          lines.push(`- **费用：** ${honestCost != null ? formatCost(honestCost) : "unknown"} (provenance: ${costProvenance})`);
+          lines.push(`- **耗时：** ${probeDurationLabel}s`);
+          lines.push(`- **路由状态：** ${describeRouteStatus(probeRouteStatus)}`);
+          lines.push(`- **私有证据：** artifact ${probeJobId} (route snapshot, model evidence, diagnostics)`);
         } else {
           const probeStage = probeResult.failureStage || FAILURE_STAGES.PROVIDER_RESPONSE;
-          lines.push(`❌ Provider liveness probe failed in ${probeDurationLabel}s`);
-          lines.push(`- **Stage:** ${probeStage}`);
-          lines.push(`- **Failure reason:** ${safeProviderReason}`);
-          lines.push(`- **Safe summary:** ${boundedText(buildSafeErrorMessage(probeStage, probeResult.error || "Unknown"), 500)}`);
-          lines.push(`- **Route status:** ${describeRouteStatus(probeRouteStatus)}`);
-          lines.push(`- **Private evidence:** artifact ${probeJobId} (route snapshot, model evidence, diagnostics)`);
+          lines.push(`❌ Provider 存活探测在 ${probeDurationLabel}s 内失败`);
+          lines.push(`- **阶段：** ${probeStage}`);
+          lines.push(`- **失败原因：** ${safeProviderReason}`);
+          lines.push(`- **安全摘要：** ${boundedText(buildSafeErrorMessage(probeStage, probeResult.error || "Unknown"), 500)}`);
+          lines.push(`- **路由状态：** ${describeRouteStatus(probeRouteStatus)}`);
+          lines.push(`- **私有证据：** artifact ${probeJobId} (route snapshot, model evidence, diagnostics)`);
         }
       } catch (err) {
         // Req 5: don't echo raw error text in the summary line. Best-effort
@@ -3132,7 +3256,7 @@ async function handleSetup(params) {
             }),
           });
         } catch { /* the pre-call artifact remains if finalization itself fails */ }
-        lines.push(`❌ Liveness probe error (probe ID: ${probeJobId}).`);
+        lines.push(`❌ 存活探测错误（探测 ID：${probeJobId}）。`);
         lines.push(`   ${buildSafeErrorSummary(FAILURE_STAGES.PROVIDER_RESPONSE, err.message)}`);
       }
     }
@@ -3141,27 +3265,27 @@ async function handleSetup(params) {
   // ── Summary ──
   const staticChecksOk = claudeStatus.available && nodeStatus.available && cliProtocolOk && sourceCacheOk;
   if (staticChecksOk) {
-    lines.push("\n✅ Static checks passed (zero model calls)\n");
-    lines.push("Use `/claude:delegate` to start delegating tasks. Use `cc_resolve_route` to preview model routing.");
+    lines.push("\n✅ 静态检查通过（零模型调用）\n");
+    lines.push("使用 `/claude:delegate` 开始委托任务。使用 `cc_resolve_route` 预览模型路由。");
     if (orphanedCount > 0) {
-      lines.push(`\n⚠️ ${orphanedCount} orphaned job(s) detected. These were running when a previous companion server exited. Check with \`/claude:status --all\`.`);
+      lines.push(`\n⚠️ 检测到 ${orphanedCount} 个孤立任务。这些任务在上一个 companion server 退出时仍在运行。使用 \`/claude:status --all\` 查看。`);
     }
     if (!livenessProbe) {
-      lines.push(`\n_For a real Provider liveness probe (incurs cost), call cc_setup with livenessProbe=true, a positive timeoutSeconds, and a positive maxBudgetUsd. The CLI must support --max-budget-usd._`);
+      lines.push(`\n_如需真实的 Provider 存活探测（产生费用），请以 livenessProbe=true、正整数 timeoutSeconds 和正数 maxBudgetUsd 调用 cc_setup。CLI 必须支持 --max-budget-usd。_`);
     }
   } else {
-    lines.push("\n❌ Setup incomplete");
+    lines.push("\n❌ 设置未完成");
     if (!claudeStatus.available) {
-      lines.push("Install Claude Code: `npm install -g @anthropic-ai/claude-code`");
+      lines.push("安装 Claude Code：`npm install -g @anthropic-ai/claude-code`");
     }
     if (!nodeStatus.available) {
-      lines.push("Install Node.js: https://nodejs.org/");
+      lines.push("安装 Node.js：https://nodejs.org/");
     }
     if (!cliProtocolOk) {
-      lines.push("Update Claude Code to support print-mode JSON: `npm update -g @anthropic-ai/claude-code`");
+      lines.push("更新 Claude Code 以支持 print 模式 JSON：`npm update -g @anthropic-ai/claude-code`");
     }
     if (!sourceCacheOk) {
-      lines.push("Reinstall the plugin to sync source and cache: `codex plugin add cc-plugin-codex@cc-plugin-codex`");
+      lines.push("重新安装插件以同步 source 和 cache：`codex plugin add cc-plugin-codex@cc-plugin-codex`");
     }
   }
 
@@ -3278,25 +3402,25 @@ async function handlePlanContinuation(params) {
   }
 
   const lines = [
-    "## Continuation Plan",
+    "## 延续计划",
     "",
-    `**Action:** ${plan.action}`,
-    `**Plan ID:** ${plan.planId}`,
-    `**Evidence state:** ${plan.evidenceState}`,
-    `**Fallback action:** ${plan.fallbackAction}`,
-    `**Reason codes:** ${plan.reasonCodes.join(", ")}`,
+    `**动作：** ${plan.action}`,
+    `**计划 ID：** ${plan.planId}`,
+    `**证据状态：** ${plan.evidenceState}`,
+    `**回退动作：** ${plan.fallbackAction}`,
+    `**原因代码：** ${plan.reasonCodes.join(", ")}`,
   ];
   if (plan.pressure !== null) {
-    lines.push(`**Context pressure:** ${(plan.pressure * 100).toFixed(1)}% (threshold: ${(plan.pressureThreshold * 100).toFixed(0)}%)`);
+    lines.push(`**上下文压力：** ${(plan.pressure * 100).toFixed(1)}% (threshold: ${(plan.pressureThreshold * 100).toFixed(0)}%)`);
   }
-  lines.push(`**Expires at:** ${plan.planExpiresAt}`);
+  lines.push(`**过期时间：** ${plan.planExpiresAt}`);
 
   if (plan.action === ACTIONS.FRESH_HANDOFF && plan.handoffTemplate) {
-    lines.push("", "### Handoff Template", "", plan.handoffTemplate);
+    lines.push("", "### 交接模板", "", plan.handoffTemplate);
   } else if (plan.action === ACTIONS.COMPACT_RESUME && plan.compactFocus) {
-    lines.push("", "### Compact Focus", "", plan.compactFocus);
+    lines.push("", "### 压缩重点", "", plan.compactFocus);
   } else if (plan.action === ACTIONS.RESUME && plan.resumeGuidance) {
-    lines.push("", "### Resume Guidance", "", plan.resumeGuidance);
+    lines.push("", "### 恢复指引", "", plan.resumeGuidance);
   }
 
   lines.push("", "Pass this planId to cc_delegate or cc_compact as continuationPlan.");
@@ -3513,6 +3637,15 @@ async function gracefulShutdown(signal) {
     } catch { /* best effort */ }
   }
 
+  // 6. Stop the live dashboard — close SSE clients, delete dashboard.json
+  //    metadata files, and close the HTTP server. Best-effort: shutdown must
+  //    not hang if the dashboard failed to start or is mid-cleanup.
+  if (dashboard) {
+    try { await dashboard.stop(); } catch { /* best effort */ }
+    dashboard = null;
+    dashboardPromise = null;
+  }
+
   process.exit(0);
 }
 
@@ -3535,6 +3668,14 @@ process.on("unhandledRejection", (reason) => {
 function main() {
   // P0: Reconcile orphans on startup for all known workspaces
   // (This happens lazily when a workspace is first accessed)
+
+  // Start the live dashboard eagerly so its URL exists before the first
+  // delegation — the MCP foreground call can only return after completion,
+  // so the panel must be discoverable out-of-band. Best-effort (never throws,
+  // never blocks the MCP loop); CC_COMPANION_DASHBOARD=off disables.
+  if (process.env.CC_COMPANION_DASHBOARD !== "off") {
+    void ensureDashboard(null);
+  }
 
   const rl = readline.createInterface({ input: process.stdin });
 

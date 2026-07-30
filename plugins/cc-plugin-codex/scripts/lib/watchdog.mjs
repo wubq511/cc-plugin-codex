@@ -22,6 +22,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
 import {
   extractContextWindow,
   extractUsageModelKeys,
@@ -36,6 +37,24 @@ import {
 } from "../lib/diagnostics.mjs";
 
 const DEFAULT_MAX_CAPTURE = 8 * 1024 * 1024; // 8 MiB
+
+// ── Stream-json event forwarding ──────────────────────────────────────
+// Claude is invoked with --output-format stream-json --verbose. Each stdout
+// line is one NDJSON event. Intermediate events (system/assistant/user) are
+// forwarded to the companion over IPC for the live dashboard; the final
+// type:"result" event is the authoritative result source. Forwarded events
+// are bounded (per-field byte truncation + total count cap) and never written
+// to disk — the task-content privacy contract is preserved.
+const MAX_STREAM_EVENTS = 5000;
+const MAX_FIELD_BYTES = 4096;
+// A single newline-free line must not grow lineBuffer unbounded, bypassing
+// the 8 MiB capture cap. Legitimate stream-json lines are bounded (fields are
+// truncated to MAX_FIELD_BYTES elsewhere), so anything past 1 MiB is noise.
+const MAX_LINE_BYTES = 1 * 1024 * 1024;
+let lineBuffer = "";
+let finalResultObj = null;
+let streamEventCount = 0;
+const stdoutDecoder = new StringDecoder("utf8");
 
 let child = null;
 let settled = false;
@@ -69,6 +88,104 @@ function capture(chunks, chunk) {
   }
   capturedBytes += buffer.length;
   chunks.push(buffer);
+}
+
+// Truncate a string to at most maxBytes of UTF-8, appending an ellipsis marker
+// when truncated. Keeps multi-byte characters intact: back off trailing bytes
+// that would split a UTF-8 sequence (continuation bytes match 0b10xxxxxx; a
+// sequence is at most 4 bytes, so at most 3 back-offs).
+function truncateToBytes(str, maxBytes) {
+  const buf = Buffer.from(str, "utf8");
+  if (buf.length <= maxBytes) return str;
+  let end = maxBytes;
+  for (let backoffs = 0; end > 0 && backoffs < 3 && (buf[end] & 0xc0) === 0x80; backoffs++) {
+    end--;
+  }
+  return buf.subarray(0, end).toString("utf8") + "…[truncated]";
+}
+
+// Recursively bound an event payload: truncate every string field to
+// MAX_FIELD_BYTES. Nested arrays/objects are walked. Non-string values pass
+// through unchanged. Keeps the dashboard feed bounded regardless of Claude
+// output size.
+function boundEvent(value) {
+  if (typeof value === "string") return truncateToBytes(value, MAX_FIELD_BYTES);
+  if (Array.isArray(value)) return value.map(boundEvent);
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const key of Object.keys(value)) out[key] = boundEvent(value[key]);
+    return out;
+  }
+  return value;
+}
+
+// Forward one intermediate stream event to the companion over IPC. Wrapped in
+// try/catch so a closed/unavailable IPC channel never crashes the watchdog —
+// the final result is still delivered via stdout. Total event count is capped
+// to bound memory and IPC traffic.
+function forwardEvent(event) {
+  if (streamEventCount >= MAX_STREAM_EVENTS) return;
+  streamEventCount++;
+  if (typeof process.send !== "function") return;
+  try {
+    process.send({ kind: "claude_event", event: boundEvent(event) });
+  } catch {
+    // IPC channel closed (companion gone) — silently drop; stdout result still lands.
+  }
+}
+
+// Parse one NDJSON line. The type:"result" line is stored as the authoritative
+// final result; all other lines are forwarded as intermediate events. Malformed
+// lines are skipped (Claude occasionally emits non-JSON fragments on stderr mix).
+function processStreamLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return; // not a JSON line — skip
+  }
+  if (!parsed || typeof parsed !== "object") return;
+  if (parsed.type === "result") {
+    // Last result event wins (there is normally exactly one).
+    finalResultObj = parsed;
+    return;
+  }
+  forwardEvent(parsed);
+}
+
+// Incrementally decode and split Claude stdout into NDJSON lines. Uses a
+// StringDecoder so multi-byte UTF-8 characters split across chunk boundaries
+// are reassembled correctly.
+function processStreamChunk(chunk) {
+  lineBuffer += stdoutDecoder.write(chunk);
+  let nl;
+  while ((nl = lineBuffer.indexOf("\n")) >= 0) {
+    const line = lineBuffer.slice(0, nl);
+    lineBuffer = lineBuffer.slice(nl + 1);
+    processStreamLine(line);
+  }
+  if (lineBuffer.length > MAX_LINE_BYTES) {
+    // Oversized newline-free fragment — drop it as noise. The remainder of
+    // the line (up to the next newline) fails JSON.parse and is skipped; the
+    // whole-stdout JSON.parse fallback is unaffected because stdoutChunks are
+    // captured separately under the 8 MiB cap.
+    lineBuffer = "";
+  }
+}
+
+// Flush any final partial line (the result event may arrive without a trailing
+// newline). Called once when Claude's stdout closes.
+function flushStreamBuffer() {
+  try {
+    const tail = stdoutDecoder.end();
+    if (tail) lineBuffer += tail;
+  } catch {
+    // decoder already ended — ignore
+  }
+  if (lineBuffer.trim()) processStreamLine(lineBuffer);
+  lineBuffer = "";
 }
 
 function writeResult(result) {
@@ -165,9 +282,13 @@ async function main() {
   }
 
   // ── Phase 3: Build Claude args (task via stdin, never argv) ──
-  // P0 fix: Claude Code 2.1.208+ requires --print for --output-format json.
-  // The task is delivered via stdin (--input-format text), never in argv.
-  const args = ["--print", "--input-format", "text", "--output-format", "json"];
+  // stream-json + --verbose: Claude emits one NDJSON event per line on stdout
+  // (system/assistant/user/result). The watchdog parses incrementally and
+  // forwards intermediate events over IPC for the live dashboard; the final
+  // type:"result" event is the authoritative result source. --verbose is
+  // required by stream-json with --print. The task is delivered via stdin
+  // (--input-format text), never in argv.
+  const args = ["--print", "--input-format", "text", "--output-format", "stream-json", "--verbose"];
   if (dangerouslySkipPermissions === true) args.push("--dangerously-skip-permissions");
   if (model) args.push("--model", model);
   if (maxBudgetUsd && Number.isFinite(maxBudgetUsd) && maxBudgetUsd > 0) {
@@ -246,8 +367,12 @@ async function main() {
     // stdin write failed — Claude may have exited already
   }
 
-  // Capture output
-  child.stdout.on("data", (chunk) => capture(stdoutChunks, chunk));
+  // Capture output (bounded for diagnostics + capture-limit) and parse
+  // stream-json lines incrementally for IPC event forwarding + result extraction.
+  child.stdout.on("data", (chunk) => {
+    capture(stdoutChunks, chunk);
+    processStreamChunk(chunk);
+  });
   child.stderr.on("data", (chunk) => capture(stderrChunks, chunk));
 
   // Handle child error (e.g., ENOENT)
@@ -281,6 +406,10 @@ async function main() {
   child.once("close", (code, signal) => {
     if (settled) return;
     settled = true;
+
+    // Flush the final partial stream-json line (the result event may arrive
+    // without a trailing newline) so finalResultObj is fully populated.
+    flushStreamBuffer();
 
     const stdout = Buffer.concat(stdoutChunks).toString("utf8");
     const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
@@ -373,7 +502,9 @@ async function main() {
       let sessionId = null;
       let usageKey = null;
       try {
-        const parsed = JSON.parse(stdout);
+        // Prefer the stream-json result event when available; fall back to
+        // whole-output JSON.parse for non-streaming/truncated output.
+        const parsed = finalResultObj !== null ? finalResultObj : JSON.parse(stdout);
         if (parsed.is_error === true || (parsed.subtype && String(parsed.subtype).startsWith("error")) ||
             (parsed.result && typeof parsed.result === "object" && parsed.result.error)) {
           structuredError = true;
@@ -410,9 +541,11 @@ async function main() {
       return;
     }
 
-    // Exit code 0: check for Claude structured error, then parse success
+    // Exit code 0: check for Claude structured error, then parse success.
+    // Prefer the stream-json result event when available; fall back to
+    // whole-output JSON.parse for non-streaming/truncated output.
     try {
-      const parsed = JSON.parse(stdout);
+      const parsed = finalResultObj !== null ? finalResultObj : JSON.parse(stdout);
 
       // Check is_error flag (top-level)
       if (parsed.is_error === true) {

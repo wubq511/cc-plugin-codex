@@ -22,6 +22,7 @@
 - **代码审查** — 标准审查（找 bug）或对抗审查（质疑实现选择、攻击面分析）
 - **有界上下文续作** — 审查修复默认开新会话并传递精炼交接包；仍支持显式恢复指定 Claude Code 会话
 - **Job 管理** — 前缀匹配、会话过滤、取消运行中的任务
+- **实时面板** — 任务执行期间在本机 127.0.0.1 起一个只读 dashboard，首次 delegate 自动在浏览器打开（可关闭），浏览器实时查看 Claude 的每一步动作（assistant 文本、tool_use、tool_result）；事件只进内存不落盘，URL 带随机 token 鉴权
 
 ## 快速开始
 
@@ -101,6 +102,39 @@ codex plugin add cc-plugin-codex
 审查发现问题后再次分派时，插件默认开启新的 Claude Code 会话。Codex 只交接当前目标、可执行的审查发现、仍有效的约束和验收命令，并要求 Claude Code 从当前工作区与 git diff 核对真实状态。它不会把完整旧会话、完整 diff 或冗长日志重复塞入新上下文。
 
 这能保留任务连续性，同时避免多轮审查和修复把同一个 Claude 会话越堆越大。只有你明确要求“继续同一个 Claude Code 会话”或指定 session ID 时，Codex 才会使用 resume。
+
+### 在终端继续插件会话
+
+插件通过 `claude -p`（print 模式）执行任务，这类会话不会出现在交互式 `/resume` 列表中（这是 Claude Code 的官方行为，无法让插件会话进入 picker）。要继续某个插件会话，需按 session ID 恢复。
+
+每次任务返回（成功、失败、取消）以及 `cc_check` 单任务输出里，只要该 job 持有 `claudeSessionId`，就会附带一节「### 在终端继续此会话」，内含一条可复制的命令：
+
+```
+claude --resume <sessionId>
+```
+
+在 workspace 根目录运行即可。session ID 也可在 `cc_check` 的任务详情中找到。
+
+### 实时面板
+
+任务执行期间，插件在本机 `127.0.0.1` 随机端口启动一个只读 dashboard 页面。由于 delegation 是 foreground 阻塞调用（MCP 返回只能在任务结束后到达），面板通过带外渠道送达：
+
+- **首次 delegate 自动打开** — Claude 启动前，插件会在你的默认浏览器打开面板页（每个 server 进程只打开一次）。浏览器保持该标签页即可，之后所有任务实时可见
+- **`/claude:setup` 显示 URL** — 输出中包含 `**实时面板：** <url>?token=<token>`，可收藏备用
+- **`cc_delegate` / `cc_check` 返回附带 URL** — 任务结束后返回里也有同一行
+
+面板实时渲染 Claude 的每一步动作：
+
+- **assistant 文本块** — Claude 的思考与回复文本
+- **tool_use 卡片** — 正在调用的工具（Read/Bash/Grep 等）及参数摘要，可折叠
+- **tool_result** — 工具返回结果，默认折叠
+- **最终 result** — 任务完成时的汇总
+
+顶部状态条显示当前阶段和已耗时。左侧 job 列表可在多个任务间切换。每个任务顶部有「在终端继续此会话」卡片，显示可一键复制的 `claude --resume <sessionId>` 命令——这是恢复入口的确定性来源，不依赖模型转述。
+
+面板是纯只读观察者：不改动取消/租约/foreground 任何契约。事件只存在于内存 ring buffer（≤500 事件/≤1MB 每 job），永不落盘。dashboard 绑定 `127.0.0.1`（不监听外部接口），URL 带随机 token 鉴权，无 token 请求一律 403。
+
+开关：设 `CC_COMPANION_DASHBOARD_OPEN=off` 关闭自动打开（CI 与无显示器的 Linux 环境自动关闭）；设 `CC_COMPANION_DASHBOARD=off` 完全禁用面板。
 
 ### 取消任务
 
