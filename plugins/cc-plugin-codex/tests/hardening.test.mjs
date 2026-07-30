@@ -76,6 +76,13 @@ function startServer(t, opts = {}) {
   fs.mkdirSync(binDir, { recursive: true });
   installFakeClaude(binDir);
 
+  // Drain state.mjs's first-access orphan reconciliation while the workspace
+  // is still empty. listJobs() runs reconcileOrphans once per process per
+  // workspace; if that first access happens after the server created a live
+  // job, it wrongly marks the job orphaned ("server restarted") and every
+  // later status poll in the test observes the corrupted state.
+  listJobs(workspace);
+
   const child = spawn(process.execPath, [serverPath], {
     cwd: workspace,
     env: {
@@ -1226,24 +1233,33 @@ test("cc_cancel terminates Claude descendant processes before releasing control"
 test("cc_cancel transitions through cancelling status before cancelled", async (t) => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-cancelling-status-"));
   // No FAKE_CLAUDE_MODE env: the fake Claude reads the mode from stdin (the task text).
-  // Timing-based observation windows are unreliable under CI load (the polling
-  // loop can be starved for seconds) and on Windows (taskkill /T /F delivers no
-  // signal the fake Claude could trap to stay alive). Instead the server holds
-  // the cancelling status until this test acknowledges it via a rendezvous file
-  // (CC_TEST_CANCEL_HOLD_FILE), making the observation deterministic.
+  //
+  // Two races make naive observation flaky:
+  //  1. Pre-spawn race: if the cancel lands while the delegate is still in its
+  //     pre-spawn phase (dashboard startup etc.), the delegate's own pre-spawn
+  //     check sees "cancelling" and finalizes to "cancelled" within milliseconds
+  //     — the intermediate status exists but is unobservable under load. Using
+  //     "hang-pid" and waiting for HANG_PID_FILE guarantees the fake Claude was
+  //     already spawned, so the cancel lands past the pre-spawn check where only
+  //     cc_cancel drives the transition.
+  //  2. Observation race: even post-spawn, polling can be starved for seconds
+  //     under CI load, and on Windows taskkill /T /F delivers no signal the fake
+  //     Claude could trap to stay alive. CC_TEST_CANCEL_HOLD_FILE makes the
+  //     server hold the cancelling status until this test acknowledges it.
   const holdFile = path.join(workspace, "cancel-hold");
+  const pidFile = path.join(workspace, "claude.pid");
   const server = startServer(t, {
     workspace,
-    env: { CC_TEST_CANCEL_HOLD_FILE: holdFile },
+    env: { CC_TEST_CANCEL_HOLD_FILE: holdFile, HANG_PID_FILE: pidFile },
   });
 
-  const delegate = server.send(1, "cc_delegate", { task: "hang-slow" });
+  const delegate = server.send(1, "cc_delegate", { task: "hang-pid" });
   delegate.catch(() => {}); // handled via await below; avoid unhandled rejection if the test bails early
-  // Wait for job to be running
-  await waitFor(() => {
-    const jobs = listJobs(workspace);
-    return jobs.find((j) => j.status === "running");
-  }, 5000);
+
+  // The fake Claude writes its pid file only after being spawned — a
+  // deterministic "post-spawn" signal, unlike the "running" job status which
+  // is written while the delegate is still in its pre-spawn phase.
+  await waitFor(() => fs.existsSync(pidFile), 15000);
 
   // Start cancel (async) — don't await yet
   const cancelPromise = server.send(2, "cc_cancel");

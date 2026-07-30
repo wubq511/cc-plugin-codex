@@ -37,6 +37,13 @@ function startServer(t, opts = {}) {
   fs.mkdirSync(binDir, { recursive: true });
   installFakeClaude(binDir);
 
+  // Drain state.mjs's first-access orphan reconciliation while the workspace
+  // is still empty. listJobs() runs reconcileOrphans once per process per
+  // workspace; if that first access happens after the server created a live
+  // job, it wrongly marks the job orphaned ("server restarted") and every
+  // later status poll in the test observes the corrupted state.
+  listJobs(workspace);
+
   const child = spawn(process.execPath, [serverPath], {
     cwd: workspace,
     env: {
