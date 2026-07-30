@@ -1,13 +1,53 @@
-/* Claude 实时面板, 浅色终端密度方向 (VS Code Light+ 系).
+/* Claude 实时面板, 浅色终端密度方向 (VS Code Light+ 系) & 暗色模式.
    Inlined into the page by dashboard-page.mjs; no external requests allowed.
    Hierarchy: assistant narration is the primary signal (white rows), tool
    activity is recessed evidence (dim rows, smaller type). */
 
 :root {
   --bg: #f3f3f3; --row: #ffffff; --row-dim: #f8f8f8; --border: #d4d4d4; --border-soft: #e4e4e4;
-  --text: #1f1f1f; --muted: #616161; --faint: #9d9d9d;
+  --text: #1f1f1f; --muted: #595959; --faint: #595959;
   --accent: #006ab1; --ok: #388a34; --err: #c72e2e; --warn: #b07d2b;
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace;
+
+  --topbar-bg: #ececec;
+  --btn-hover-bg: #e0eef7;
+  --chip-hover-bg: #e8f1f8;
+  --chip-active-bg: #dce9f5;
+  --status-done-bg: #ecf5ea;
+  --status-err-bg: #f9eeee;
+  --tool-pre-bg: #fdfdfd;
+  --tool-err-border: #e3b3b3;
+  --tool-err-pre-bg: #fdf3f3;
+  --card-ok-border: #a9d0a6;
+  --back-latest-bg: #16161d;
+  --back-latest-text: #f2f2f5;
+  --back-latest-hover: #2a2a35;
+  --pop-shadow: rgba(0, 0, 0, 0.12);
+  --pill-shadow: rgba(0, 0, 0, 0.3);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1e1e1e; --row: #252526; --row-dim: #2d2d2d; --border: #3c3c3c; --border-soft: #333333;
+    --text: #cccccc; --muted: #9cdcfe; --faint: #858585;
+    --accent: #4fc1ff; --ok: #4ec9b0; --err: #f14c4c; --warn: #cca700;
+
+    --topbar-bg: #2d2d2d;
+    --btn-hover-bg: #37373d;
+    --chip-hover-bg: #37373d;
+    --chip-active-bg: #094771;
+    --status-done-bg: #1e3a29;
+    --status-err-bg: #3a1e1e;
+    --tool-pre-bg: #1e1e1e;
+    --tool-err-border: #6e2a2a;
+    --tool-err-pre-bg: #2d1e1e;
+    --card-ok-border: #2a6e38;
+    --back-latest-bg: #3c3c3c;
+    --back-latest-text: #ffffff;
+    --back-latest-hover: #4e4e4e;
+    --pop-shadow: rgba(0, 0, 0, 0.4);
+    --pill-shadow: rgba(0, 0, 0, 0.5);
+  }
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -24,7 +64,7 @@ pre { white-space: pre-wrap; word-break: break-word; }
 
 /* ── Top bar ── */
 .topbar {
-  background: #ececec; border-bottom: 1px solid var(--border);
+  background: var(--topbar-bg); border-bottom: 1px solid var(--border);
   position: sticky; top: 0; z-index: 10;
 }
 .topbar-row {
@@ -45,21 +85,21 @@ pre { white-space: pre-wrap; word-break: break-word; }
   font-size: 11.5px; color: var(--accent); padding: 3px 8px;
   border: 1px solid var(--border); background: var(--row);
 }
-.sound-btn:hover, .jobs-btn:hover { background: #e0eef7; }
+.sound-btn:hover, .jobs-btn:hover { background: var(--btn-hover-bg); }
 
 /* ── Job switcher popover ── */
 .jobs-pop {
-  position: absolute; right: 14px; top: 34px; width: 360px; max-height: 50vh; overflow-y: auto;
+  position: absolute; right: 14px; top: 34px; width: min(360px, calc(100vw - 28px)); max-height: 50vh; overflow-y: auto;
   background: var(--row); border: 1px solid var(--border); z-index: 20;
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
+  box-shadow: 0 2px 6px var(--pop-shadow);
 }
 .job-row {
   display: flex; align-items: baseline; gap: 8px; padding: 6px 10px;
   font-size: 11.5px; border-bottom: 1px solid var(--border-soft); cursor: pointer;
 }
 .job-row:last-child { border-bottom: none; }
-.job-row:hover { background: #e8f1f8; }
-.job-row.active { background: #dce9f5; }
+.job-row:hover { background: var(--chip-hover-bg); }
+.job-row.active { background: var(--chip-active-bg); }
 .job-row .jtitle { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .job-row .jstat { flex-shrink: 0; font-size: 10.5px; padding: 0 5px; border: 1px solid var(--border); color: var(--muted); }
 .job-row .jstat.running { color: var(--accent); border-color: var(--accent); }
@@ -77,8 +117,8 @@ pre { white-space: pre-wrap; word-break: break-word; }
   padding: 6px 14px;
 }
 .status-zone[hidden] { display: none; }
-.status-zone.done { background: #ecf5ea; }
-.status-zone.err { background: #f9eeee; }
+.status-zone.done { background: var(--status-done-bg); }
+.status-zone.err { background: var(--status-err-bg); }
 .now-label { font-size: 11px; color: var(--faint); text-transform: uppercase; letter-spacing: 0.05em; display: flex; align-items: center; }
 .pulse { display: inline-block; width: 8px; height: 8px; background: var(--accent); margin-right: 5px; animation: blink 1.2s steps(2, start) infinite; }
 .pulse.static { animation: none; }
@@ -94,7 +134,7 @@ pre { white-space: pre-wrap; word-break: break-word; }
   font-size: 11px; color: var(--accent); padding: 2px 8px;
   border: 1px solid var(--border); background: var(--row); white-space: nowrap;
 }
-.copy-btn:hover { background: #e0eef7; }
+.copy-btn:hover { background: var(--btn-hover-bg); }
 
 /* ── Filter chips ── */
 .filters { display: flex; gap: 6px; margin-bottom: 10px; }
@@ -102,8 +142,8 @@ pre { white-space: pre-wrap; word-break: break-word; }
   font-size: 11px; color: var(--muted); padding: 2px 10px;
   border: 1px solid var(--border); background: var(--row);
 }
-.chip:hover { background: #e8f1f8; }
-.chip.active { color: var(--accent); border-color: var(--accent); background: #dce9f5; }
+.chip:hover { background: var(--chip-hover-bg); }
+.chip.active { color: var(--accent); border-color: var(--accent); background: var(--chip-active-bg); }
 body[data-filter="errors"] .tl > * { display: none; }
 body[data-filter="errors"] .tl > .tool.err,
 body[data-filter="errors"] .tl > .result-card.err { display: block; }
@@ -134,17 +174,17 @@ body[data-filter="msgs"] .tl > .msg { display: flex; }
 .t-time { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; min-width: 48px; text-align: right; }
 .tool summary { padding: 3px 12px 6px 28px; font-size: 11px; color: var(--faint); }
 .tool summary:hover { color: var(--accent); }
-.tool pre { padding: 8px 12px; font-size: 11.5px; line-height: 1.5; background: #fdfdfd; border-top: 1px solid var(--border-soft); color: var(--text); }
-.tool.err { border: 1px solid #e3b3b3; border-top: none; background: var(--row); }
+.tool pre { padding: 8px 12px; font-size: 11.5px; line-height: 1.5; background: var(--tool-pre-bg); border-top: 1px solid var(--border-soft); color: var(--text); }
+.tool.err { border: 1px solid var(--tool-err-border); border-top: none; background: var(--row); }
 .tool.err .t-name { color: var(--err); }
-.tool.err pre { background: #fdf3f3; }
+.tool.err pre { background: var(--tool-err-pre-bg); }
 
 .think { font-size: 11px; color: var(--faint); padding: 3px 2px 3px 12px; }
 .think summary { display: inline; }
 .think pre { margin-top: 4px; font-size: 11.5px; color: var(--muted); background: var(--row); border: 1px solid var(--border-soft); padding: 6px 10px; }
 
-.result-card { border: 1px solid #a9d0a6; background: var(--row); padding: 10px 12px; margin-top: 8px; }
-.result-card.err { border-color: #e3b3b3; }
+.result-card { border: 1px solid var(--card-ok-border); background: var(--row); padding: 10px 12px; margin-top: 8px; }
+.result-card.err { border-color: var(--tool-err-border); }
 .result-card .rc-title { font-weight: 700; font-size: 12px; color: var(--ok); }
 .result-card.err .rc-title { color: var(--err); }
 .result-card .rc-text { margin-top: 6px; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
@@ -155,14 +195,14 @@ body[data-filter="msgs"] .tl > .msg { display: flex; }
 /* ── Back-to-latest pill ── */
 .back-latest {
   position: fixed; right: 16px; bottom: 18px; z-index: 90;
-  background: #16161d; color: #f2f2f5; border-radius: 999px; padding: 10px 16px;
+  background: var(--back-latest-bg); color: var(--back-latest-text); border-radius: 999px; padding: 10px 16px;
   font: 12px/1 -apple-system, "PingFang SC", sans-serif;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3);
+  box-shadow: 0 4px 14px var(--pill-shadow);
   opacity: 0; transform: translateY(8px); pointer-events: none;
   transition: opacity 0.18s ease-out, transform 0.18s ease-out;
 }
 .back-latest.show { opacity: 1; transform: translateY(0); pointer-events: auto; }
-.back-latest:hover { background: #2a2a35; }
+.back-latest:hover { background: var(--back-latest-hover); }
 
 /* ── Enter animation ── */
 .ev-in > * { animation: evIn 0.3s ease-out; }

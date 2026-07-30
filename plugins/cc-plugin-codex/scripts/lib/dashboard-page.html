@@ -22,21 +22,21 @@
       <button id="soundBtn" class="sound-btn" aria-pressed="false" title="任务结束时播放提示音">提示音 关</button>
       <button id="jobsBtn" class="jobs-btn" aria-haspopup="true" aria-expanded="false">切换任务 ▾</button>
     </span>
-    <div class="jobs-pop" id="jobsPop" hidden></div>
+    <div class="jobs-pop" id="jobsPop" role="region" aria-label="任务列表" hidden></div>
   </div>
-  <section class="status-zone" id="statusZone" aria-live="polite" hidden></section>
+  <section class="status-zone" id="statusZone" role="status" aria-label="当前任务状态" aria-live="polite" hidden></section>
 </header>
 
 <div class="wrap">
   <div class="filters" role="group" aria-label="事件过滤">
-    <button class="chip active" data-filter="all">全部</button>
-    <button class="chip" data-filter="errors">仅错误</button>
-    <button class="chip" data-filter="msgs">仅叙述</button>
+    <button class="chip active" data-filter="all" aria-pressed="true">全部</button>
+    <button class="chip" data-filter="errors" aria-pressed="false">仅错误</button>
+    <button class="chip" data-filter="msgs" aria-pressed="false">仅叙述</button>
   </div>
-  <main class="tl" id="timeline"></main>
+  <main class="tl" id="timeline" role="log" aria-label="事件时间线" aria-live="polite"></main>
 </div>
 
-<button class="back-latest" id="backLatest"></button>
+<button class="back-latest" id="backLatest" aria-label="回到最新动态"></button>
 
 <script type="module">%%DASHBOARD_JS%%</script>
 </body>

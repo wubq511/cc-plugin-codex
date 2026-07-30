@@ -558,7 +558,9 @@ function bootstrap() {
     if (follow.following || follow.pending === 0) {
       backLatest.classList.remove("show");
     } else {
-      backLatest.textContent = "↓ " + follow.pending + " 条新动态，回到最新";
+      const text = "↓ " + follow.pending + " 条新动态，回到最新";
+      backLatest.textContent = text;
+      backLatest.setAttribute("aria-label", text);
       backLatest.classList.add("show");
     }
   }
@@ -579,7 +581,11 @@ function bootstrap() {
   document.querySelectorAll(".chip").forEach((chip) => {
     chip.addEventListener("click", () => {
       document.body.dataset.filter = chip.dataset.filter;
-      document.querySelectorAll(".chip").forEach((c) => c.classList.toggle("active", c === chip));
+      document.querySelectorAll(".chip").forEach((c) => {
+        const active = c === chip;
+        c.classList.toggle("active", active);
+        c.setAttribute("aria-pressed", String(active));
+      });
     });
   });
 
@@ -693,7 +699,17 @@ function bootstrap() {
     if (!jobsPop.hidden) renderJobList();
   });
   document.addEventListener("click", (e) => {
-    if (!jobsPop.hidden && !jobsPop.contains(e.target) && e.target !== jobsBtn) jobsPop.hidden = true;
+    if (!jobsPop.hidden && !jobsPop.contains(e.target) && e.target !== jobsBtn) {
+      jobsPop.hidden = true;
+      jobsBtn.setAttribute("aria-expanded", "false");
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !jobsPop.hidden) {
+      jobsPop.hidden = true;
+      jobsBtn.setAttribute("aria-expanded", "false");
+      jobsBtn.focus();
+    }
   });
 
   setFavicon(null);
