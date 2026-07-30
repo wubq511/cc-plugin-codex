@@ -2275,12 +2275,24 @@ async function handleCancel(params) {
   // the process tree can die within the same event-loop turn, overwriting
   // cancelling→cancelled before any observer sees the intermediate state.
   // The default delay is bounded (20ms) and negligible compared to
-  // process-tree shutdown time in production. Tests may widen the window via
-  // CC_TEST_CANCEL_OBSERVE_MS: on Windows, taskkill /T /F delivers no signal
-  // the child can trap, so without a wider window the transition is
-  // unobservable under CI load.
-  const cancelObserveMs = Number(process.env.CC_TEST_CANCEL_OBSERVE_MS) || 20;
-  await new Promise((r) => setTimeout(r, cancelObserveMs));
+  // process-tree shutdown time in production.
+  //
+  // Test hook: when CC_TEST_CANCEL_HOLD_FILE is set, replace the fixed yield
+  // with a deterministic rendezvous — hold the cancelling status until that
+  // file exists (bounded 30s fallback). Timing-based windows are unreliable
+  // under CI load: the observer's event loop can be starved for seconds, and
+  // on Windows taskkill /T /F delivers no signal the child could trap to
+  // widen the window itself.
+  const cancelHoldFile = process.env.CC_TEST_CANCEL_HOLD_FILE;
+  if (cancelHoldFile) {
+    const holdDeadline = Date.now() + 30000;
+    while (Date.now() < holdDeadline) {
+      try { if (fs.existsSync(cancelHoldFile)) break; } catch { /* keep waiting */ }
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  } else {
+    await new Promise((r) => setTimeout(r, 20));
+  }
 
   // Signal the watchdog once. The watchdog terminates the Claude process tree.
   handle.cancelRequested = true;

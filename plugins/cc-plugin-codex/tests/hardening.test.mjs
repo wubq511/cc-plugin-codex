@@ -1226,17 +1226,19 @@ test("cc_cancel terminates Claude descendant processes before releasing control"
 test("cc_cancel transitions through cancelling status before cancelled", async (t) => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "cc-cancelling-status-"));
   // No FAKE_CLAUDE_MODE env: the fake Claude reads the mode from stdin (the task text).
-  // Using "hang-slow" which traps SIGTERM and waits 300ms before exiting, giving
-  // the test enough time to observe the cancelling status on disk. On Windows,
-  // taskkill /T /F delivers no trappable signal, so the observation window is
-  // widened deterministically via CC_TEST_CANCEL_OBSERVE_MS instead of relying
-  // on the trap — polling under CI load would otherwise miss the transition.
+  // Timing-based observation windows are unreliable under CI load (the polling
+  // loop can be starved for seconds) and on Windows (taskkill /T /F delivers no
+  // signal the fake Claude could trap to stay alive). Instead the server holds
+  // the cancelling status until this test acknowledges it via a rendezvous file
+  // (CC_TEST_CANCEL_HOLD_FILE), making the observation deterministic.
+  const holdFile = path.join(workspace, "cancel-hold");
   const server = startServer(t, {
     workspace,
-    env: { CC_TEST_CANCEL_OBSERVE_MS: "2000" },
+    env: { CC_TEST_CANCEL_HOLD_FILE: holdFile },
   });
 
   const delegate = server.send(1, "cc_delegate", { task: "hang-slow" });
+  delegate.catch(() => {}); // handled via await below; avoid unhandled rejection if the test bails early
   // Wait for job to be running
   await waitFor(() => {
     const jobs = listJobs(workspace);
@@ -1245,19 +1247,20 @@ test("cc_cancel transitions through cancelling status before cancelled", async (
 
   // Start cancel (async) — don't await yet
   const cancelPromise = server.send(2, "cc_cancel");
+  cancelPromise.catch(() => {}); // same guard as above
 
   // The job must transition to cancelling while the process tree is still alive.
-  // hang-slow traps SIGTERM for 300ms, so cancelling should be observable.
-  let sawCancelling = false;
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
+  // The server holds that status until we write the hold file, so this waitFor
+  // cannot miss the window no matter how loaded the machine is.
+  const cancellingJob = await waitFor(() => {
     const jobs = listJobs(workspace);
-    const job = jobs.find((j) => j.status === "cancelling");
-    if (job) { sawCancelling = true; break; }
-    await new Promise((r) => setTimeout(r, 10));
-  }
-  assert.ok(sawCancelling,
+    return jobs.find((j) => j.status === "cancelling");
+  }, 15000);
+  assert.ok(cancellingJob,
     "Job must transition to cancelling status (not directly to cancelled)");
+
+  // Acknowledge: let the server proceed to tree termination and finalize.
+  fs.writeFileSync(holdFile, "seen");
 
   const cancelled = await cancelPromise;
   assert.match(cancelled.result.content[0].text, /已取消/i);

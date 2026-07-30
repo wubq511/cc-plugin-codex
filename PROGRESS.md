@@ -511,4 +511,4 @@ audit found and repaired these additional gaps:
 
 **保留不改（有背书的判断项）**：dashboard URL 带 `?token=` 进入 delegate/cc_check/cc_setup 输出（即进 Codex transcript）——带外信道设计所需，hardening `/token/i` 断言已收窄豁免「实时面板」行；5 处取消模板重复拼接为既有模式延续。
 
-**验证**：`npm test` 551 pass / 0 fail / 0 skipped；`npm run verify:ci` 全绿；`git diff --check` clean。注：`hardening` 的 "cc_cancel transitions through cancelling status" 在本地全量并行与 windows-latest/Node 22 CI 上各 flake 一次——根因：Windows `taskkill /T /F` 不投递可捕获信号，fake-claude 的 SIGTERM trap 无效，cancelling 观察窗只剩 ~20ms，负载下 10ms 轮询会错过。已确定性修复：cancel 路径的 20ms 观察窗改为 `CC_TEST_CANCEL_OBSERVE_MS` 可调（默认 20ms 不变），该测试设为 2000ms；6 并发重复跑 fail 0。
+**验证**：`npm test` 551 pass / 0 fail / 0 skipped；`npm run verify:ci` 全绿；`git diff --check` clean。注：`hardening` 的 "cc_cancel transitions through cancelling status" 在本地全量并行与 CI（windows-latest/22、macos-latest/22）上反复 flake——根因：时间窗方案不可靠（CI 负载下轮询循环可被饿死数秒；Windows `taskkill /T /F` 不投递可捕获信号，fake-claude 的 SIGTERM trap 无效）。最终修复：cancel 路径的 20ms 观察 yield 支持 `CC_TEST_CANCEL_HOLD_FILE` 交会文件（设置后服务端保持 cancelling 直到文件出现，30s 有界兜底；默认 20ms 不变），测试观察到 cancelling 后写文件放行——完全去除时序依赖。8 并发重复跑 fail 0。
