@@ -11,7 +11,7 @@
  *     separation, orphaned status, safe cancellation, writer lease, workspace
  *     fingerprinting, is_error handling, resume semantics.
  * P1: Watchdog runner, stdin prompt delivery, bounded outputs, read-only enforcement,
- *     background deprecation, persistence-failure cancellation.
+ *     foreground-only delegation, persistence-failure cancellation.
  * P2: Runtime MCP input validation, NUL-delimited Git, review context caps,
  *     sensitive file exclusion, untrusted data framing, canonical review schema,
  *     EPIPE/fatal handling, cc_setup diagnostics.
@@ -286,6 +286,27 @@ const pendingToolCalls = new Map();
 // makes re-entrant/late calls return the same terminal decision.
 const finalizingJobs = new Map();
 
+// Process-local record of terminal-result fingerprints already delivered to
+// the caller (via cc_delegate's terminal return or a cc_check). cc_check uses
+// it to avoid re-paying the full result payload on repeated status checks of
+// an unchanged terminal job. Nothing new is persisted: the fingerprint is
+// recomputed from the on-disk artifact, so after a server restart the next
+// cc_check simply re-delivers the result once. Bounded FIFO.
+const deliveredResultFingerprints = new Map();
+const DELIVERED_RESULT_FINGERPRINTS_MAX = 200;
+
+function resultFingerprint(jobId, fullResult) {
+  return "sha256:" + createHash("sha256").update(`${jobId}\n${fullResult || ""}`).digest("hex").slice(0, 12);
+}
+
+function markResultDelivered(jobId, fingerprint) {
+  deliveredResultFingerprints.delete(jobId);
+  deliveredResultFingerprints.set(jobId, fingerprint);
+  while (deliveredResultFingerprints.size > DELIVERED_RESULT_FINGERPRINTS_MAX) {
+    deliveredResultFingerprints.delete(deliveredResultFingerprints.keys().next().value);
+  }
+}
+
 // Terminal statuses — once set, no other status may override.
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "rejected", "orphaned"]);
 
@@ -336,17 +357,17 @@ function validateToolArgs(toolName, params) {
   // Reject unknown properties and validate types
   const schemas = {
     cc_delegate: {
-      allowed: new Set(["cwd", "task", "write", "background", "model", "effort", "dangerouslySkipPermissions", "timeoutSeconds", "resume", "resumeSession", "autoCompact", "maxBudgetUsd", "continuationPlan"]),
+      allowed: new Set(["cwd", "task", "write", "model", "effort", "dangerouslySkipPermissions", "timeoutSeconds", "resume", "resumeSession", "autoCompact", "maxBudgetUsd", "continuationPlan"]),
       required: ["cwd", "task"],
-      booleans: ["write", "background", "dangerouslySkipPermissions", "resume"],
+      booleans: ["write", "dangerouslySkipPermissions", "resume"],
       strings: ["cwd", "task", "model", "effort", "resumeSession", "continuationPlan"],
       integers: ["timeoutSeconds"],
       enums: { effort: ["low", "medium", "high", "xhigh", "max"] }
     },
     cc_check: {
-      allowed: new Set(["cwd", "job", "all", "wait", "session"]),
+      allowed: new Set(["cwd", "job", "all", "wait", "session", "includeResult"]),
       required: ["cwd"],
-      booleans: ["all", "wait", "session"],
+      booleans: ["all", "wait", "session", "includeResult"],
       strings: ["cwd", "job"]
     },
     cc_cancel: {
@@ -714,42 +735,41 @@ const CWD_SCHEMA = {
 const TOOLS = [
   {
     name: "cc_delegate",
-    description: "Delegate a coding task to Claude Code. All tasks keep one foreground tool call pending and return automatically on completion. Call this registered tool directly: while it is pending, do not manually launch the MCP server, poll, or emit periodic 'still running' commentary. background=true is deprecated and rejected. Task prompts are sent via stdin for privacy. For follow-up and review-fix work, call cc_plan_continuation first and pass the returned planId as continuationPlan: the plan enforces the chosen action (resume, compact_resume, or fresh_handoff) and prevents replay. Without a plan, delegation starts a fresh session by default. Use resume only when the user explicitly requests preservation of the same Claude Code conversation. By default, delegation inherits the user's current Claude Code Provider and model configuration — do not pass --model unless the user explicitly names one. When the response contains a 实时面板 (live dashboard) URL, always relay it verbatim to the user — it opens a real-time browser view of Claude's progress. When the response contains a 在终端继续此会话 section with a `claude --resume` command, always relay that command verbatim to the user as well.",
+    description: "Delegate a coding task to Claude Code. One foreground call stays pending and returns automatically on completion — while pending, do not launch the MCP server manually, poll, or emit 'still running' commentary. Foreground only. For follow-up or review-fix work, call cc_plan_continuation first and pass its planId as continuationPlan; without a plan, a fresh session starts. Model and Provider config are inherited unless the user explicitly names a model. Relay any 实时面板 (live dashboard) URL or 终端续接 `claude --resume` command in the response verbatim to the user. Operational details: see the delegate skill.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
         cwd: CWD_SCHEMA,
         task: { type: "string", description: "The coding task to delegate to Claude Code" },
-        write: { type: "boolean", description: "Allow Claude Code to write files (default: true)" },
-        background: { type: "boolean", description: "DEPRECATED AND REJECTED. background=true is no longer supported. Default foreground delegation waits silently without polling. This parameter exists only for backward compatibility and will always produce an error if set to true." },
-        model: { type: "string", description: "Explicit model override for this delegation. When omitted, Claude Code uses its current configured default (inherited). Accepts a Claude alias (opus, fable, sonnet, haiku — case-insensitive) or a bounded native model ID (e.g., deepseek-v4-pro, glm-5.2). Ambiguous selectors are rejected — the plugin does not guess or silently fall back." },
+        write: { type: "boolean", description: "Allow Claude Code to write files (default: true); false = read-only, strictly Read/Glob/Grep" },
+        model: { type: "string", description: "Model override. Omit = inherited from Claude Code's current configuration. Accepts a Claude alias (opus, fable, sonnet, haiku — case-insensitive) or a native model ID containing a digit (e.g., glm-5.2). Ambiguous selectors are rejected." },
         effort: { type: "string", description: "Reasoning effort level", enum: ["low", "medium", "high", "xhigh", "max"] },
-        dangerouslySkipPermissions: { type: "boolean", description: "Skip permission prompts (default: false, set true to allow Claude Code to write without confirmation)" },
-        timeoutSeconds: { type: "integer", description: "Optional hard timeout in seconds. When omitted, the task runs until it completes, fails, is cancelled, or the server shuts down. Must be an integer in 1..604800 if supplied." },
-        resume: { type: "boolean", description: "Explicit conversation preservation: resume the last completed plugin job in this workspace that has a claudeSessionId. Do not use for ordinary follow-up or review-fix work; start fresh with a bounded handoff instead. Cannot be combined with resumeSession." },
-        resumeSession: { type: "string", description: "Explicit conversation preservation: resume a specific Claude Code session by session ID (adds --resume <id> flag). Do not use for ordinary follow-up or review-fix work. Cannot be combined with resume." },
+        dangerouslySkipPermissions: { type: "boolean", description: "Skip permission prompts (default: false)" },
+        timeoutSeconds: { type: "integer", description: "Hard timeout in seconds (1..604800). Omit = run until completion, failure, cancellation, or server shutdown." },
+        resume: { type: "boolean", description: "Resume the last completed plugin job's session in this workspace. Only when the user explicitly requests conversation preservation; use cc_plan_continuation for ordinary follow-ups. Mutually exclusive with resumeSession." },
+        resumeSession: { type: "string", description: "Resume a specific Claude session by ID (--resume <id>). Only on explicit user request. Mutually exclusive with resume." },
         autoCompact: {
           type: ["object", "null"],
-          description: "Temporary auto-compact directive. A full policy supplies contextWindowTokens + targetTokens and optional scope. Task inheritance supplies scope=task + taskScopeId UUID only. Task clear supplies scope=task + taskScopeId UUID + clear=true. Explicit null on a resumed session clears that session's inherited policy. Unknown/cleared task IDs fail before spawn. Values are injected only through inline --settings; permanent Claude/Provider config and parent env are never modified.",
+          description: "Temporary auto-compact directive, injected via inline --settings only (never permanent config or parent env). Full policy: contextWindowTokens + targetTokens (+ optional scope). Task inheritance: scope=task + taskScopeId. Task clear: scope=task + taskScopeId + clear=true. Explicit null on a resumed session clears its inherited policy. Unknown/cleared task IDs fail before spawn. Semantics: see the delegate skill.",
           additionalProperties: false,
           properties: {
-            contextWindowTokens: { type: "integer", description: "User-declared context window size in tokens (unverified). Must be a positive integer. Required for full policy; omit when inheriting via taskScopeId only." },
-            targetTokens: { type: "integer", description: "Nominal target token count for auto-compact. Must be a positive integer <= 90% of contextWindowTokens. Required for full policy; omit when inheriting via taskScopeId only." },
-            scope: { type: "string", enum: ["delegation", "session", "task"], description: "Scope of the auto-compact policy. Default: delegation." },
-            taskScopeId: { type: "string", description: "UUID for task-scope inheritance. Omit on the first full task policy to generate one. Carry the same UUID with scope=task on later delegations." },
-            clear: { type: "boolean", const: true, description: "Only true is valid. With scope=task and taskScopeId UUID, clears that task policy without injecting settings." }
+            contextWindowTokens: { type: "integer", description: "User-declared context window tokens (unverified). Positive integer. Required for full policy." },
+            targetTokens: { type: "integer", description: "Nominal compact target. Positive integer ≤ 90% of contextWindowTokens. Required for full policy." },
+            scope: { type: "string", enum: ["delegation", "session", "task"], description: "Policy scope. Default: delegation." },
+            taskScopeId: { type: "string", description: "UUID for task-scope inheritance. Omit on the first task policy to generate one; carry it on later delegations." },
+            clear: { type: "boolean", const: true, description: "true only. With scope=task + taskScopeId, clears that task policy without injecting settings." }
           }
         },
-        maxBudgetUsd: { type: "number", description: "Optional positive maximum budget in USD (≤ 1000) for this delegation, passed through to the CLI budget guard (--max-budget-usd). When supplied but the CLI lacks --max-budget-usd, the call fails closed before any Provider call. Omit to run without an explicit budget cap.", exclusiveMinimum: 0, maximum: 1000 },
-        continuationPlan: { type: "string", description: "Optional planId from cc_plan_continuation. Enforces the chosen continuation action: fresh_handoff forbids resume flags; resume/compact_resume target the exact parent session. Single-use; replay, expiry, or binding mismatch (cwd/model/write) fails closed." }
+        maxBudgetUsd: { type: "number", description: "Max budget in USD (≤ 1000), passed to --max-budget-usd; fails closed if the CLI lacks the budget guard. Omit = no explicit cap.", exclusiveMinimum: 0, maximum: 1000 },
+        continuationPlan: { type: "string", description: "planId from cc_plan_continuation. Enforces the planned action (fresh_handoff forbids resume flags; resume/compact_resume target the parent session). Single-use; replay, expiry, or binding mismatch (cwd/model/write) fails closed." }
       },
       required: ["cwd", "task"]
     }
   },
   {
     name: "cc_list_models",
-    description: "Compatibility tool: reports that model resolution is owned by Claude Code's current Provider configuration, explains the optional free-form model override, and summarizes requested-vs-observed model information from the latest completed local job when available. Does not enumerate or validate available models. Pass an absolute `cwd` to load history from a specific workspace.",
+    description: "Compatibility tool: model resolution is owned by Claude Code's current Provider configuration and this tool does not enumerate or validate available models. Reports requested-vs-observed model info from the latest completed local job when available.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -760,18 +780,18 @@ const TOOLS = [
   },
   {
     name: "cc_resolve_route",
-    description: "Read-only model route resolver. Use when the user explicitly names a model for delegation (e.g., Opus, Fable, DeepSeek V4 Pro, GLM 5.2, or a native model ID). Returns the selector kind (alias/native/inherited), the canonical CLI argument, and a non-secret route snapshot. Does NOT enumerate Provider models, does NOT promise Provider acceptance, and does NOT make a model call. Unknown or ambiguous selectors are rejected with a clarification message. Omit the selector for inherited (default) behavior — no resolver call is needed.",
+    description: "Read-only preview of how an explicit model selector will be routed: selector kind (inherited/alias/native), canonical CLI argument, non-secret route snapshot. No model call; ambiguous selectors are rejected. Omit the selector for inherited default. A configuration claim, not execution proof.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
-        selector: { type: "string", description: "Natural-language or exact model selector (e.g., 'Opus', 'Fable', 'DeepSeek V4 Pro', 'glm-5.2'). Omit for inherited default." }
+        selector: { type: "string", description: "Model selector (e.g., 'Opus', 'glm-5.2'). Omit for inherited default." }
       }
     }
   },
   {
     name: "cc_check",
-    description: "Check job status or get results. With only the required workspace cwd, returns the latest job. Pass a job ID (or prefix) for details. Set all=true to list all jobs. Set wait=true to wait for a running job to complete. Set session=true to filter by current session. When the output contains a 实时面板 (live dashboard) URL or a 在终端继续此会话 section with a `claude --resume` command, always relay them verbatim to the user.",
+    description: "Check job status or results. cwd only → latest job; job = ID/prefix → specific job; all=true → summary table; wait=true → wait for a running job; session=true → current session only. Repeated checks of an unchanged terminal job return a result fingerprint instead of the full result; includeResult=true forces re-delivery. Relay any 实时面板 (live dashboard) URL or 终端续接 `claude --resume` command verbatim to the user.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -780,14 +800,15 @@ const TOOLS = [
         job: { type: "string", description: "Job ID or prefix to check (default: latest job)" },
         all: { type: "boolean", description: "List all jobs (default: false)" },
         wait: { type: "boolean", description: "Wait for job completion if still running (default: false)" },
-        session: { type: "boolean", description: "Filter to current session's jobs (default: false)" }
+        session: { type: "boolean", description: "Filter to current session's jobs (default: false)" },
+        includeResult: { type: "boolean", description: "Force re-delivery of the full terminal result when it was suppressed as unchanged (default: false)." }
       },
       required: ["cwd"]
     }
   },
   {
     name: "cc_cancel",
-    description: "Cancel a running Claude Code job. With only the required workspace cwd, cancels the latest active job. Accepts job ID prefix. Can only cancel jobs owned by the current companion server session; orphaned or foreign-owned jobs cannot be safely cancelled.",
+    description: "Cancel a running Claude Code job (cwd only → latest active job; accepts ID prefix). Only jobs owned by this server session can be cancelled; orphaned or foreign-owned jobs cannot.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -800,7 +821,7 @@ const TOOLS = [
   },
   {
     name: "cc_review",
-    description: "Review code changes made by a Claude Code job. Returns the diff and a structured review prompt for Codex to execute. Set adversarial=true to challenge implementation choices with a structured XML template. Auto-detects review scope (working-tree vs branch). Returns findings in a structured schema with verdict, severity-ranked findings, and next_steps. The canonical review verdict enum is: approve, needs-attention, request_changes, reject.",
+    description: "Review code changes made by a Claude Code job. Returns bounded diff context plus a structured review prompt for you to execute. Verdict enum: approve, needs-attention, request_changes, reject. adversarial=true challenges implementation choices. Scope auto-detects working-tree vs branch.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -817,23 +838,23 @@ const TOOLS = [
   },
   {
     name: "cc_setup",
-    description: "Check if Claude Code is installed and ready to use. Performs static checks (zero model calls): CLI protocol verification (print-mode JSON support), real source-vs-cache comparison, model routing classifier status, and state schema health. Set livenessProbe=true to run a real Provider liveness probe — this makes one model call and incurs a cost. The probe accepts the same optional `model` selector as cc_delegate, requires a positive `timeoutSeconds`, a positive `maxBudgetUsd`, and a CLI budget-guard capability that is verified before the paid call. If the budget guard is unsupported the probe fails closed without a Provider call. When the output contains a 实时面板 (live dashboard) URL, always relay it verbatim to the user.",
+    description: "Static readiness checks for Claude Code (zero model calls): CLI print-mode protocol, source-vs-cache comparison, routing classifier, state schema health. livenessProbe=true makes one paid Provider call and requires timeoutSeconds>0, maxBudgetUsd>0, and CLI budget-guard support (fails closed otherwise). Relay any 实时面板 (live dashboard) URL verbatim to the user.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
         cwd: CWD_SCHEMA,
-        livenessProbe: { type: "boolean", description: "When true, run a real Provider liveness probe (one model call, incurs cost). Requires timeoutSeconds > 0, maxBudgetUsd > 0, and CLI budget-guard support. Default: false (static checks only, zero model calls)." },
-        timeoutSeconds: { type: "integer", description: "Positive timeout budget in seconds for the liveness probe. Required when livenessProbe=true." },
-        model: { type: "string", description: "Optional model selector for the liveness probe (same semantics as cc_delegate). Omit for inherited default." },
-        maxBudgetUsd: { type: "number", description: "Positive maximum budget in USD for the liveness probe. Passed through to the CLI budget guard. Required when livenessProbe=true.", exclusiveMinimum: 0 }
+        livenessProbe: { type: "boolean", description: "Run a real Provider liveness probe (one model call, incurs cost). Requires timeoutSeconds and maxBudgetUsd. Default: false (static checks only)." },
+        timeoutSeconds: { type: "integer", description: "Positive timeout in seconds for the liveness probe. Required when livenessProbe=true." },
+        model: { type: "string", description: "Model selector for the liveness probe (same semantics as cc_delegate). Omit = inherited." },
+        maxBudgetUsd: { type: "number", description: "Positive USD budget for the liveness probe, passed to the CLI budget guard. Required when livenessProbe=true.", exclusiveMinimum: 0 }
       },
       required: ["cwd"]
     }
   },
   {
     name: "cc_compact",
-    description: "Run a read-only foreground /compact on a stopped Claude Code session. Captures a transcript cursor first and returns compacted=true only for a new compact_boundary appended by this invocation; historical boundaries and summary markers do not count. Explicit resumeSession is checked against active/cancelling jobs. Stored session/task autoCompact settings are replayed, delegation settings are not. When a compact_resume continuationPlan is supplied, enforces the issued → compacted → consumed lifecycle. No permanent Claude/Provider configuration is modified.",
+    description: "Run a read-only foreground /compact on a stopped Claude Code session. Returns compacted=true only when this invocation appends a new compact_boundary after its pre-captured transcript cursor. Replays stored session/task autoCompact settings (delegation scope is not replayed). With a compact_resume planId, enforces the issued → compacted → consumed lifecycle. Never modifies permanent Claude/Provider config.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -841,40 +862,40 @@ const TOOLS = [
         cwd: CWD_SCHEMA,
         job: { type: "string", description: "Job ID or prefix whose claudeSessionId to compact (default: latest stopped job)" },
         resumeSession: { type: "string", description: "Explicit Claude session ID to compact. Takes precedence over job." },
-        maxBudgetUsd: { type: "number", description: "Optional positive maximum budget in USD (≤ 1000) for this compact invocation, passed through to the CLI budget guard (--max-budget-usd). When supplied but the CLI lacks --max-budget-usd, the call fails closed before any Provider call. Omit to run without an explicit budget cap.", exclusiveMinimum: 0, maximum: 1000 },
-        continuationPlan: { type: "string", description: "Optional planId from cc_plan_continuation with action=compact_resume. Enforces the compact lifecycle: issued → compacted → consumed. A non-compact_resume plan, replay, or expiry fails closed." }
+        maxBudgetUsd: { type: "number", description: "Max budget in USD (≤ 1000), passed to --max-budget-usd; fails closed if the CLI lacks the budget guard. Omit = no explicit cap.", exclusiveMinimum: 0, maximum: 1000 },
+        continuationPlan: { type: "string", description: "planId with action=compact_resume. Enforces issued → compacted → consumed; other actions, replay, or expiry fail closed." }
       },
       required: ["cwd"]
     }
   },
   {
     name: "cc_plan_continuation",
-    description: "Evidence-based continuation planner (read-only, zero model calls). Selects between resume, compact_resume, and fresh_handoff for the next delegation using current-turn token evidence from the previous round. Returns a single-use planId bound to cwd/model/write/action. Call before cc_delegate or cc_compact when continuing prior work; the plan enforces the chosen action and prevents replay. Plans and token telemetry live only in the current MCP process; after restart, explicit same_session can recover the canonical session from persisted job state, while auto remains conservative without telemetry. Incomplete evidence never guesses Compact; multi-turn aggregate billing usage is never misrepresented as current context.",
+    description: "Evidence-based continuation planner (read-only, zero model calls). Selects resume, compact_resume, or fresh_handoff for the next delegation from current-turn token evidence. Returns a single-use, 15-minute planId bound to cwd/model/write/action; replay, expiry, or binding mismatch fails closed. Call before cc_delegate/cc_compact when continuing prior work. Evidence is process-local: after a restart, explicit same_session recovers the canonical session from persisted state while auto stays conservative. Incomplete evidence never guesses compaction. Semantics: see the delegate skill.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
         cwd: CWD_SCHEMA,
-        parentJob: { type: "string", description: "Parent job ID for evidence lookup. When omitted, parentSession is used." },
+        parentJob: { type: "string", description: "Parent job ID for evidence lookup. Omit to use parentSession." },
         parentSession: { type: "string", description: "Parent Claude session ID for evidence lookup." },
         relationship: { type: "string", enum: ["same_attempt", "same_goal", "next_step", "unrelated", "unknown"], description: "How the next task relates to the parent." },
         contextValue: { type: "string", enum: ["essential", "useful", "reconstructable"], description: "Value of the prior session's context for the next task." },
-        userIntent: { type: "string", enum: ["auto", "same_session", "fresh"], description: "User's explicit continuation preference. fresh → fresh_handoff; same_session never Fresh; auto uses evidence." },
+        userIntent: { type: "string", enum: ["auto", "same_session", "fresh"], description: "fresh → fresh_handoff; same_session never fresh; auto uses evidence." },
         correctionCount: { type: "integer", minimum: 0, description: "Number of prior correction rounds for this task." },
         allowCompact: { type: "boolean", description: "Whether compaction is permitted for this continuation." },
-        model: { type: ["string", "null"], description: "Next-round model selector (null = inherited). Bound to the plan; a mismatched model at consumption fails closed." },
-        write: { type: "boolean", description: "Next-round write flag. Bound to the plan; a mismatched write at consumption fails closed." },
+        model: { type: ["string", "null"], description: "Next-round model selector (null = inherited). Bound to the plan; mismatch at consumption fails closed." },
+        write: { type: "boolean", description: "Next-round write flag. Bound to the plan; mismatch fails closed." },
         drift: {
           type: "object",
           additionalProperties: false,
-          description: "Optional caller-observed drift signals. The plugin also derives workspace/CLI/tool drift from in-process evidence. Any drift pushes auto toward fresh_handoff.",
+          description: "Optional caller-observed drift signals, merged with plugin-derived workspace/CLI/tool drift. Any drift pushes auto toward fresh_handoff.",
           properties: {
             workspace: { type: "boolean" },
             cli: { type: "boolean" },
             tool: { type: "boolean" },
           },
         },
-        sessionPollution: { type: "boolean", description: "When true, the prior session is polluted and auto intent pushes toward fresh_handoff." }
+        sessionPollution: { type: "boolean", description: "true = prior session is polluted; auto pushes toward fresh_handoff." }
       },
       required: ["cwd", "relationship", "contextValue", "userIntent", "correctionCount", "allowCompact", "write"]
     }
@@ -983,15 +1004,15 @@ function formatTaskScopeIdLine(autoCompact) {
 }
 
 /**
- * Build the "resume in terminal" section for MCP responses. Shown only when
- * the job has a claudeSessionId (falls back to the pre-allocated
- * claudeSessionUuid). Claude Code `-p` sessions do not appear in the
- * interactive /resume picker, so the user must resume by ID. Returns "" when
- * no session id is available, so the section is omitted entirely.
+ * Build the "resume in terminal" line for MCP responses. Shown only when the
+ * job has a claudeSessionId (falls back to the pre-allocated claudeSessionUuid).
+ * Claude Code `-p` sessions do not appear in the interactive /resume picker, so
+ * the user must resume by ID (see skills/delegate/SKILL.md Notes). Returns ""
+ * when no session id is available, so the line is omitted entirely.
  */
 function formatTerminalResumeSection(sessionId) {
   if (!sessionId) return "";
-  return `\n\n### 在终端继续此会话\n\n在 workspace 根目录运行以下命令可继续此会话（claude \`-p\` 会话不进 /resume 列表，需按 ID 恢复）：\n\n\`\`\`\nclaude --resume ${sessionId}\n\`\`\``;
+  return `\n\n**终端续接：** \`claude --resume ${sessionId}\``;
 }
 
 // ─── Tool Handlers ──────────────────────────────────────────────────────────
@@ -1006,18 +1027,7 @@ async function handleDelegate(params, context = {}) {
   const cwd = getCwd(params);
   const workspaceRoot = rememberWorkspaceRoot(cwd);
   const write = params.write !== false;
-  const background = params.background === true;
 
-  // P1: Reject new background delegations unconditionally
-  if (background) {
-    return {
-      content: [{
-        type: "text",
-        text: "Error: background=true is deprecated and rejected in this release. Default foreground delegation waits silently without polling. Detached execution requires a separate supervisor design and is not available."
-      }],
-      isError: true
-    };
-  }
 
   // Validate model
   let model = params.model ?? null;
@@ -1485,7 +1495,7 @@ async function handleDelegate(params, context = {}) {
     effort,
     write,
     dangerouslySkipPermissions: skipPerms,
-    background: background || false,
+    background: false,
     resume,
     resumeSession: resolvedResumeSession,
     ownerServerId: SESSION_ID,
@@ -1856,6 +1866,10 @@ async function handleDelegate(params, context = {}) {
       }
     }
 
+    // Record that this terminal result was delivered, so a follow-up cc_check
+    // of the same unchanged job does not re-pay the full result payload.
+    markResultDelivered(jobId, resultFingerprint(jobId, safeResult));
+
     return {
       content: [{
         type: "text",
@@ -2057,8 +2071,7 @@ function handleResolveRoute(params) {
   lines.push(`_注意：${resolution.note}_`);
 
   return {
-    content: [{ type: "text", text: lines.join("\n") }],
-    structuredContent: resolution.structuredContent
+    content: [{ type: "text", text: lines.join("\n") }]
   };
 }
 
@@ -2158,8 +2171,26 @@ async function handleCheck(params) {
     diagnosticSection = diagLines.join("\n");
   }
 
+  // Terminal-result dedup: a repeated cc_check of an unchanged terminal job
+  // must not re-pay the full result payload (it was already delivered by
+  // cc_delegate's terminal return or an earlier cc_check). The fingerprint is
+  // recomputed from the on-disk artifact; includeResult=true is the explicit
+  // escape hatch that forces re-delivery.
+  const fingerprint = TERMINAL_STATUSES.has(job.status) && fullResult
+    ? resultFingerprint(job.id, fullResult)
+    : null;
+  const resultUnchanged = fingerprint !== null
+    && params.includeResult !== true
+    && deliveredResultFingerprints.get(job.id) === fingerprint;
+
   const resultPresentation = truncateForPresentation(fullResult);
-  const resultSection = resultPresentation.text ? `### 结果\n${resultPresentation.text}` : "";
+  let resultSection;
+  if (resultUnchanged) {
+    resultSection = `### 结果\n_与上次交付一致（指纹 ${fingerprint}），未重复发送。传 \`includeResult: true\` 可重新获取完整结果。_`;
+  } else {
+    resultSection = resultPresentation.text ? `### 结果\n${resultPresentation.text}` : "";
+    if (fingerprint !== null) markResultDelivered(job.id, fingerprint);
+  }
   const filesSection = (job.workspaceChanges)
     ? `### 工作区变更（观察）\n${job.workspaceChanges}\n${(job.touchedFiles || []).map((f) => `- ${f}`).join("\n")}`
     : (job.touchedFiles && job.touchedFiles.length > 0)
@@ -2189,14 +2220,16 @@ async function handleCheck(params) {
   const terminalResumeSection = formatTerminalResumeSection(job.claudeSessionId || job.claudeSessionUuid);
   const dashboardSection = formatDashboardSection();
 
-  const truncationNote = resultPresentation.truncated
+  const truncationNote = !resultUnchanged && resultPresentation.truncated
     ? `\n_结果为展示而截断（原始：${resultPresentation.originalSize} 字节）_`
     : "";
+
+  const fingerprintLine = fingerprint !== null ? `**结果指纹：** ${fingerprint}\n` : "";
 
   return {
     content: [{
       type: "text",
-      text: `## 任务：${job.id}\n\n**状态：** ${job.status}\n**阶段：** ${phase} (${phaseDescription(phase)})\n**任务：** ${taskRefLabel(job)}\n${modelLine}${taskScopeLine}\n**思考强度：** ${job.effort || "—"}\n**耗时：** ${formatDuration(job.duration ? job.duration * 1000 : null)}\n**费用：** ${formatCost(job.cost)}\n${elapsedSection}**开始时间：** ${job.startedAt || job.createdAt || "—"}\n**完成时间：** ${job.completedAt || "—"}\n\n${resultSection}${truncationNote}\n\n${filesSection}\n\n${progressSection}\n\n${diagnosticSection}${terminalResumeSection}${dashboardSection}`
+      text: `## 任务：${job.id}\n\n**状态：** ${job.status}\n**阶段：** ${phase} (${phaseDescription(phase)})\n**任务：** ${taskRefLabel(job)}\n${modelLine}${taskScopeLine}\n**思考强度：** ${job.effort || "—"}\n**耗时：** ${formatDuration(job.duration ? job.duration * 1000 : null)}\n**费用：** ${formatCost(job.cost)}\n${fingerprintLine}${elapsedSection}**开始时间：** ${job.startedAt || job.createdAt || "—"}\n**完成时间：** ${job.completedAt || "—"}\n\n${resultSection}${truncationNote}\n\n${filesSection}\n\n${progressSection}\n\n${diagnosticSection}${terminalResumeSection}${dashboardSection}`
     }]
   };
 }
@@ -2620,13 +2653,6 @@ async function handleCompact(params) {
       type: "text",
       text: lines.join("\n")
     }],
-    structuredContent: {
-      compacted: boundary.compacted,
-      observedBoundary: boundary.observedBoundary,
-      costUsd: Number.isFinite(result.cost) ? result.cost : null,
-      durationSeconds: Number.isFinite(result.duration) ? result.duration : null,
-      reason,
-    },
   };
 }
 
@@ -3465,19 +3491,6 @@ async function handlePlanContinuation(params) {
 
   return {
     content: [{ type: "text", text: lines.join("\n") }],
-    structuredContent: {
-      action: plan.action,
-      planId: plan.planId,
-      reasonCodes: plan.reasonCodes,
-      evidenceState: plan.evidenceState,
-      fallbackAction: plan.fallbackAction,
-      pressure: plan.pressure,
-      pressureThreshold: plan.pressureThreshold,
-      planExpiresAt: plan.planExpiresAt,
-      ...(plan.handoffTemplate ? { handoffTemplate: plan.handoffTemplate } : {}),
-      ...(plan.compactFocus ? { compactFocus: plan.compactFocus } : {}),
-      ...(plan.resumeGuidance ? { resumeGuidance: plan.resumeGuidance } : {}),
-    },
   };
 }
 
@@ -3522,7 +3535,7 @@ function handleMessage(msg) {
           protocolVersion: PROTOCOL_VERSION,
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: "claude-code-companion", version: SERVER_VERSION },
-          instructions: "Claude Code Companion: call cc_delegate directly and let its foreground tools/call remain pending until completion. Do not emulate it through shell/PTY, poll it, or emit periodic waiting commentary. For follow-up and review-fix work, call cc_plan_continuation first to select resume, compact_resume, or fresh_handoff based on evidence, then pass the returned planId to cc_delegate or cc_compact. Supports atomic per-job persistence, watchdog execution, session scoping, prefix matching, and explicit resume."
+          instructions: "Claude Code Companion: call cc_delegate directly and let the foreground tools/call remain pending until completion — never emulate via shell/PTY, poll, or emit waiting commentary. For follow-up or review-fix work, call cc_plan_continuation first and pass its planId to cc_delegate/cc_compact."
         });
         break;
       }

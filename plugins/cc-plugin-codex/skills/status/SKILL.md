@@ -18,8 +18,11 @@ Check the status and results of Claude Code tasks. Shows phase tracking, recent 
    - `all=true` → list all jobs in a summary table
    - `wait=true` → wait for a running job to complete (up to 4 minutes)
    - `session=true` → filter to current session's jobs only
+   - `includeResult=true` → force re-delivery of the full terminal result
 
-2. Present the status information to the user, including:
+2. Terminal-result dedup: a repeated `cc_check` of an unchanged terminal job returns a **结果指纹** (result fingerprint) line and a short "unchanged" note instead of the full result — the payload was already delivered by `cc_delegate`'s terminal return or an earlier check. The fingerprint is recomputed from the on-disk artifact (nothing extra is persisted), so after an MCP server restart the next check simply re-delivers once. Pass `includeResult=true` whenever you actually need the full result text again.
+
+3. Present the status information to the user, including:
    - Current phase and its description
    - Recent log entries showing progress
    - Session ID for the job

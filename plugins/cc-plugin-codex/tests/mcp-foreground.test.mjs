@@ -761,7 +761,7 @@ test("delegate success response embeds a terminal resume command with the real s
   const completed = await server.send(200, "cc_delegate", { task: "do work" });
   const text = completed.result.content[0].text;
   assert.match(text, /任务完成/);
-  assert.match(text, /### 在终端继续此会话/);
+  assert.match(text, /\*\*终端续接：\*\*/);
   const jobs = listJobs(server.workspace);
   const job = jobs.find((j) => j.status === "completed");
   assert.ok(job, "completed job should exist");
@@ -780,7 +780,7 @@ test("delegate preflight rejection omits the terminal resume section", async (t)
   const rejected = await server.send(201, "cc_delegate", { task: "x", model: "deepseek" });
   const text = rejected.result.content[0].text;
   assert.match(text, /模型选择器歧义|配置错误/);
-  assert.doesNotMatch(text, /### 在终端继续此会话/);
+  assert.doesNotMatch(text, /\*\*终端续接：\*\*/);
   assert.doesNotMatch(text, /claude --resume/);
 });
 
@@ -789,7 +789,7 @@ test("cc_check single-job output includes the terminal resume section for a comp
   await server.send(202, "cc_delegate", { task: "do work" });
   const check = await server.send(203, "cc_check");
   const text = check.result.content[0].text;
-  assert.match(text, /### 在终端继续此会话/);
+  assert.match(text, /\*\*终端续接：\*\*/);
   const jobs = listJobs(server.workspace);
   const job = jobs.find((j) => j.status === "completed");
   const sid = job.claudeSessionId || job.claudeSessionUuid;

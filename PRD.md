@@ -113,7 +113,6 @@ cc-plugin-codex/
 | `cwd` | string | ✅ | — | 用户当前工作区的绝对路径 |
 | `task` | string | ✅ | — | 要执行的任务描述 |
 | `write` | boolean | ❌ | `true` | 是否允许 Claude Code 写文件（`false` 严格限制为 Read/Glob/Grep） |
-| `background` | boolean | ❌ | `false` | DEPRECATED AND REJECTED — 不再支持，设置为 `true` 会报错 |
 | `model` | string | ❌ | — | 显式选择器：省略为 inherited；`Opus`/`Fable`/`Sonnet`/`Haiku` 为 alias；合法 native ID 原样透传；歧义/非法值 fail closed |
 | `effort` | string | ❌ | — | 推理努力度：`low`, `medium`, `high`, `xhigh`, `max` |
 | `timeoutSeconds` | integer | ❌ | — | 可选硬超时（秒，1..604800）。省略时任务运行直到完成、失败、取消或服务器关闭 |
@@ -153,7 +152,7 @@ cc-plugin-codex/
    - 解析 JSON 输出，提取 result、cost、touched files
    - 更新 job 状态为 completed
    - **自动返回结果**，包含摘要和修改的文件列表
-4. `background=true`：已废弃并拒绝。不再支持 detached 模式。
+4. 仅前台模式：无 background 参数（传入会被当作未知参数拒绝）。不支持 detached 模式。
 
 **后续任务的上下文策略：**
 
@@ -315,7 +314,7 @@ cc-plugin-codex/
 3. 对目标 session 运行只读前台 `claude --print --resume <sessionId> ...`，并将 `/compact` 通过 stdin 传入；不使用 `--session-id`。
 4. session/task 临时 auto-compact settings 会重放，delegation-only settings 不重放。
 5. 只有本次调用后新增的 canonical `type:"system", subtype:"compact_boundary"` 才返回 `compacted:true`；历史 boundary、summary marker 或普通成功退出都不能伪装为压缩成功。
-6. 将有界、非敏感的 `compactResult`（含本次 compact 的 cost/duration）写回 job，并在 `structuredContent` 返回 `compacted`、boundary、cost、duration、reason；随后可用同一 `resumeSession` 继续会话。
+6. 将有界、非敏感的 `compactResult`（含本次 compact 的 cost/duration）写回 job，并在文本结果中返回 `compacted`、boundary、cost、duration、reason（text-first，不再发 `structuredContent`）；随后可用同一 `resumeSession` 继续会话。
 
 ### 4.8 `cc_plan_continuation` — 三选一延续规划
 
@@ -326,7 +325,7 @@ cc-plugin-codex/
 1. 从持久化 job 解析 canonical parent session，并拒绝 job/session/cwd 不一致；MCP 重启后显式 `same_session` 可据此重新规划。
 2. 合并调用者 drift 与插件实测的 workspace fingerprint、Claude CLI 版本、model 和 write/tool profile 漂移。
 3. 读取仅存于当前 MCP 进程的上一轮证据。压力 token 优先取最后一个可用 `usage.iterations`；仅单轮运行可使用 aggregate usage。Provider `modelUsage.contextWindow` 一致时采用，否则仅可退回用户声明且未验证的 autoCompact window。
-4. 返回 `resume`、`compact_resume` 或 `fresh_handoff`，以及 `reasonCodes`、`evidenceState`、`fallbackAction`、压力信息和一次性 `planId` 的 `structuredContent`。
+4. 以文本结果返回 `resume`、`compact_resume` 或 `fresh_handoff`，以及 `reasonCodes`、`evidenceState`、`fallbackAction`、压力信息和一次性 `planId`（text-first，不再发 `structuredContent`）。
 5. plan 15 分钟过期，容量有界，且绑定 cwd、parent job/session、action、model、write。未知、过期、重放或绑定不匹配全部 fail closed；Compact+Resume 严格执行 `issued → compacted → consumed`。
 
 ## 5. Skills 定义
@@ -479,9 +478,9 @@ Job 记录结构：
 
 MCP 工具 `cc_delegate` 默认在同一次 pending 工具调用中等待 Claude Code 子进程完成，解析输出后只返回一次结果。Codex 作为 MCP client 收到工具返回值后自然继续执行；普通任务和长任务都不需要外层 `sleep`、重复 `cc_check` 或周期性“仍在运行” commentary。Codex 必须直接调用已注册的 `cc_delegate`；若工具未注册，应进入 setup/restart 排障，不得通过 shell/PTY 手工启动 server 并模拟轮询等待。
 
-**后台模式已废弃：**
+**仅前台模式：**
 
-`background=true` 在此版本中被拒绝。所有任务以前台模式运行，通过 watchdog 进程管理 Claude 的生命周期。watchdog 通过控制管道（fd3）与 companion 通信，companion 退出时自动终止 Claude。
+delegation 没有 background 模式（`background` 不是合法参数）。所有任务以前台模式运行，通过 watchdog 进程管理 Claude 的生命周期。watchdog 通过控制管道（fd3）与 companion 通信，companion 退出时自动终止 Claude。
 
 **delegate skill 的完整工作流：**
 

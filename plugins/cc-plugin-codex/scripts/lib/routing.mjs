@@ -31,7 +31,7 @@ export const KNOWN_ALIASES = Object.freeze(new Set(["opus", "fable", "sonnet", "
  * Allowed characters for a native model selector: letters, digits,
  * underscore, hyphen, dot, colon, slash. Rejects control characters,
  * whitespace, and any other character class before the value enters
- * snapshot, structuredContent, or CLI argv.
+ * snapshot, MCP output, or CLI argv.
  */
 const NATIVE_SELECTOR_RE = /^[a-zA-Z0-9_\-.:/]+$/;
 
@@ -111,7 +111,7 @@ function looksLikeNativeId(input) {
 
 /**
  * Validate a native model selector before it enters a route snapshot,
- * structuredContent, or CLI argv. Rejects control characters, whitespace,
+ * MCP output, or CLI argv. Rejects control characters, whitespace,
  * overlong values, characters outside the allowlist, and secret-like values.
  *
  * @param {string} selector - The native selector to validate
@@ -222,23 +222,15 @@ export function resolveRoute({ selectorInput, cliVersion, parentEnv }) {
 
 /**
  * Resolve a route for the cc_resolve_route tool (read-only, no execution).
- * Returns a human-readable summary and bounded structuredContent.
+ * Returns a human-readable summary only — the tool result is text-first and
+ * carries no structuredContent duplicate.
  *
- * @returns {{ selectorKind, requestedValue, cliArg, canonicalAlias, resolvedFrom, cliVersion, note, structuredContent }}
+ * @returns {{ selectorKind, requestedValue, cliArg, canonicalAlias, resolvedFrom, cliVersion, note }}
  * @throws {AmbiguousSelectorError} if the selector is ambiguous
  */
 export function resolveRouteForDisplay({ selectorInput, cliVersion }) {
   const selector = classifySelector(selectorInput);
   const snapshot = buildRouteSnapshot({ selector, cliVersion });
-
-  const structuredContent = {
-    selectorKind: snapshot.selectorKind,
-    requestedValue: snapshot.requestedValue,
-    cliArg: snapshot.cliArg,
-    canonicalAlias: snapshot.canonicalAlias,
-    cliVersion: snapshot.cliVersion,
-    notExecutionProof: true,
-  };
 
   return {
     selectorKind: snapshot.selectorKind,
@@ -248,6 +240,5 @@ export function resolveRouteForDisplay({ selectorInput, cliVersion }) {
     resolvedFrom: selector.resolvedFrom,
     cliVersion: snapshot.cliVersion,
     note: "This is a configuration claim, not execution proof. Live execution evidence is still required after delegation. The plugin does not know which Provider model each alias resolves to — that is owned by Claude Code's native configuration.",
-    structuredContent,
   };
 }

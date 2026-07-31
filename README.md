@@ -84,7 +84,7 @@ codex plugin add cc-plugin-codex
 /claude:status --all  # 所有任务
 ```
 
-默认 delegate 会一直等待 Claude Code 完成，期间 MCP server 仍可响应取消请求。等待时不应通过 `sleep`、重复状态查询或周期性“仍在运行”消息制造额外模型回合，也不得在工具缺失时用 shell/PTY 手工启动 companion 来模拟 delegation。`background=true` 已废弃并被拒绝。
+默认 delegate 会一直等待 Claude Code 完成，期间 MCP server 仍可响应取消请求。等待时不应通过 `sleep`、重复状态查询或周期性“仍在运行”消息制造额外模型回合，也不得在工具缺失时用 shell/PTY 手工启动 companion 来模拟 delegation。delegation 仅前台模式，没有 background 参数。
 
 ### 审查产出
 
@@ -107,7 +107,7 @@ codex plugin add cc-plugin-codex
 
 插件通过 `claude -p`（print 模式）执行任务，这类会话不会出现在交互式 `/resume` 列表中（这是 Claude Code 的官方行为，无法让插件会话进入 picker）。要继续某个插件会话，需按 session ID 恢复。
 
-每次任务返回（成功、失败、取消）以及 `cc_check` 单任务输出里，只要该 job 持有 `claudeSessionId`，就会附带一节「### 在终端继续此会话」，内含一条可复制的命令：
+每次任务返回（成功、失败、取消）以及 `cc_check` 单任务输出里，只要该 job 持有 `claudeSessionId`，就会附带一行「**终端续接：**」，内含一条可复制的命令：
 
 ```
 claude --resume <sessionId>

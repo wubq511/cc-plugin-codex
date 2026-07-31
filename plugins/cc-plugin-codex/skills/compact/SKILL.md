@@ -14,7 +14,7 @@ description: Use when you want to compact a stopped Claude Code session to recla
 - The user wants to reclaim context in a stopped session before resuming it.
 - The user wants to compact a specific session by ID or job.
 - After a delegation completes and the user wants to compress its context.
-- `cc_plan_continuation` returns `structuredContent.action: "compact_resume"`.
+- `cc_plan_continuation` returns a plan whose action is `compact_resume`.
 
 ## When NOT to Use
 
@@ -45,7 +45,7 @@ description: Use when you want to compact a stopped Claude Code session to recla
    - `Trigger` — `manual` or `auto` (if observed)
    - `Observed boundary` — the actual pre-compaction token count (if observed)
    - `Requested target` / `Effective window` — from the job's stored auto-compact policy (if any)
-   - `Cost` / `Duration` — this compact invocation's own telemetry; unknown cost remains null in `structuredContent`
+   - `Cost` / `Duration` — this compact invocation's own telemetry; unknown cost is shown as `—`, never as $0.00
    - `Reason` — why compaction did not happen (if `compacted: false`)
 
 ## Honest Reporting

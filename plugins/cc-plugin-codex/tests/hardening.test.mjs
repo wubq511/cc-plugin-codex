@@ -468,11 +468,11 @@ test("resume=true with no completed jobs returns clear error", async (t) => {
 
 // ─── P1: Background Rejection (unconditional) ──────────────────────────────
 
-test("background=true is rejected unconditionally (no escape hatch)", async (t) => {
+test("background param is rejected as unknown (foreground-only, no escape hatch)", async (t) => {
   const server = startServer(t);
   const result = await server.send(1, "cc_delegate", { task: "success", background: true });
   assert.equal(result.result.isError, true);
-  assert.match(result.result.content[0].text, /deprecated/);
+  assert.match(result.result.content[0].text, /Unknown parameter "background"/);
 });
 
 // ─── P1: Read-Only Mutation Test ─────────────────────────────────────────────
@@ -1454,16 +1454,17 @@ test("graceful shutdown drains foreground processes before releasing writer leas
 
 // ─── P2: Background not advertised in tool description ──────────────────────
 
-test("cc_delegate tool description does not encourage background=true usage", async (t) => {
+test("cc_delegate tool description does not advertise a background mode", async (t) => {
   const server = startServer(t);
   const listed = await server.request(1, "tools/list");
   const delegate = listed.result.tools.find((t) => t.name === "cc_delegate");
   assert.ok(delegate, "cc_delegate must be listed");
 
-  // Description should say deprecated/rejected, not encourage usage
-  const desc = delegate.description;
-  assert.match(desc, /deprecated|rejected/i);
-  assert.doesNotMatch(desc, /Set background=true only when the user explicitly requests/);
+  // The background parameter was removed entirely: neither the description nor
+  // the schema may mention it, and the input schema must not accept it.
+  assert.doesNotMatch(delegate.description, /background/i);
+  assert.ok(!("background" in delegate.inputSchema.properties), "background must not be a schema property");
+  assert.equal(delegate.inputSchema.additionalProperties, false);
 });
 
 // ─── P2: Sensitive file exclusion from review context ───────────────────────
@@ -2051,27 +2052,19 @@ test("cc_setup performs real source/cache comparison", async (t) => {
   assert.match(text, /not-installed|源码与缓存一致|源码与缓存不一致/i);
 });
 
-test("cc_resolve_route returns bounded structuredContent with no secrets", async (t) => {
+test("cc_resolve_route returns text-only result with no secrets", async (t) => {
   const server = startServer(t, { env: { ANTHROPIC_API_KEY: "sk-structured-content-secret" } });
   const response = await server.request(213, "tools/call", {
     name: "cc_resolve_route",
     arguments: { selector: "Opus" }
   });
 
-  // structuredContent must be present and bounded.
-  const sc = response.result.structuredContent;
-  assert.ok(sc, "structuredContent must be present");
-  assert.equal(sc.selectorKind, "alias");
-  assert.equal(sc.cliArg, "opus");
-  assert.equal(sc.canonicalAlias, "opus");
-  assert.equal(sc.notExecutionProof, true);
-  assert.deepStrictEqual(Object.keys(sc).sort(), [
-    "canonicalAlias", "cliArg", "cliVersion", "notExecutionProof", "requestedValue", "selectorKind",
-  ]);
-
-  // No secrets in structuredContent
-  const scStr = JSON.stringify(sc);
-  assert.doesNotMatch(scStr, /sk-structured-content-secret/);
+  // Text-first contract: no structuredContent duplicate on the wire.
+  assert.ok(!response.result.structuredContent, "structuredContent must not be present");
+  const text = response.result.content[0].text;
+  assert.match(text, /--model opus/);
+  assert.match(text, /opus/);
+  assert.doesNotMatch(text, /sk-structured-content-secret/);
 });
 
 test("delegate with alias model passes canonical alias to Claude CLI (case-insensitive)", async (t) => {

@@ -435,17 +435,44 @@ function plannerArgs(workspace, parentJob, model, overrides = {}) {
   };
 }
 
+// Tool results are text-first: cc_plan_continuation and cc_compact emit no
+// structuredContent. Parse the labeled text lines — the labels are the
+// plugin's output contract, pinned by the test suite.
+function planText(result) {
+  const text = result?.content?.[0]?.text || "";
+  const grab = (re) => text.match(re)?.[1] ?? null;
+  const pressureMatch = text.match(/\*\*上下文压力：\*\* ([\d.]+)% \(threshold: ([\d.]+)%\)/);
+  return {
+    action: grab(/\*\*动作：\*\* (\S+)/),
+    planId: grab(/\*\*计划 ID：\*\* (\S+)/),
+    evidenceState: grab(/\*\*证据状态：\*\* (\S+)/),
+    pressure: pressureMatch ? Number(pressureMatch[1]) / 100 : null,
+    pressureThreshold: pressureMatch ? Number(pressureMatch[2]) / 100 : null,
+  };
+}
+
+function compactText(result) {
+  const text = result?.content?.[0]?.text || "";
+  const cost = text.match(/\*\*费用：\*\* \$([\d.]+)/);
+  const duration = text.match(/\*\*耗时：\*\* (?:(\d+)ms|([\d.]+)s)/);
+  return {
+    compacted: text.match(/\*\*已压缩：\*\* (true|false)/)?.[1] === "true",
+    costUsd: cost ? Number(cost[1]) : null,
+    durationSeconds: duration ? (duration[1] != null ? Number(duration[1]) / 1000 : Number(duration[2])) : null,
+  };
+}
+
 async function observePlan(client, workspace, parentJob, model) {
   const result = await client.call(
     "cc_plan_continuation",
     plannerArgs(workspace, parentJob, model),
   );
-  const structured = result.structuredContent || {};
+  const parsed = planText(result);
   return {
-    action: structured.action || null,
-    evidenceState: structured.evidenceState || null,
-    pressure: safeNumber(structured.pressure),
-    threshold: safeNumber(structured.pressureThreshold),
+    action: parsed.action || null,
+    evidenceState: parsed.evidenceState || null,
+    pressure: safeNumber(parsed.pressure),
+    threshold: safeNumber(parsed.pressureThreshold),
   };
 }
 
@@ -454,10 +481,11 @@ async function issuePlan(client, workspace, parentJob, model, overrides) {
     "cc_plan_continuation",
     plannerArgs(workspace, parentJob, model, overrides),
   );
-  if (!result.structuredContent?.planId || !result.structuredContent?.action) {
-    throw new Error("planner-structured-content-missing");
+  const plan = planText(result);
+  if (!plan.planId || !plan.action) {
+    throw new Error("planner-text-parse-missing");
   }
-  return result.structuredContent;
+  return plan;
 }
 
 async function runCalibration({
@@ -592,7 +620,7 @@ async function runCalibration({
           write: true,
           sessionPollution: false,
         });
-        plan = result.structuredContent;
+        plan = planText(result);
         if (plan.action !== "fresh_handoff") throw new Error("fresh-arm-plan-mismatch");
         followTask = FRESH_HANDOFF_TASK;
       } else {
@@ -602,10 +630,11 @@ async function runCalibration({
           job: seed.job.id,
         });
         const compactWallSeconds = (performance.now() - compactStartedAt) / 1000;
+        const compactParsed = compactText(compactResult);
         compact = {
-          boundaryObserved: compactResult.structuredContent?.compacted === true,
-          costUsd: safeNumber(compactResult.structuredContent?.costUsd),
-          durationSeconds: safeNumber(compactResult.structuredContent?.durationSeconds),
+          boundaryObserved: compactParsed.compacted,
+          costUsd: safeNumber(compactParsed.costUsd),
+          durationSeconds: safeNumber(compactParsed.durationSeconds),
           wallSeconds: Number(compactWallSeconds.toFixed(3)),
         };
         plan = await issuePlan(client, workspace, seed.job, model, {

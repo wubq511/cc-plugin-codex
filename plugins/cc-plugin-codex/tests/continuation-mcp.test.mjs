@@ -143,8 +143,8 @@ test("cc_plan_continuation with no prior evidence returns fresh_handoff", async 
   assert.match(text, /fresh_handoff/);
   assert.match(text, /unavailable/);
   assert.match(text, /plan_[0-9a-f-]+/);
-  assert.equal(res.result.structuredContent.action, "fresh_handoff");
-  assert.equal(res.result.structuredContent.evidenceState, "unavailable");
+  // Text-first contract: no structuredContent duplicate.
+  assert.ok(!res.result.structuredContent);
 });
 
 test("cc_plan_continuation with explicit fresh returns fresh_handoff with handoff template", async (t) => {
@@ -197,9 +197,11 @@ test("cc_plan_continuation uses current-turn usage and provider contextWindow", 
     model: null,
     write: true,
   });
-  assert.equal(plan.result.structuredContent.evidenceState, "complete");
-  assert.equal(plan.result.structuredContent.action, "compact_resume");
-  assert.ok(plan.result.structuredContent.pressure >= 0.75);
+  const planText = plan.result.content[0].text;
+  assert.match(planText, /\*\*证据状态：\*\* complete/);
+  assert.match(planText, /\*\*动作：\*\* compact_resume/);
+  const pressurePct = Number(planText.match(/\*\*上下文压力：\*\* ([\d.]+)%/)?.[1]);
+  assert.ok(pressurePct >= 75);
 });
 
 test("cc_plan_continuation rejects a parentJob/parentSession mismatch", async (t) => {
@@ -245,12 +247,15 @@ test("same_session resolves parentJob from persisted state after MCP restart", a
     model: null,
     write: true,
   });
-  assert.equal(plan.result.structuredContent.evidenceState, "unavailable");
-  assert.equal(plan.result.structuredContent.action, "resume");
+  const restartPlanText = plan.result.content[0].text;
+  assert.match(restartPlanText, /\*\*证据状态：\*\* unavailable/);
+  assert.match(restartPlanText, /\*\*动作：\*\* resume/);
+  const planId = restartPlanText.match(/\*\*计划 ID：\*\* (\S+)/)?.[1];
+  assert.ok(planId, "planId must be present in the plan text");
 
   const resumed = await restarted.send(3, "cc_delegate", {
     task: "echo-args",
-    continuationPlan: plan.result.structuredContent.planId,
+    continuationPlan: planId,
   });
   assert.match(
     extractArgs(resumed.result.content[0].text),
@@ -280,8 +285,9 @@ test("plugin-derived workspace drift pushes auto intent to fresh_handoff", async
     model: null,
     write: true,
   });
-  assert.equal(plan.result.structuredContent.action, "fresh_handoff");
-  assert.ok(plan.result.structuredContent.reasonCodes.includes("drift-detected"));
+  const driftPlanText = plan.result.content[0].text;
+  assert.match(driftPlanText, /\*\*动作：\*\* fresh_handoff/);
+  assert.match(driftPlanText, /\*\*原因代码：\*\*[^\n]*drift-detected/);
 });
 
 // ─── cc_plan_continuation: invalid inputs fail closed ────────────────────────
@@ -546,9 +552,10 @@ test("cc_compact without continuationPlan preserves existing behavior", async (t
   const res = await server.send(2, "cc_compact", {});
   // Either compacts or reports no boundary — both are non-error outcomes.
   assert.equal(res.result.isError, undefined);
-  assert.equal(typeof res.result.structuredContent.compacted, "boolean");
-  assert.equal(typeof res.result.structuredContent.costUsd, "number");
-  assert.equal(typeof res.result.structuredContent.durationSeconds, "number");
+  const compactText = res.result.content[0].text;
+  assert.match(compactText, /\*\*已压缩：\*\* (true|false)/);
+  assert.match(compactText, /\*\*费用：\*\*/);
+  assert.match(compactText, /\*\*耗时：\*\*/);
 });
 
 // ─── Fix: telemetry/plan never persisted to state/artifact/log ───────────────

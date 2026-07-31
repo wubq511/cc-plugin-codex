@@ -545,3 +545,17 @@ audit found and repaired these additional gaps:
 - `verify-install.mjs` 缓存测试超时 60s→240s（套件 ~75s，旧阈值误失败）。
 
 **验证**：`npm test` 578 pass / 0 fail（新增 actionLabel 剥符号、reducer 丢弃 thinking_tokens、server ingest 过滤等 4 条）；装配页面真实浏览器渲染走查（双行 header、无 JS 错误、空态状态区隐藏）；`npm run verify:ci` 绿。
+
+## 2026-07-31 — Codex 侧 token 成本优化（grilling 共识落地）
+
+**背景**：用户担心 MCP 的 token 消耗。先调研后实测：always-on ~4,500 tokens（9 工具 schema 16.7 KB + instructions + skill front-matter），远低于 Tool Search 启用门槛（>10K tokens 或 10+ 工具），架构级方案（code mode / CLI / 延迟加载）明确否决。8 个决策点与否决理由见 docs/adr/0001-codex-side-token-cost.md。
+
+**改动**：
+- schema 瘦身：9 个工具描述压缩到「调用正确所需的硬规则」，深层语义归 skills；tools/list 16,688 → 13,480 字节（cc_delegate 单项 5,599 → 4,001），initialize instructions 570 → 294 字节；delegate/SKILL.md 参数枚举改为指向 schema 的指针（15.4 KB → 13.7 KB）。
+- text-first：cc_plan_continuation / cc_compact / cc_resolve_route 移除 structuredContent 双发（同时规避 openai/codex#10334 中 structuredContent 在场时 content[] 被隐藏的风险）；routing.mjs、3 个测试文件、calibrate-continuation.mjs 改为解析带标签文本（标签即输出契约，由测试锁定）。
+- cc_check 终态结果去重：进程内指纹（sha256 12 位前缀，jobId + 终态结果从磁盘 artifact 重算，FIFO 200，无新增持久化）；delegate 终态返回即登记已交付，重复 check 回「与上次交付一致」+ 指纹；includeResult=true 为显式逃生门；server 重启后首次 check 重发一次（有界、可接受）。
+- background 参数整体删除：前台-only 契约由既有 server 端未知参数拒绝兜底；AGENTS.md / PRD / README / skill 措辞同步。
+- 响应尾巴一行化（`**终端续接：**`），教学说明归档 delegate/SKILL.md Notes。
+- 防回退：新增 tests/token-budget.test.mjs（tools/list ≤15,500 B、instructions ≤400 B、三工具无 structuredContent、去重全流程断言）；AGENTS.md 新增 text-first 与 cc_check 去重两条契约；CONTEXT.md 新增「常驻上下文成本 / 单次调用成本 / 结果指纹」三术语。
+
+**验证**：`npm test` 585 pass / 0 fail；`npm run verify:ci` 绿；`npm run verify` 绿（缓存与源码一致 + 安装副本测试通过）。注：verify:ci 首跑一个测试偶发失败（`actual: null` 形态，疑似 spawn 时序 flake），`npm test` 单独连跑两次 + verify:ci 重跑均全绿、未能复现，按既有 flake 记录在案；若 CI 复发需单独排查。

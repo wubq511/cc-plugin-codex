@@ -17,6 +17,25 @@ The plugin-side tracked record of one delegation: id, status, phase, timing,
 and session identifiers. Jobs are what the dashboard lists.
 _Avoid_: task record, session, process
 
+### Caller-side token cost
+
+**Always-on Context Cost** (常驻上下文成本):
+The tokens Codex pays just by having the plugin connected, before any tool
+call: tool schemas, server instructions, and skill front-matter. Kept small by
+holding schemas to hard invocation rules and leaving deep semantics to skills.
+_Avoid_: fixed overhead, static cost
+
+**Per-call Cost** (单次调用成本):
+The tokens Codex pays for one tool result. Dominated by the terminal result
+payload of a delegation; bounded by presentation caps and by result dedup.
+_Avoid_: response cost, payload cost
+
+**Result Fingerprint** (结果指纹):
+A short hash (sha256 prefix) of a job's terminal result, shown by `cc_check`
+in place of re-delivering an unchanged result. Recomputed from the on-disk
+artifact; the record of what was already delivered is process-local.
+_Avoid_: etag, version token
+
 **Event Stream** (事件流):
 The bounded stream-json NDJSON events (system/assistant/user/result) forwarded
 from the watchdog to the dashboard while a delegation runs. High-frequency

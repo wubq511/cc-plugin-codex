@@ -16,9 +16,10 @@ test("MCP transport uses a seven-day ceiling as an orphan-safety boundary, not a
   assert.equal(server.tool_timeout_sec, 604800);
 });
 
-test("delegate skill rejects background=true and keeps tasks pending", () => {
+test("delegate skill states foreground-only delegation and keeps tasks pending", () => {
   const skill = fs.readFileSync(path.join(pluginRoot, "skills", "delegate", "SKILL.md"), "utf8");
-  assert.match(skill, /DEPRECATED AND REJECTED/);
+  assert.match(skill, /foreground only — there is no background mode/);
+  assert.doesNotMatch(skill, /background=true/);
   assert.match(skill, /Do not run outer `sleep` commands or repeatedly call `cc_check`/);
   assert.match(skill, /remain silent while it is pending/);
   assert.match(skill, /Do not manually start `cc-companion\.mjs`, wrap it in a shell\/PTY/);
@@ -41,7 +42,7 @@ test("MCP guidance reserves resume for explicit conversation preservation", () =
   const server = fs.readFileSync(path.join(pluginRoot, "scripts", "cc-companion.mjs"), "utf8");
   // New: follow-up work should call cc_plan_continuation first.
   assert.match(server, /call cc_plan_continuation first/);
-  assert.match(server, /Use resume only when the user explicitly requests preservation of the same Claude Code conversation/);
+  assert.match(server, /Only when the user explicitly requests conversation preservation/);
   assert.doesNotMatch(server, /Use resume=true to continue the last Claude Code session/);
   // Old "always Fresh" text must not remain.
   assert.doesNotMatch(server, /ordinary follow-up and review-fix work, start a fresh Claude Code session with a bounded handoff/);
@@ -49,8 +50,8 @@ test("MCP guidance reserves resume for explicit conversation preservation", () =
 
 test("MCP guidance forbids periodic commentary and manual polling fallbacks", () => {
   const server = fs.readFileSync(path.join(pluginRoot, "scripts", "cc-companion.mjs"), "utf8");
-  assert.match(server, /do not manually launch the MCP server, poll, or emit periodic 'still running' commentary/);
-  assert.match(server, /Do not emulate it through shell\/PTY, poll it, or emit periodic waiting commentary/);
+  assert.match(server, /do not launch the MCP server manually, poll, or emit 'still running' commentary/);
+  assert.match(server, /never emulate via shell\/PTY, poll, or emit waiting commentary/);
 });
 
 test("every stateful skill supplies the required absolute workspace cwd", () => {

@@ -11,20 +11,7 @@ Send a coding task to Claude Code for execution. Claude Code runs in a separate 
 
 ## Workflow
 
-1. **Delegate the task** by calling `cc_delegate`:
-   - `cwd` (required): absolute path to the user's current workspace
-   - `task` (required): the coding task description
-   - `model` (optional): explicit model override for this delegation. When omitted, Claude Code uses its current configured default (inherited from the user's Provider). Accepts a Claude alias (Opus, Fable, Sonnet, Haiku — case-insensitive) or a bounded native model ID (e.g., `deepseek-v4-pro`, `glm-5.2`). Ambiguous selectors are rejected — the plugin does not guess or silently fall back.
-   - `effort` (optional): reasoning effort level (low, medium, high, xhigh, max)
-   - `write`: set to `true` (default) to allow file writes, `false` for read-only analysis (strictly limits tools to Read, Glob, Grep)
-   - `background`: DEPRECATED AND REJECTED. Do not pass `background=true` — it will always produce an error. Default foreground delegation waits silently without polling.
-   - `timeoutSeconds` (optional): hard timeout in seconds (1..604800). When omitted, the task runs until it completes, fails, is cancelled, or the server shuts down. Supply only when the user explicitly requests a deadline.
-   - `dangerouslySkipPermissions`: set to `true` to let Claude Code write without confirmation (default: false)
-   - `resume`: set to `true` only when the user explicitly asks to preserve the same/latest Claude Code conversation. It resumes the last completed plugin job in this workspace that has a claudeSessionId. Cannot be combined with resumeSession.
-   - `resumeSession`: pass a session ID only when the user explicitly identifies the Claude Code conversation to preserve (adds `--resume <id>`). Cannot be combined with resume.
-   - `autoCompact` (optional): temporary auto-compact policy for this delegation. Injects two env keys via Claude CLI inline `--settings` (no writes to permanent config). See the Auto-Compact section below.
-   - `continuationPlan` (optional): planId from `cc_plan_continuation`. Enforces the chosen continuation action: `fresh_handoff` forbids resume flags; `resume`/`compact_resume` target the exact parent session. Single-use; replay, expiry, or binding mismatch (cwd/model/write) fails closed.
-   - `maxBudgetUsd` (optional): positive maximum budget in USD (≤ 1000) passed through to the CLI budget guard (`--max-budget-usd`). When supplied but the CLI lacks `--max-budget-usd`, the call fails closed before any Provider call. Omit to run without an explicit budget cap.
+1. **Delegate the task** by calling `cc_delegate` with the required `cwd` (absolute path to the user's current workspace) and `task`. Parameters, defaults, and validation rules are defined authoritatively in the `cc_delegate` tool schema — follow it directly. This skill adds only the semantics the schema does not repeat: model-routing evidence (below), follow-up context policy, and auto-compact scope semantics.
 
    Call the registered `cc_delegate` MCP tool directly. You may announce the delegation once before the tool call, then remain silent while it is pending. Do not manually start `cc-companion.mjs`, wrap it in a shell/PTY, or emit periodic "still running" commentary. If the registered `cc_*` tools are unavailable, use the setup workflow and ask the user to restart or open a new task; never emulate delegation with a polling fallback.
 
@@ -43,7 +30,7 @@ Model resolution uses three selector kinds, classified per job with no filesyste
 
 Ambiguous selectors (no digit, not a known alias) are **rejected** — the plugin does not guess or silently fall back. Ask the user to clarify.
 
-Use `cc_resolve_route` to preview how a selector will be routed before delegating. It is read-only, makes no model call, does not require `cwd`, and returns both a human-readable summary and a bounded `structuredContent` object (selector kind, CLI arg, non-secret route snapshot).
+Use `cc_resolve_route` to preview how a selector will be routed before delegating. It is read-only, makes no model call, does not require `cwd`, and returns a human-readable text summary (selector kind, CLI arg, non-secret route snapshot).
 
 The plugin does not read, write, or modify any external routing configuration. It does not inject or strip environment variables for routing purposes — the child Claude process inherits the parent environment unchanged.
 
@@ -79,7 +66,7 @@ For follow-ups such as "keep going", "continue", "fix the review findings", or a
    - `allowCompact`: false if the user forbids compaction or the next action is time-critical; otherwise true.
    - `model` and `write`: the exact values you will pass to the next `cc_delegate` (`null`/omitted model means inherited). A mismatch at execution fails closed.
    - `sessionPollution`: true only when the session contains substantial obsolete, conflicting, or unrelated work. Do not guess drift flags; the plugin derives workspace/CLI/tool drift and merges any concrete caller evidence.
-2. **Read `structuredContent.action` and execute exactly once:**
+2. **Read the plan's action (动作) and execute exactly once:**
    - `resume`: call `cc_delegate` with `continuationPlan=planId`; do not add resume flags.
    - `compact_resume`: call `cc_compact` with the same `continuationPlan`, then call `cc_delegate` with that same plan. If no new compact boundary is observed, the plan safely falls back to Resume; if compact fails, re-plan.
    - `fresh_handoff`: fill the returned bounded `handoffTemplate`, then call `cc_delegate` with `continuationPlan=planId` and no resume flags.
@@ -163,7 +150,7 @@ not break task-scope continuity.
 - `cc_delegate` defaults to foreground mode — it waits for Claude Code to finish and returns results immediately.
 - Long-running tasks also stay in foreground: keep the single tool call pending until completion. Do not run outer `sleep` commands or repeatedly call `cc_check` while a normal delegate is pending.
 - A pending foreground call is silent: do not send recurring progress/commentary messages merely to say that Claude Code has not finished. The next model action should occur after `cc_delegate` returns.
-- `background=true` is deprecated and rejected unconditionally. Default foreground delegation waits silently without polling.
+- Delegation is foreground only — there is no background mode. The single pending call waits silently without polling until Claude Code finishes.
 - The task prompt is sent via stdin (never argv) for privacy — it does not appear in any process command line. Be specific about what you want done.
 - Claude Code is invoked with `claude --print --input-format text --output-format json` (print-mode JSON protocol). The task is delivered via stdin.
 - Job ID supports prefix matching: "cc-abc" matches "cc-abc123def".
@@ -175,4 +162,5 @@ not break task-scope continuity.
 - Only one write-enabled delegation can run per workspace at a time (writer lease). Read-only delegations can run concurrently.
 - Resume=true resolves to the latest completed plugin job with a claudeSessionId in the same workspace, not a global resume-last.
 - Do not use `--fork-session` as a context-cost optimization: it creates a new session ID while retaining the resumed conversation history.
+- Terminal responses carry a `**终端续接：**` line with a `claude --resume <sessionId>` command — relay it verbatim to the user. Claude Code `-p` sessions never appear in the interactive `/resume` picker, so resuming in a terminal requires the explicit ID; run the command in the workspace root.
 - On failure, the MCP output shows only a safe summary with a stage prefix (e.g., `[provider_response]`). `cc_check` additionally exposes a safe diagnostic summary (failure stage, duration, structured-error flag) for failed/cancelled/rejected jobs. Full diagnostics (redacted stdout/stderr tails, error detail, exit code, session ID, usage key) live only in the private job artifact — MCP output never exposes raw stdout/stderr, error excerpts, session IDs, or usage keys.

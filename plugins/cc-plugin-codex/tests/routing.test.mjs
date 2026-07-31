@@ -301,11 +301,8 @@ test("resolveRouteForDisplay returns expected fields for alias selector", () => 
   assert.strictEqual(result.resolvedFrom, "known-alias");
   assert.strictEqual(result.cliVersion, "1.0.0");
   assert.ok(result.note, "should have note about execution proof");
-  assert.ok(result.structuredContent);
-  // structuredContent must use the fixed bounded shape.
-  assert.deepStrictEqual(Object.keys(result.structuredContent).sort(), [
-    "canonicalAlias", "cliArg", "cliVersion", "notExecutionProof", "requestedValue", "selectorKind",
-  ]);
+  // The display result is text-first: no structuredContent duplicate.
+  assert.ok(!("structuredContent" in result));
 });
 
 test("resolveRouteForDisplay for inherited returns inherited kind", () => {
@@ -317,7 +314,7 @@ test("resolveRouteForDisplay for inherited returns inherited kind", () => {
   assert.strictEqual(result.requestedValue, null);
   assert.strictEqual(result.cliArg, null);
   assert.strictEqual(result.canonicalAlias, null);
-  assert.ok(result.structuredContent.notExecutionProof);
+  assert.match(result.note, /not execution proof/);
 });
 
 test("resolveRouteForDisplay for native ID passes through unchanged", () => {
@@ -340,14 +337,14 @@ test("resolveRouteForDisplay for ambiguous selector throws", () => {
   }, AmbiguousSelectorError);
 });
 
-test("resolveRouteForDisplay structuredContent has no secret-bearing fields", () => {
+test("resolveRouteForDisplay result has no secret-bearing fields", () => {
   const result = resolveRouteForDisplay({
     selectorInput: "sonnet",
     cliVersion: null,
   });
-  const json = JSON.stringify(result.structuredContent);
-  assert.ok(!json.includes("sk-"), "no secrets in structuredContent");
-  assert.ok(!json.includes("Bearer"), "no bearer tokens in structuredContent");
+  const json = JSON.stringify(result);
+  assert.ok(!json.includes("sk-"), "no secrets in result");
+  assert.ok(!json.includes("Bearer"), "no bearer tokens in result");
 });
 
 // ─── §7: getClaudeVersion (best-effort) ──────────────────────────────────────────

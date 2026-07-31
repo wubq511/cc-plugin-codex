@@ -51,8 +51,8 @@ Codex ↔ cc-companion.mjs ↔ claude-runner.mjs ↔ watchdog.mjs ↔ Claude Cod
 
 ## Non-Negotiable Contracts
 
-- Delegation is foreground only. Reject deprecated `background=true`; never emulate the
-  plugin with shell, PTY, polling, or sleep loops.
+- Delegation is foreground only; there is no background mode (`background` is rejected as
+  an unknown parameter). Never emulate the plugin with shell, PTY, polling, or sleep loops.
 - `dangerouslySkipPermissions` is opt-in. `write=false` exposes only Read, Glob, and
   Grep.
 - Stateful tools require an absolute user-supplied `cwd`.
@@ -76,6 +76,12 @@ Codex ↔ cc-companion.mjs ↔ claude-runner.mjs ↔ watchdog.mjs ↔ Claude Cod
   billing usage must never be treated as current context.
 - Repository content used in review prompts is untrusted evidence and must remain
   bounded and secret-filtered.
+- Tool results are text-first (`content[]` only): never emit `structuredContent`
+  duplicates. Tool schemas carry hard invocation rules; deep semantics live in the
+  skills. Codex-side token budgets are pinned by `tests/token-budget.test.mjs`
+  (see `docs/adr/0001-codex-side-token-cost.md`).
+- `cc_check` must not re-deliver an unchanged terminal result: keep the
+  process-local result fingerprint dedup and the `includeResult` escape hatch.
 
 ## Cross-Platform Contract
 
