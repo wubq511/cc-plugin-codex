@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-labelledby="hero-title hero-desc">
+  <title id="hero-title">Claude Code Companion — 在 Codex 里委托编码任务给 Claude Code</title>
+  <desc id="hero-desc">Codex 插件：通过 MCP 把编码任务交给 Claude Code 前台执行，实时面板展示 Claude 的每一步动作（assistant 叙述、工具调用、工具结果），完成后自动返回结果供 Codex 审查。左下为委托流程：Codex → cc-companion.mjs (MCP) → Claude Code → result。</desc>
+
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F6F8FA"/>
+      <stop offset="1" stop-color="#F3F3F3"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 背景 -->
+  <rect width="1200" height="420" rx="26" fill="url(#bg)"/>
+
+  <!-- ── 左侧标题区 ─────────────────────────────── -->
+  <g id="title-block">
+    <text x="56" y="58" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17" letter-spacing="3" fill="#595959">CODEX PLUGIN · MCP · v0.3.0</text>
+
+    <text x="56" y="112" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif" font-size="48" font-weight="700" fill="#1F1F1F">Claude Code Companion</text>
+
+    <text x="56" y="156" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif" font-size="25" fill="#404448">在 Codex 里把编码任务交给 Claude Code，</text>
+    <text x="56" y="190" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif" font-size="25" fill="#404448">实时看它执行，完成后自动返回结果供审查。</text>
+
+    <g id="chips">
+      <rect x="56" y="224" width="250" height="44" rx="8" fill="#FFFFFF" stroke="#D4D4D4"/>
+      <circle cx="84" cy="246" r="5" fill="#DA7756"/>
+      <text x="100" y="252" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#1F1F1F">/claude:delegate</text>
+
+      <rect x="328" y="224" width="232" height="44" rx="8" fill="#FFFFFF" stroke="#D4D4D4"/>
+      <circle cx="356" cy="246" r="5" fill="#006AB1"/>
+      <text x="372" y="252" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#1F1F1F">/claude:review</text>
+    </g>
+
+    <text x="56" y="318" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" fill="#595959">claude --print --input-format text --output-format json</text>
+    <text x="56" y="342" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" fill="#595959">任务只经 stdin 传递，永不进入进程命令行</text>
+  </g>
+
+  <!-- ── 右侧 dashboard 卡片（真实产品表面） ─────── -->
+  <g id="dashboard-card">
+    <rect x="648" y="40" width="492" height="320" rx="14" fill="#FFFFFF" stroke="#D4D4D4"/>
+
+    <!-- 卡片头 -->
+    <text x="676" y="76" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif" font-size="20" font-weight="600" fill="#1F1F1F">Claude 实时面板</text>
+    <circle cx="1096" cy="68" r="5" fill="#388A34"/>
+    <text x="1046" y="73" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" fill="#595959">在线</text>
+
+    <!-- 状态区 -->
+    <rect x="676" y="96" width="436" height="44" rx="8" fill="#F8F8F8" stroke="#E4E4E4"/>
+    <text x="696" y="124" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif" font-size="18" fill="#1F1F1F">正在编辑 scripts/lib/dashboard.mjs</text>
+
+    <!-- 时间线 -->
+    <line x1="692" y1="168" x2="692" y2="316" stroke="#D4D4D4" stroke-width="2"/>
+
+    <circle cx="692" cy="184" r="6" fill="#DA7756"/>
+    <text x="718" y="190" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif" font-size="19" fill="#1F1F1F">实现 auth 中间件并接入路由</text>
+    <text x="718" y="212" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" fill="#595959">assistant · 正在叙述</text>
+
+    <circle cx="692" cy="242" r="6" fill="#006AB1"/>
+    <text x="718" y="248" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="19" fill="#1F1F1F">Edit scripts/lib/auth.mjs</text>
+    <text x="718" y="270" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="14" fill="#595959">tool_use · 2 个文件 · 1.2s</text>
+
+    <circle cx="692" cy="300" r="6" fill="#388A34"/>
+    <text x="718" y="306" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="19" fill="#1F1F1F">✓ 已更新 2 个文件</text>
+
+    <!-- 卡片底：结果汇总 -->
+    <line x1="676" y1="328" x2="1112" y2="328" stroke="#E4E4E4"/>
+    <text x="676" y="350" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" fill="#595959">result · 费用 $0.42 · 4 轮 · 3 次工具调用</text>
+  </g>
+
+  <!-- ── 底部流程条 ─────────────────────────────── -->
+  <g id="flow">
+    <line x1="56" y1="374" x2="1144" y2="374" stroke="#D4D4D4"/>
+
+    <rect x="56" y="386" width="120" height="30" rx="6" fill="#FFFFFF" stroke="#D4D4D4"/>
+    <text x="116" y="406" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" fill="#1F1F1F">Codex</text>
+
+    <path d="M 192 401 L 206 401" stroke="#8B949E" stroke-width="2"/>
+    <path d="M 200 395 L 206 401 L 200 407" fill="none" stroke="#8B949E" stroke-width="2"/>
+
+    <rect x="216" y="386" width="230" height="30" rx="6" fill="#FFFFFF" stroke="#D4D4D4"/>
+    <text x="331" y="406" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" fill="#006AB1">cc-companion.mjs</text>
+    <text x="331" y="384" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" fill="#595959">MCP server</text>
+
+    <path d="M 462 401 L 476 401" stroke="#8B949E" stroke-width="2"/>
+    <path d="M 470 395 L 476 401 L 470 407" fill="none" stroke="#8B949E" stroke-width="2"/>
+
+    <rect x="486" y="386" width="190" height="30" rx="6" fill="#FFFFFF" stroke="#D4D4D4"/>
+    <text x="581" y="406" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" fill="#1F1F1F">Claude Code</text>
+
+    <path d="M 692 401 L 706 401" stroke="#8B949E" stroke-width="2"/>
+    <path d="M 700 395 L 706 401 L 700 407" fill="none" stroke="#8B949E" stroke-width="2"/>
+
+    <rect x="716" y="386" width="120" height="30" rx="6" fill="#FFFFFF" stroke="#D4D4D4"/>
+    <text x="776" y="406" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" fill="#388A34">result</text>
+
+    <text x="1120" y="406" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" fill="#595959">9 个 MCP 工具 · stdin-only · 前台委托</text>
+  </g>
+</svg>
