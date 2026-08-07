@@ -541,6 +541,20 @@ export function findJob(jobs, idOrPrefix) {
   return null;
 }
 
+/**
+ * Match a job to an exact Claude session identifier.
+ *
+ * A job is associated with a session via any of the identifiers retained in
+ * local state: the pre-allocated `claudeSessionUuid`, the runtime
+ * `claudeSessionId`, or the `resumeSession` it was resumed from.
+ */
+export function jobMatchesClaudeSession(job, sessionId) {
+  if (!job || !sessionId) return false;
+  return job.claudeSessionId === sessionId
+    || job.claudeSessionUuid === sessionId
+    || job.resumeSession === sessionId;
+}
+
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
 }

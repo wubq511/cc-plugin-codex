@@ -34,7 +34,8 @@ import {
   generateJobId, upsertJob, listJobs,
   findJob, sortJobsNewestFirst, findLatestJob,
   findLatestActiveJob, findLatestCompletedJob, writeResultArtifact,
-  readResultArtifact, cleanupOldJobs, resolveStateDir, STATE_VERSION
+  readResultArtifact, cleanupOldJobs, resolveStateDir, STATE_VERSION,
+  jobMatchesClaudeSession
 } from "./lib/state.mjs";
 import {
   startDelegation, cancelDelegation, listActiveDelegations,
@@ -71,8 +72,8 @@ import {
   resolveActiveCache, compareSourceCache
 } from "./lib/install-cache.mjs";
 import {
-  validateAutoCompact, buildInlineSettings, resolveScope,
-  generateTaskScopeId, buildAutoCompactAudit, buildAutoCompactClearAudit
+  validateAutoCompact,
+  resolveDelegateAutoCompact, replayStoredAutoCompact
 } from "./lib/autocompact.mjs";
 import {
   captureCompactBoundaryCursor,
@@ -769,75 +770,6 @@ const REVIEW_SCHEMA_JSON = JSON.stringify({
   next_steps: ["step 1", "step 2"]
 }, null, 2);
 
-function jobMatchesClaudeSession(job, sessionId) {
-  if (!job || !sessionId) return false;
-  return job.claudeSessionId === sessionId
-    || job.claudeSessionUuid === sessionId
-    || job.resumeSession === sessionId;
-}
-
-function sortPolicyRecordsNewestFirst(jobs) {
-  return [...jobs].sort((a, b) => {
-    const byCreated = String(b.createdAt ?? b.startedAt ?? "")
-      .localeCompare(String(a.createdAt ?? a.startedAt ?? ""));
-    return byCreated || String(b.id ?? "").localeCompare(String(a.id ?? ""));
-  });
-}
-
-function latestTaskPolicyRecord(jobs, taskScopeId) {
-  if (!taskScopeId) return null;
-  return sortPolicyRecordsNewestFirst(jobs).find((job) =>
-    job.autoCompact?.scope === "task"
-    && job.autoCompact?.taskScopeId === taskScopeId
-  ) || null;
-}
-
-/**
- * Resolve the stored policy for an exact Claude session. A newer session
- * tombstone blocks older session and task policies. Otherwise session scope
- * wins over the task policy associated with that session.
- */
-function resolveStoredPolicyForSession(jobs, sessionId) {
-  const matching = sortPolicyRecordsNewestFirst(jobs).filter((job) =>
-    jobMatchesClaudeSession(job, sessionId)
-  );
-  const sessionRecord = matching.find((job) => job.autoCompact?.scope === "session") || null;
-  if (sessionRecord?.autoCompact?.cleared === true) {
-    return { policy: null, sourceJob: sessionRecord, cleared: true };
-  }
-
-  const sessionPolicy = sessionRecord?.autoCompact || null;
-  const taskScopeId = matching.find((job) =>
-    job.autoCompact?.scope === "task" && job.autoCompact?.taskScopeId
-  )?.autoCompact?.taskScopeId || null;
-  const taskRecord = latestTaskPolicyRecord(jobs, taskScopeId);
-  const taskPolicy = taskRecord?.autoCompact?.cleared === true
-    ? null
-    : taskRecord?.autoCompact || null;
-
-  const policy = resolveScope({
-    thisCall: null,
-    sessionPolicy,
-    taskPolicy,
-    clearTaskScope: false,
-  });
-  const sourceJob = policy === sessionPolicy ? sessionRecord : taskRecord;
-  return { policy, sourceJob: sourceJob || null, cleared: false };
-}
-
-function rebuildStoredPolicy(policy) {
-  if (!policy || policy.cleared === true) return null;
-  const validated = validateAutoCompact({
-    contextWindowTokens: policy.contextWindowTokens,
-    targetTokens: policy.targetTokens,
-    scope: policy.scope,
-    ...(policy.scope === "task" && policy.taskScopeId
-      ? { taskScopeId: policy.taskScopeId }
-      : {}),
-  });
-  return validated.valid ? validated : null;
-}
-
 function formatTaskScopeIdLine(autoCompact) {
   if (autoCompact?.scope !== "task" || typeof autoCompact.taskScopeId !== "string") {
     return "";
@@ -1152,77 +1084,23 @@ async function handleDelegate(params, context = {}) {
   }
 
   // ── Auto-compact policy validation & resolution ──
-  // Every branch resolves to one persisted audit object or null. Full policies
-  // inject settings; explicit clears persist tombstones; inheritance misses
-  // fail closed before Claude is spawned.
-  let inlineSettings = null;
-  let autoCompactAudit = null;
-  const existingJobs = listJobs(workspaceRoot);
-
-  if (params.autoCompact !== undefined && params.autoCompact !== null) {
-    const acValidation = validateAutoCompact(params.autoCompact);
-    if (!acValidation.valid) {
-      return {
-        content: [{ type: "text", text: `Error: ${acValidation.error}` }],
-        isError: true
-      };
-    }
-
-    if (acValidation.clearMode) {
-      const previous = latestTaskPolicyRecord(existingJobs, acValidation.taskScopeId);
-      if (!previous?.autoCompact) {
-        return {
-          content: [{
-            type: "text",
-            text: `Error: no autoCompact task policy was found for taskScopeId ${acValidation.taskScopeId}; nothing was cleared.`,
-          }],
-          isError: true,
-        };
-      }
-      autoCompactAudit = buildAutoCompactClearAudit({
-        scope: "task",
-        taskScopeId: acValidation.taskScopeId,
-      });
-    } else if (acValidation.inheritanceMode) {
-      const previous = latestTaskPolicyRecord(existingJobs, acValidation.taskScopeId);
-      if (!previous?.autoCompact || previous.autoCompact.cleared === true) {
-        return {
-          content: [{
-            type: "text",
-            text: `Error: no active autoCompact task policy was found for taskScopeId ${acValidation.taskScopeId}. Supply a full task policy to create or reactivate it.`,
-          }],
-          isError: true,
-        };
-      }
-      const inherited = rebuildStoredPolicy(previous.autoCompact);
-      if (!inherited) {
-        return {
-          content: [{
-            type: "text",
-            text: `Error: the stored autoCompact task policy for taskScopeId ${acValidation.taskScopeId} is invalid and cannot be replayed.`,
-          }],
-          isError: true,
-        };
-      }
-      inlineSettings = buildInlineSettings(inherited.effectiveWindow);
-      autoCompactAudit = buildAutoCompactAudit(inherited, true);
-    } else {
-      if (acValidation.scope === "task" && acValidation.taskScopeId === undefined) {
-        acValidation.taskScopeId = generateTaskScopeId();
-      }
-      inlineSettings = buildInlineSettings(acValidation.effectiveWindow);
-      autoCompactAudit = buildAutoCompactAudit(acValidation, true);
-    }
-  } else if (params.autoCompact === null && resolvedResumeSession) {
-    autoCompactAudit = buildAutoCompactClearAudit({ scope: "session" });
-  } else if (params.autoCompact === undefined && resolvedResumeSession) {
-    const stored = resolveStoredPolicyForSession(existingJobs, resolvedResumeSession);
-    const replay = rebuildStoredPolicy(stored.policy);
-    if (replay) {
-      inlineSettings = buildInlineSettings(replay.effectiveWindow);
-      autoCompactAudit = buildAutoCompactAudit(replay, true);
-    }
+  // The decision lives in lib/autocompact.mjs: every request shape resolves to
+  // one persisted audit object or null. Full policies inject settings; explicit
+  // clears persist tombstones; inheritance misses fail closed before Claude is
+  // spawned. This handler only packages the structured error as an MCP response.
+  const decision = resolveDelegateAutoCompact({
+    request: params.autoCompact,
+    jobs: listJobs(workspaceRoot),
+    resumeSession: resolvedResumeSession,
+  });
+  if (decision.error) {
+    return {
+      content: [{ type: "text", text: `Error: ${decision.error}` }],
+      isError: true
+    };
   }
+  const inlineSettings = decision.settings;
+  const autoCompactAudit = decision.audit;
 
   // ── Delegation Lifecycle start ──
   // Build the in-memory job record first. startDelegation acquires the writer
@@ -2107,13 +1985,10 @@ async function handleCompact(params) {
 
   // Resolve the current stored policy. Session/task policies replay for the
   // compact invocation; delegation policies and clear tombstones do not.
-  const stored = resolveStoredPolicyForSession(jobs, sessionId);
-  const compactPolicy = rebuildStoredPolicy(stored.policy);
-  const inlineSettings = compactPolicy
-    ? buildInlineSettings(compactPolicy.effectiveWindow)
-    : null;
-  if (!job && stored.sourceJob && TERMINAL_STATUSES.has(stored.sourceJob.status)) {
-    job = stored.sourceJob;
+  const replay = replayStoredAutoCompact({ jobs, sessionId });
+  const inlineSettings = replay.settings;
+  if (!job && replay.sourceJob && TERMINAL_STATUSES.has(replay.sourceJob.status)) {
+    job = replay.sourceJob;
   }
 
   let boundaryCursor = null;
@@ -2247,8 +2122,8 @@ async function handleCompact(params) {
   }
 
   // 5. Retrieve stored auto-compact policy from the job (if any).
-  const requestedTarget = compactPolicy?.targetTokens ?? null;
-  const effectiveWindow = compactPolicy?.effectiveWindow ?? null;
+  const requestedTarget = replay.policy?.targetTokens ?? null;
+  const effectiveWindow = replay.policy?.effectiveWindow ?? null;
 
   const boundaryWarnings = {
     "transcript-not-found": "未找到 transcript——无法确认跨越了压缩边界。",

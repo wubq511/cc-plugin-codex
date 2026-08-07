@@ -7,7 +7,7 @@ import readline from "node:readline";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { validateAutoCompact, computeEffectiveWindow, resolveScope, AUTO_COMPACT_PCT } from "../scripts/lib/autocompact.mjs";
+import { validateAutoCompact, computeEffectiveWindow, resolveScope, AUTO_COMPACT_PCT, resolveDelegateAutoCompact, replayStoredAutoCompact, buildInlineSettings } from "../scripts/lib/autocompact.mjs";
 import { listJobs } from "../scripts/lib/state.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -876,4 +876,307 @@ test("cc_delegate with taskScopeId:undefined (omitted) generates new ID for task
   assert.ok(job.autoCompact.taskScopeId,
     "Omitted taskScopeId with task scope must generate a new ID");
   assert.match(job.autoCompact.taskScopeId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+});
+
+// ─── Deep module: resolveDelegateAutoCompact unit tests ─────────────────────
+
+const SESSION = "test-session-uuid-0001";
+const TASK_SCOPE = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Build a minimal policy-bearing job record. */
+function policyJob({ id, createdAt, sessionId = SESSION, autoCompact, status = "completed" }) {
+  return {
+    id,
+    createdAt,
+    status,
+    claudeSessionUuid: sessionId,
+    ...(autoCompact === undefined ? {} : { autoCompact }),
+  };
+}
+
+/** Build a stored autoCompact audit as persisted in job state. */
+function storedAudit({ scope, contextWindowTokens = null, targetTokens = null, effectiveWindow = null, taskScopeId = null, cleared = false }) {
+  return { scope, contextWindowTokens, targetTokens, effectiveWindow, taskScopeId, settingsInjected: !cleared, cleared };
+}
+
+test("resolveDelegateAutoCompact: full policy injects settings and persists audit", () => {
+  const decision = resolveDelegateAutoCompact({
+    request: { contextWindowTokens: 256000, targetTokens: 230400, scope: "delegation" },
+    jobs: [],
+  });
+  assert.equal(decision.error, null);
+  assert.equal(decision.settings, buildInlineSettings(256000));
+  assert.deepEqual(decision.audit, {
+    scope: "delegation",
+    contextWindowTokens: 256000,
+    targetTokens: 230400,
+    effectiveWindow: 256000,
+    taskScopeId: null,
+    settingsInjected: true,
+    cleared: false,
+  });
+});
+
+test("resolveDelegateAutoCompact: task scope with omitted id generates a UUID", () => {
+  const decision = resolveDelegateAutoCompact({
+    request: { contextWindowTokens: 1_000_000, targetTokens: 300000, scope: "task" },
+    jobs: [],
+  });
+  assert.equal(decision.error, null);
+  assert.equal(decision.audit.scope, "task");
+  assert.match(decision.audit.taskScopeId, UUID_RE);
+});
+
+test("resolveDelegateAutoCompact: task scope with explicit id carries it forward", () => {
+  const decision = resolveDelegateAutoCompact({
+    request: { contextWindowTokens: 1_000_000, targetTokens: 300000, scope: "task", taskScopeId: TASK_SCOPE },
+    jobs: [],
+  });
+  assert.equal(decision.error, null);
+  assert.equal(decision.audit.taskScopeId, TASK_SCOPE);
+});
+
+test("resolveDelegateAutoCompact: invalid request returns the validation error", () => {
+  const decision = resolveDelegateAutoCompact({
+    request: { contextWindowTokens: 256000, targetTokens: 300000, scope: "delegation" },
+    jobs: [],
+  });
+  assert.equal(decision.settings, null);
+  assert.equal(decision.audit, null);
+  assert.match(decision.error, /targetTokens \(300000\) must be <= 90%/);
+});
+
+test("resolveDelegateAutoCompact: clear fails closed with no prior task policy", () => {
+  const decision = resolveDelegateAutoCompact({
+    request: { scope: "task", taskScopeId: TASK_SCOPE, clear: true },
+    jobs: [],
+  });
+  assert.equal(decision.settings, null);
+  assert.equal(decision.audit, null);
+  assert.match(decision.error, /nothing was cleared/);
+});
+
+test("resolveDelegateAutoCompact: clear persists a tombstone when a prior task policy exists", () => {
+  const decision = resolveDelegateAutoCompact({
+    request: { scope: "task", taskScopeId: TASK_SCOPE, clear: true },
+    jobs: [
+      policyJob({
+        id: "j1",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        autoCompact: storedAudit({ scope: "task", taskScopeId: TASK_SCOPE, contextWindowTokens: 1_000_000, targetTokens: 300000, effectiveWindow: 333334 }),
+      }),
+    ],
+  });
+  assert.equal(decision.error, null);
+  assert.deepEqual(decision.audit, {
+    scope: "task",
+    contextWindowTokens: null,
+    targetTokens: null,
+    effectiveWindow: null,
+    taskScopeId: TASK_SCOPE,
+    settingsInjected: false,
+    cleared: true,
+  });
+});
+
+test("resolveDelegateAutoCompact: inherit replays an active prior task policy", () => {
+  const decision = resolveDelegateAutoCompact({
+    request: { scope: "task", taskScopeId: TASK_SCOPE },
+    jobs: [
+      policyJob({
+        id: "j1",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        autoCompact: storedAudit({ scope: "task", taskScopeId: TASK_SCOPE, contextWindowTokens: 1_000_000, targetTokens: 300000, effectiveWindow: 333334 }),
+      }),
+    ],
+  });
+  assert.equal(decision.error, null);
+  assert.equal(decision.settings, buildInlineSettings(333334));
+  assert.equal(decision.audit.scope, "task");
+  assert.equal(decision.audit.settingsInjected, true);
+  assert.equal(decision.audit.cleared, false);
+});
+
+test("resolveDelegateAutoCompact: inherit fails closed on a tombstoned prior task policy", () => {
+  const decision = resolveDelegateAutoCompact({
+    request: { scope: "task", taskScopeId: TASK_SCOPE },
+    jobs: [
+      policyJob({
+        id: "j1",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        autoCompact: storedAudit({ scope: "task", taskScopeId: TASK_SCOPE, cleared: true }),
+      }),
+    ],
+  });
+  assert.equal(decision.settings, null);
+  assert.equal(decision.audit, null);
+  assert.match(decision.error, /no active autoCompact task policy/);
+});
+
+test("resolveDelegateAutoCompact: inherit fails closed on unknown taskScopeId", () => {
+  const decision = resolveDelegateAutoCompact({
+    request: { scope: "task", taskScopeId: TASK_SCOPE },
+    jobs: [],
+  });
+  assert.match(decision.error, /no active autoCompact task policy/);
+});
+
+test("resolveDelegateAutoCompact: explicit null on a resume persists a session clear tombstone", () => {
+  const decision = resolveDelegateAutoCompact({
+    request: null,
+    jobs: [],
+    resumeSession: SESSION,
+  });
+  assert.equal(decision.settings, null);
+  assert.equal(decision.error, null);
+  assert.deepEqual(decision.audit, {
+    scope: "session",
+    contextWindowTokens: null,
+    targetTokens: null,
+    effectiveWindow: null,
+    taskScopeId: null,
+    settingsInjected: false,
+    cleared: true,
+  });
+});
+
+test("resolveDelegateAutoCompact: explicit null without a resume session yields no policy", () => {
+  const decision = resolveDelegateAutoCompact({
+    request: null,
+    jobs: [],
+    resumeSession: null,
+  });
+  assert.equal(decision.settings, null);
+  assert.equal(decision.audit, null);
+  assert.equal(decision.error, null);
+});
+
+test("resolveDelegateAutoCompact: undefined on a resume replays the stored session policy", () => {
+  const decision = resolveDelegateAutoCompact({
+    request: undefined,
+    jobs: [
+      policyJob({
+        id: "j1",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        autoCompact: storedAudit({ scope: "session", contextWindowTokens: 256000, targetTokens: 230400, effectiveWindow: 256000 }),
+      }),
+    ],
+    resumeSession: SESSION,
+  });
+  assert.equal(decision.error, null);
+  assert.equal(decision.settings, buildInlineSettings(256000));
+  assert.equal(decision.audit.scope, "session");
+  assert.equal(decision.audit.settingsInjected, true);
+});
+
+test("resolveDelegateAutoCompact: undefined on a resume — session policy wins over the session's task policy", () => {
+  const decision = resolveDelegateAutoCompact({
+    request: undefined,
+    jobs: [
+      policyJob({
+        id: "task",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        autoCompact: storedAudit({ scope: "task", taskScopeId: TASK_SCOPE, contextWindowTokens: 1_000_000, targetTokens: 300000, effectiveWindow: 333334 }),
+      }),
+      policyJob({
+        id: "sess",
+        createdAt: "2026-01-02T00:00:00.000Z",
+        autoCompact: storedAudit({ scope: "session", contextWindowTokens: 256000, targetTokens: 230400, effectiveWindow: 256000 }),
+      }),
+    ],
+    resumeSession: SESSION,
+  });
+  assert.equal(decision.settings, buildInlineSettings(256000));
+  assert.equal(decision.audit.scope, "session");
+});
+
+test("resolveDelegateAutoCompact: undefined on a resume — newer session tombstone blocks older policies", () => {
+  const decision = resolveDelegateAutoCompact({
+    request: undefined,
+    jobs: [
+      policyJob({
+        id: "older-task",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        autoCompact: storedAudit({ scope: "task", taskScopeId: TASK_SCOPE, contextWindowTokens: 1_000_000, targetTokens: 300000, effectiveWindow: 333334 }),
+      }),
+      policyJob({
+        id: "newer-session-clear",
+        createdAt: "2026-01-03T00:00:00.000Z",
+        autoCompact: storedAudit({ scope: "session", cleared: true }),
+      }),
+    ],
+    resumeSession: SESSION,
+  });
+  assert.equal(decision.settings, null);
+  assert.equal(decision.audit, null);
+  assert.equal(decision.error, null);
+});
+
+test("resolveDelegateAutoCompact: undefined without a resume session yields no policy", () => {
+  const decision = resolveDelegateAutoCompact({
+    request: undefined,
+    jobs: [],
+    resumeSession: null,
+  });
+  assert.equal(decision.settings, null);
+  assert.equal(decision.audit, null);
+  assert.equal(decision.error, null);
+});
+
+// ─── Deep module: replayStoredAutoCompact unit tests ────────────────────────
+
+test("replayStoredAutoCompact: replays session policy and returns its source job", () => {
+  const job = policyJob({
+    id: "j1",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    autoCompact: storedAudit({ scope: "session", contextWindowTokens: 256000, targetTokens: 230400, effectiveWindow: 256000 }),
+  });
+  const replay = replayStoredAutoCompact({ jobs: [job], sessionId: SESSION });
+  assert.equal(replay.settings, buildInlineSettings(256000));
+  assert.equal(replay.sourceJob, job);
+});
+
+test("replayStoredAutoCompact: replays task policy", () => {
+  const job = policyJob({
+    id: "j1",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    autoCompact: storedAudit({ scope: "task", taskScopeId: TASK_SCOPE, contextWindowTokens: 1_000_000, targetTokens: 300000, effectiveWindow: 333334 }),
+  });
+  const replay = replayStoredAutoCompact({ jobs: [job], sessionId: SESSION });
+  assert.equal(replay.settings, buildInlineSettings(333334));
+  assert.equal(replay.sourceJob, job);
+});
+
+test("replayStoredAutoCompact: delegation scope is not replayed", () => {
+  const job = policyJob({
+    id: "j1",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    autoCompact: storedAudit({ scope: "delegation", contextWindowTokens: 256000, targetTokens: 230400, effectiveWindow: 256000 }),
+  });
+  const replay = replayStoredAutoCompact({ jobs: [job], sessionId: SESSION });
+  assert.equal(replay.settings, null);
+  assert.equal(replay.sourceJob, null);
+});
+
+test("replayStoredAutoCompact: clear tombstone yields no settings", () => {
+  const job = policyJob({
+    id: "j1",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    autoCompact: storedAudit({ scope: "session", cleared: true }),
+  });
+  const replay = replayStoredAutoCompact({ jobs: [job], sessionId: SESSION });
+  assert.equal(replay.settings, null);
+  assert.equal(replay.sourceJob, job);
+});
+
+test("replayStoredAutoCompact: no matching session yields null", () => {
+  const job = policyJob({
+    id: "j1",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    autoCompact: storedAudit({ scope: "session", contextWindowTokens: 256000, targetTokens: 230400, effectiveWindow: 256000 }),
+  });
+  const replay = replayStoredAutoCompact({ jobs: [job], sessionId: "other-session" });
+  assert.equal(replay.settings, null);
+  assert.equal(replay.sourceJob, null);
 });

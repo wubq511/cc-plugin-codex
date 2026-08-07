@@ -37,8 +37,12 @@ Codex ↔ cc-companion.mjs ↔ claude-runner.mjs ↔ watchdog.mjs ↔ Claude Cod
   module so the numeric contract exists in exactly one place.
 - `scripts/lib/model-evidence*.mjs`: separates requested model, transcript execution
   evidence, and final usage keys.
-- `scripts/lib/autocompact.mjs` and `compact-boundary.mjs`: temporary auto-compact policy
-  and canonical compact-boundary evidence.
+- `scripts/lib/autocompact.mjs`: auto-compact policy decision — validation,
+  inline `--settings` build, and cross-job policy resolution (session/task
+  tombstones, inheritance, clear, resume replay). Both `cc_delegate` and
+  `cc_compact` ask it one question; only the structured error is surfaced by
+  the companion.
+- `scripts/lib/compact-boundary.mjs`: canonical compact-boundary evidence.
 - `scripts/lib/continuation-planner.mjs`: process-local planner for `resume`,
   `compact_resume`, and `fresh_handoff`.
 - `scripts/lib/git.mjs`: bounded, secret-filtered review context and workspace
