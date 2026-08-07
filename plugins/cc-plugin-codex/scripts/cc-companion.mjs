@@ -1453,7 +1453,31 @@ async function handleDelegate(params, context = {}) {
     };
   }
 
-  const result = await execution.result;
+  // A rejected result promise must still settle the delegation. The watchdog
+  // runner resolves a failed result rather than rejecting, but `run` is an
+  // injected seam (tests swap a fake), so the rejection path is part of the
+  // contract: without it the writer lease leaks and the handle stays in the
+  // registry with its completionPromise never resolved, and a later
+  // cancel/shutdown would hang.
+  let result;
+  try {
+    result = await execution.result;
+  } catch (err) {
+    try { handle.signalCancel(); } catch { /* best effort */ }
+    const current = listJobs(workspaceRoot).find((candidate) => candidate.id === jobId);
+    const cancelling = current?.status === "cancelling";
+    await settleDelegation({ handle, result: null, direct: {
+      status: cancelling ? "cancelled" : "failed",
+      errorMessage: cancelling
+        ? (current.errorMessage || "Cancelled.")
+        : buildSafeErrorMessage(FAILURE_STAGES.PROVIDER_RESPONSE, err?.message || "Claude Code failed to produce a result."),
+      routeStatus: cancelling ? ROUTE_STATUSES.CANCELLED : ROUTE_STATUSES.REJECTED,
+    }});
+    return {
+      content: [{ type: "text", text: "Error: Claude Code failed to produce a result. No task was executed." }],
+      isError: true
+    };
+  }
 
   // Check if cancellation was requested — settleDelegation's finalizeJob
   // writes cancelled when the persisted status is cancelling.
@@ -2174,7 +2198,28 @@ async function handleCompact(params) {
     maxBudgetUsd,
   });
 
-  const result = await execution.result;
+  // `run` is an injected seam, so a rejected result promise is part of the
+  // contract: fail the compact plan (it must not be consumed by a resume) and
+  // report the same error surface as a failed result.
+  let result;
+  try {
+    result = await execution.result;
+  } catch (err) {
+    if (compactPlanId) {
+      try { continuationPlanner.completeCompact(compactPlanId, { ok: false }); } catch { /* best effort */ }
+    }
+    const safeError = buildSafeErrorMessage(
+      FAILURE_STAGES.PROVIDER_RESPONSE,
+      err?.message || "Compact invocation failed."
+    );
+    return {
+      content: [{
+        type: "text",
+        text: `## 压缩失败\n\n**会话：** ${sessionId}\n**错误：** ${boundedText(safeError, MAX_ERROR_MESSAGE_BYTES)}`
+      }],
+      isError: true
+    };
+  }
 
   // If the compact invocation itself failed, report honestly.
   if (!result.ok) {

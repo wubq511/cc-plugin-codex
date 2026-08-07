@@ -273,12 +273,14 @@ export function createDashboard({ getJobs, openBrowser = defaultOpenBrowser } = 
     }
     announcedDirs.clear();
     // Close HTTP server. server.close() stops listening but its callback
-    // waits for every existing connection to drain — a browser SSE tab keeps
-    // its keep-alive socket open, and EventSource reconnects after res.end(),
-    // so the callback can wait forever and gracefulShutdown would hang.
-    // closeAllConnections() (Node >=18.2, engine requires >=22) force-destroys
-    // those sockets so the close callback always fires. Unref'd bound as a
-    // final safety net for a client that misbehaves between close and destroy.
+    // waits for every existing connection to drain. A mid-flight connection —
+    // an EventSource reconnect socket whose request head has not arrived, or a
+    // page still opening — has no response object, so the res.end() above
+    // cannot reach it and the close callback can wait forever (this hung
+    // gracefulShutdown on SIGTERM). closeAllConnections() (Node >=18.2,
+    // engine requires >=22) force-destroys those sockets so the close callback
+    // always fires. Unref'd bound as a final safety net for a client that
+    // misbehaves between close and destroy.
     return new Promise((resolve) => {
       server.close(() => resolve());
       server.closeAllConnections();

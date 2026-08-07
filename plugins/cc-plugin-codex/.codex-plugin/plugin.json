@@ -1,6 +1,6 @@
 {
   "name": "cc-plugin-codex",
-  "version": "0.3.0+codex.20260807064158",
+  "version": "0.3.0+codex.20260807071515",
   "description": "从 Codex 把编码任务委托给 Claude Code，完成后审查结果。",
   "author": {
     "name": "Robert Wu"

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import net from "node:net";
 
 import {
   createDashboard,
@@ -130,5 +131,36 @@ test("dashboard ingest drops thinking_tokens so it cannot evict real events", as
     assert.equal(buf.events[0].event.subtype, "init");
   } finally {
     await dashboard.stop();
+  }
+});
+
+// ─── stop(): force-close half-open sockets (gracefulShutdown hang regression) ─
+
+test("dashboard stop() force-closes a half-open connection", async () => {
+  const dashboard = await createDashboard({ openBrowser: () => {} });
+  const port = new URL(dashboard.url).port;
+  // A raw TCP connection with no HTTP request head yet: the server accepted it
+  // but no response object exists, so stop()'s res.end() cannot reach it, and
+  // server.close() waits for it to drain. Only closeAllConnections() destroys
+  // it — without that call stop() falls through to its 2s bound. This is the
+  // mid-flight reconnect/opening socket that hung gracefulShutdown on SIGTERM.
+  const sock = net.connect(Number(port), "127.0.0.1");
+  let stopped = false;
+  try {
+    await new Promise((resolve, reject) => {
+      sock.once("connect", resolve);
+      sock.once("error", reject);
+    });
+
+    await Promise.race([
+      (async () => { await dashboard.stop(); stopped = true; })(),
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error("dashboard.stop() hung with a half-open connection (closeAllConnections regression)")),
+        1500,
+      )),
+    ]);
+    assert.equal(stopped, true, "stop() must resolve while a half-open connection is held");
+  } finally {
+    sock.destroy();
   }
 });
