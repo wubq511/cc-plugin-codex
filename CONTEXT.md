@@ -17,6 +17,14 @@ The plugin-side tracked record of one delegation: id, status, phase, timing,
 and session identifiers. Jobs are what the dashboard lists.
 _Avoid_: task record, session, process
 
+**Delegation Lifecycle** (委托生命周期):
+The run → finalize → cancel lifecycle of one foreground delegation, owned by
+`scripts/lib/delegation.mjs`. It holds the writer lease, the running-delegation
+registry, and the single terminal-status settlement (finalize) race lock.
+Handlers signal cancellation and consume results, but never settle a terminal
+status themselves.
+_Avoid_: runner, orchestrator, job finalizer
+
 ### Caller-side token cost
 
 **Always-on Context Cost** (常驻上下文成本):

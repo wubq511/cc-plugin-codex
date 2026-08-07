@@ -42,6 +42,13 @@ const MAX_SAFE_ERROR_BYTES = 4096; // 4 KiB for safe error message
 const MIN_TASK_MARKER_LEN = 8;
 const TASK_BEARING_REDACTED_MARKER = "[TASK_BEARING_OUTPUT_REDACTED]";
 
+// ─── Presentation Caps ───────────────────────────────────────────────────────
+
+/** Presentation caps for job metadata, MCP output, and error messages. */
+export const MAX_MCP_RESULT_BYTES = 256 * 1024; // 256 KiB presentation limit
+export const MAX_JOB_RESULT_BYTES = 32 * 1024; // keep complete job metadata below 64 KiB
+export const MAX_ERROR_MESSAGE_BYTES = 8 * 1024;
+
 // ─── Redaction Patterns ──────────────────────────────────────────────────────
 
 /**
@@ -302,6 +309,58 @@ export function redactText(text, maxBytes = MAX_TAIL_BYTES, taskMarkers = [], op
  * marker stored when a task-bearing diagnostic cannot be safely rendered.
  */
 export const TASK_BEARING_REDACTED = TASK_BEARING_REDACTED_MARKER;
+
+// ─── Presentational Bounding ─────────────────────────────────────────────────
+
+/**
+ * Bound text to a byte cap at a safe UTF-8 boundary, appending a truncation
+ * note. Returns the bounded text plus truncation metadata for presentation.
+ */
+export function truncateForPresentation(text, maxBytes = MAX_MCP_RESULT_BYTES) {
+  if (!text) return { text: "", truncated: false, originalSize: 0 };
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes <= maxBytes) return { text, truncated: false, originalSize: bytes };
+  // Truncate to maxBytes, then cut at last safe UTF-8 boundary
+  let truncated = text.slice(0, maxBytes);
+  // Ensure we don't cut a multi-byte character
+  while (truncated.length > 0 && Buffer.byteLength(truncated, "utf8") > maxBytes) {
+    truncated = truncated.slice(0, -1);
+  }
+  return {
+    text: truncated + `\n\n... (truncated, original size: ${bytes} bytes)`,
+    truncated: true,
+    originalSize: bytes,
+  };
+}
+
+/** Bound a value to a byte cap for storage or presentation. */
+export function boundedText(value, maxBytes) {
+  return truncateForPresentation(String(value ?? ""), maxBytes).text;
+}
+
+/**
+ * Recursively apply the redaction boundary to an untrusted diagnostics object
+ * before it crosses from the watchdog into a private result artifact. The
+ * watchdog already redacts its failure envelope, but this second boundary
+ * protects future result fields and opaque runtime credentials without
+ * persisting runtime-only secret values.
+ */
+export function redactDiagnosticValue(value, markers) {
+  if (typeof value === "string") return redactText(value, 2048, markers);
+  if (Array.isArray(value)) return value.map((entry) => redactDiagnosticValue(entry, markers));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => {
+      // `stage` is a plugin-owned enum, not Provider text. Preserve a valid
+      // value so a short user task cannot erase the diagnostic classification;
+      // any unexpected value remains subject to normal redaction.
+      if (key === "stage" && Object.values(FAILURE_STAGES).includes(entry)) {
+        return [key, entry];
+      }
+      return [key, redactDiagnosticValue(entry, markers)];
+    }));
+  }
+  return value;
+}
 
 // ─── Failure Stage Classification ────────────────────────────────────────────
 

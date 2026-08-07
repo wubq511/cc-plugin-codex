@@ -30,12 +30,15 @@ import { fileURLToPath } from "node:url";
 import { runClaude, getClaudeAvailability } from "./lib/claude-runner.mjs";
 import { createDashboard } from "./lib/dashboard.mjs";
 import {
-  generateJobId, upsertJob, listJobs, reconcileOrphans,
-  acquireWriterLease, updateWriterLeaseJobId, refreshWriterLease, releaseWriterLease,
-  getWriterLeaseOwner, findJob, sortJobsNewestFirst, findLatestJob,
+  generateJobId, upsertJob, listJobs,
+  findJob, sortJobsNewestFirst, findLatestJob,
   findLatestActiveJob, findLatestCompletedJob, writeResultArtifact,
   readResultArtifact, cleanupOldJobs, resolveStateDir, STATE_VERSION
 } from "./lib/state.mjs";
+import {
+  startDelegation, cancelDelegation, listActiveDelegations,
+  settleDelegation, collectExecutionEvidence, TERMINAL_STATUSES
+} from "./lib/delegation.mjs";
 import { binaryAvailable, resolveCommandForSpawn, terminateProcessTree } from "./lib/process.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
@@ -48,19 +51,21 @@ import {
   captureWorkspaceFingerprint, diffWorkspaceFingerprints
 } from "./lib/git.mjs";
 import {
-  collectModelEvidence, formatModelEvidence, formatModelCompact,
-  normalizeModelIdForStorage, sanitizeModelId, extractUsageModelKeys
+  formatModelEvidence, formatModelCompact,
+  normalizeModelIdForStorage
 } from "./lib/model-evidence.mjs";
 import {
   resolveRoute, resolveRouteForDisplay,
   getClaudeVersion, AmbiguousSelectorError
 } from "./lib/routing.mjs";
 import {
-  buildSafeErrorMessage, buildSafeErrorSummary, FAILURE_STAGES, buildFailureEnvelope, redactText
+  buildSafeErrorMessage, buildSafeErrorSummary, FAILURE_STAGES, buildFailureEnvelope,
+  redactDiagnosticValue, truncateForPresentation, boundedText,
+  MAX_ERROR_MESSAGE_BYTES
 } from "./lib/diagnostics.mjs";
 import { deriveTaskTitle } from "./lib/task-title.mjs";
 import {
-  computeRouteStatus, ROUTE_STATUSES, describeRouteStatus
+  ROUTE_STATUSES, describeRouteStatus
 } from "./lib/route-status.mjs";
 import {
   resolveActiveCache, compareSourceCache
@@ -80,9 +85,6 @@ import { createPlanner, ACTIONS } from "./lib/continuation-planner.mjs";
 
 const PROTOCOL_VERSION = "2025-03-26";
 const SERVER_VERSION = "0.3.0";
-const MAX_MCP_RESULT_BYTES = 256 * 1024; // 256 KiB presentation limit
-const MAX_JOB_RESULT_BYTES = 32 * 1024; // keep complete job metadata below 64 KiB
-const MAX_ERROR_MESSAGE_BYTES = 8 * 1024;
 const MAX_TOUCHED_FILES = 500;
 const MAX_TOUCHED_FILES_BYTES = 16 * 1024;
 const MAX_BUDGET_USD_CAP = 1000;
@@ -180,7 +182,6 @@ function logError(msg) {
 // ─── Session ID ──────────────────────────────────────────────────────────────
 
 const SESSION_ID = `session-${Date.now().toString(36)}-${randomBytes(4).toString("hex")}`;
-const WRITER_TOKEN = randomBytes(16).toString("hex");
 
 const workspaceRoots = new Set();
 let shuttingDown = false;
@@ -278,13 +279,7 @@ function formatDashboardSection() {
   return `\n\n**实时面板：** ${dashboard.url}?token=${dashboard.token}`;
 }
 
-const activeForegroundRuns = new Map();
 const pendingToolCalls = new Map();
-
-// Per-job finalization cache: finalizeJob has no await points, so its
-// read/decide/write sequence is one event-loop critical section. The cache
-// makes re-entrant/late calls return the same terminal decision.
-const finalizingJobs = new Map();
 
 // Process-local record of terminal-result fingerprints already delivered to
 // the caller (via cc_delegate's terminal return or a cc_check). cc_check uses
@@ -306,9 +301,6 @@ function markResultDelivered(jobId, fingerprint) {
     deliveredResultFingerprints.delete(deliveredResultFingerprints.keys().next().value);
   }
 }
-
-// Terminal statuses — once set, no other status may override.
-const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "rejected", "orphaned"]);
 
 // ─── MCP Input Validation ────────────────────────────────────────────────────
 
@@ -556,29 +548,6 @@ function formatElapsedDuration(startIso, endIso = null) {
   return `${seconds}s`;
 }
 
-function truncateForPresentation(text, maxBytes = MAX_MCP_RESULT_BYTES) {
-  if (!text) return { text: "", truncated: false, originalSize: 0 };
-  const bytes = Buffer.byteLength(text, "utf8");
-  if (bytes <= maxBytes) return { text, truncated: false, originalSize: bytes };
-  // Truncate to maxBytes, then cut at last safe UTF-8 boundary
-  let truncated = text.slice(0, maxBytes);
-  // Ensure we don't cut a multi-byte character
-  while (truncated.length > 0 && Buffer.byteLength(truncated, "utf8") > maxBytes) {
-    truncated = truncated.slice(0, -1);
-  }
-  return {
-    text: truncated + `\n\n... (truncated, original size: ${bytes} bytes)`,
-    truncated: true,
-    originalSize: bytes
-  };
-}
-
-/**
- * Build a non-reversible, bounded task reference from the task content.
- * Returns a short SHA-256 prefix that lets users correlate jobs without ever
- * persisting or displaying task text. The full task enters only the child
- * process stdin stream.
- */
 function taskRef(task) {
   if (!task) return null;
   return "sha256:" + createHash("sha256").update(task).digest("hex").slice(0, 12);
@@ -588,34 +557,6 @@ function taskRef(task) {
 function taskRefLabel(job) {
   const ref = job?.taskRef || null;
   return ref ? `${ref}（内容已隐藏）` : "（内容已隐藏）";
-}
-
-function boundedText(value, maxBytes) {
-  return truncateForPresentation(String(value ?? ""), maxBytes).text;
-}
-
-/**
- * Recursively apply the redaction boundary to an untrusted diagnostics object
- * before it crosses from the watchdog into a private result artifact. The
- * watchdog already redacts its failure envelope, but this second boundary
- * protects future result fields and opaque runtime credentials without
- * persisting runtime-only secret values.
- */
-function redactDiagnosticValue(value, markers) {
-  if (typeof value === "string") return redactText(value, 2048, markers);
-  if (Array.isArray(value)) return value.map((entry) => redactDiagnosticValue(entry, markers));
-  if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([key, entry]) => {
-      // `stage` is a plugin-owned enum, not Provider text. Preserve a valid
-      // value so a short user task cannot erase the diagnostic classification;
-      // any unexpected value remains subject to normal redaction.
-      if (key === "stage" && Object.values(FAILURE_STAGES).includes(entry)) {
-        return [key, entry];
-      }
-      return [key, redactDiagnosticValue(entry, markers)];
-    }));
-  }
-  return value;
 }
 
 /**
@@ -661,68 +602,6 @@ function updateJob(workspaceRoot, patch) {
     }
   }
   return upsertJob(workspaceRoot, patch);
-}
-
-/**
- * Centralized finalizer — the ONLY writer of terminal job status.
- * Prevents the completed-vs-cancelled race via a synchronous per-job critical
- * section plus an in-memory terminal-decision cache.
- *
- * Rules:
- *   - If the job is already terminal, return the existing state (first writer wins).
- *   - If the job is "cancelling", the terminal status is always "cancelled"
- *     regardless of what the result says.
- *   - Otherwise, write the requested terminal status.
- *
- * Both handleDelegate's result path and handleCancel's settlement path call this.
- */
-function finalizeJob(workspaceRoot, jobId, requestedStatus, patch = {}) {
-  // If another finalization already settled this job, return
-  // its cached result. This prevents the completed-vs-cancelled race where
-  // a late success/failure path could override a cancelled status (or vice
-  // versa). The Map entry is cleared in handleDelegate's finally block once
-  // the completion promise resolves.
-  const existing = finalizingJobs.get(jobId);
-  if (existing) return existing;
-
-  const result = (() => {
-    const jobs = listJobs(workspaceRoot);
-    const current = jobs.find((j) => j.id === jobId);
-    if (!current) return null;
-
-    // Already terminal — first writer wins, no override.
-    if (TERMINAL_STATUSES.has(current.status)) {
-      return current;
-    }
-
-    // If cancellation was requested, always write cancelled.
-    const finalStatus = current.status === "cancelling" ? "cancelled" : requestedStatus;
-
-    const now = new Date().toISOString();
-    const finalPatch = { ...patch };
-    if (finalStatus === "cancelled") {
-      finalPatch.result = null;
-      finalPatch.errorMessage = current.errorMessage || "Cancelled.";
-      finalPatch.routeStatus = ROUTE_STATUSES.CANCELLED;
-    }
-    updateJob(workspaceRoot, {
-      id: jobId,
-      ...finalPatch,
-      status: finalStatus,
-      phase: finalStatus,
-      pid: null,
-      completedAt: now,
-      updatedAt: now,
-    });
-
-    return listJobs(workspaceRoot).find((j) => j.id === jobId) || null;
-  })();
-
-  // Cache the result so any concurrent or late finalization attempt (e.g.
-  // a cancel arriving after the result path settles) returns the same
-  // terminal state without overriding it.
-  finalizingJobs.set(jobId, result);
-  return result;
 }
 
 // ─── Tool Definitions ───────────────────────────────────────────────────────
@@ -1375,22 +1254,12 @@ async function handleDelegate(params, context = {}) {
     }
   }
 
-  // P0: Writer lease for write-enabled delegations
-  let leaseOwner = null;
-  if (write) {
-    const leaseResult = acquireWriterLease(workspaceRoot, WRITER_TOKEN);
-    if (!leaseResult.acquired) {
-      return {
-        content: [{
-          type: "text",
-          text: `Error: another write-enabled delegation is already active in this workspace (lease owner: ${leaseResult.owner?.slice(0, 8)}..., job: ${leaseResult.jobId || "unknown"}). Wait for it to complete or cancel it first. Read-only delegations (write=false) can run concurrently.`
-        }],
-        isError: true
-      };
-    }
-    leaseOwner = WRITER_TOKEN;
-  }
-
+  // ── Delegation Lifecycle start ──
+  // Build the in-memory job record first. startDelegation acquires the writer
+  // lease (write-enabled delegations) and registers a live handle, so a
+  // concurrent cc_cancel can always find a controller once the job is
+  // persisted below. The log file is created after — a lease failure must not
+  // leave a log file behind.
   const jobId = generateJobId("cc");
   const now = new Date().toISOString();
   const taskTitle = resume ? "Claude Code Resume" : "Claude Code Task";
@@ -1410,63 +1279,6 @@ async function handleDelegate(params, context = {}) {
   // Populated by ensureDashboard() just before spawn. Empty until the
   // dashboard is running, so pre-spawn error returns omit the section.
   let dashboardSection = "";
-
-  let leaseHeartbeat = null;
-  if (leaseOwner) {
-    leaseHeartbeat = setInterval(() => {
-      try { refreshWriterLease(workspaceRoot, leaseOwner); } catch { /* final release handles loss */ }
-    }, 60_000);
-    leaseHeartbeat.unref?.();
-  }
-
-  let preRunFingerprint;
-  let execution;
-  let autoCompactBoundaryCursor = null;
-
-  // Completion promise: resolves when the delegate's result path has fully
-  // finished cleanup (lease released + terminal status written). cc_cancel and
-  // gracefulShutdown await this to ensure no live process or lease remains.
-  // MUST be declared outside the spawn try-catch so the result-path finally
-  // block can resolve it — otherwise the variable is block-scoped and invisible.
-  let completionResolve;
-  const completionPromise = new Promise((resolve) => { completionResolve = resolve; });
-  const foregroundHandle = {
-    execution: null,
-    leaseOwner,
-    leaseHeartbeat,
-    completionPromise,
-    cancelRequested: false,
-  };
-
-  // Register cancellation before the first asynchronous pre-spawn operation.
-  // This removes the window where persisted state said "running" but cc_cancel
-  // could not find a live controller yet.
-  context.setCancel?.(() => {
-    const current = listJobs(workspaceRoot).find((candidate) => candidate.id === jobId);
-    if (!current || TERMINAL_STATUSES.has(current.status) || current.status === "cancelling") return;
-    foregroundHandle.cancelRequested = true;
-    appendLogLine(workspaceRoot, jobId, "Cancelled by MCP client request.");
-    updateJob(workspaceRoot, {
-      id: jobId,
-      status: "cancelling",
-      phase: "cancelling",
-      errorMessage: "Cancelled by MCP client request.",
-    });
-    foregroundHandle.execution?.cancel();
-  });
-
-  try {
-
-  // Update lease with job ID
-  if (leaseOwner) {
-    updateWriterLeaseJobId(workspaceRoot, leaseOwner, jobId);
-  }
-
-  // Create log file
-  const logFile = createJobLogFile(workspaceRoot, jobId, taskTitle);
-
-  // P0: Pre-run workspace fingerprint
-  preRunFingerprint = captureWorkspaceFingerprint(workspaceRoot);
 
   // Privacy boundary: store only a non-reversible task reference + hash.
   // The full task enters only the child process stdin stream.
@@ -1502,7 +1314,7 @@ async function handleDelegate(params, context = {}) {
     claudeSessionId: provisionalClaudeSessionId,
     claudeSessionUuid,
     pid: null,
-    logFile,
+    logFile: null, // filled by createJobLogFile inside the try below
     createdAt: now,
     updatedAt: now,
     startedAt: now,
@@ -1518,10 +1330,43 @@ async function handleDelegate(params, context = {}) {
     autoCompact: autoCompactAudit
   };
 
+  // Start the delegation lifecycle: acquire the writer lease (write-enabled)
+  // and register the live handle in the running-delegation registry. The job
+  // record is persisted only after this returns.
+  const started = startDelegation({ job, workspaceRoot, run: runClaude });
+  if (!started.ok) {
+    return {
+      content: [{ type: "text", text: `Error: ${started.error}` }],
+      isError: true
+    };
+  }
+  const handle = started.handle;
+
+  // Register cancellation before the first asynchronous pre-spawn operation.
+  // This removes the window where persisted state said "running" but cc_cancel
+  // could not find a live controller yet.
+  context.setCancel?.(() => {
+    const current = listJobs(workspaceRoot).find((candidate) => candidate.id === jobId);
+    if (!current || TERMINAL_STATUSES.has(current.status) || current.status === "cancelling") return;
+    handle.cancel("Cancelled by MCP client request.");
+  });
+
+  let preRunFingerprint;
+  let autoCompactBoundaryCursor = null;
+  let execution;
+
+  try {
+
+  // Create log file
+  const logFile = createJobLogFile(workspaceRoot, jobId, taskTitle);
+  job.logFile = logFile;
+
+  // P0: Pre-run workspace fingerprint
+  preRunFingerprint = captureWorkspaceFingerprint(workspaceRoot);
+
   // Publish the in-memory controller before the persisted running state. A
   // concurrent cc_cancel may observe the job as soon as updateJob returns; at
   // that point it must never see "running" without a cancellable handle.
-  activeForegroundRuns.set(jobId, foregroundHandle);
   updateJob(workspaceRoot, job);
 
   // Foreground mode (default)
@@ -1547,17 +1392,13 @@ async function handleDelegate(params, context = {}) {
   const dash = await ensureDashboard(workspaceRoot);
   dashboardSection = formatDashboardSection();
 
-  if (foregroundHandle.cancelRequested
+  if (handle.cancelRequested
     || listJobs(workspaceRoot).find((candidate) => candidate.id === jobId)?.status === "cancelling") {
-    if (leaseHeartbeat) clearInterval(leaseHeartbeat);
-    if (leaseOwner) releaseWriterLease(workspaceRoot, leaseOwner);
-    finalizeJob(workspaceRoot, jobId, "cancelled", {
+    await settleDelegation({ handle, result: null, direct: {
+      status: "cancelled",
       errorMessage: "Cancelled before Claude Code was started.",
       routeStatus: ROUTE_STATUSES.CANCELLED,
-    });
-    activeForegroundRuns.delete(jobId);
-    finalizingJobs.delete(jobId);
-    completionResolve?.(null);
+    }});
     return {
       content: [{
         type: "text",
@@ -1575,7 +1416,7 @@ async function handleDelegate(params, context = {}) {
   // CC_COMPANION_DASHBOARD_OPEN=off opts out.
   if (dash) dash.openOnce();
 
-  execution = runClaude(task, {
+  execution = handle.spawn(task, {
     cwd: workspaceRoot, write, model: resolvedModel, effort,
     dangerouslySkipPermissions: skipPerms, resume,
     resumeSession: resolvedResumeSession,
@@ -1593,31 +1434,19 @@ async function handleDelegate(params, context = {}) {
       ? (event) => { try { dash.ingest(jobId, event); } catch { /* best effort — dashboard must not break the run */ } }
       : null,
   });
-  foregroundHandle.execution = execution;
   updateJob(workspaceRoot, { id: jobId, pid: execution.pid });
   } catch (err) {
-    try { execution?.cancel(); } catch { /* best effort */ }
-    if (leaseHeartbeat) clearInterval(leaseHeartbeat);
-    if (leaseOwner) releaseWriterLease(workspaceRoot, leaseOwner);
+    // Best-effort: stop the watchdog if a spawn-side failure left it running.
+    try { handle.signalCancel(); } catch { /* best effort */ }
     const current = listJobs(workspaceRoot).find((candidate) => candidate.id === jobId);
-    if (current) {
-      finalizeJob(
-        workspaceRoot,
-        jobId,
-        current.status === "cancelling" ? "cancelled" : "failed",
-        {
-          errorMessage: current.status === "cancelling"
-            ? (current.errorMessage || "Cancelled.")
-            : buildSafeErrorMessage(FAILURE_STAGES.SPAWN, err?.message || "Spawn failed."),
-          routeStatus: current.status === "cancelling"
-            ? ROUTE_STATUSES.CANCELLED
-            : ROUTE_STATUSES.REJECTED,
-        },
-      );
-    }
-    activeForegroundRuns.delete(jobId);
-    finalizingJobs.delete(jobId);
-    completionResolve?.(null);
+    const cancelling = current?.status === "cancelling";
+    await settleDelegation({ handle, result: null, direct: {
+      status: cancelling ? "cancelled" : "failed",
+      errorMessage: cancelling
+        ? (current.errorMessage || "Cancelled.")
+        : buildSafeErrorMessage(FAILURE_STAGES.SPAWN, err?.message || "Spawn failed."),
+      routeStatus: cancelling ? ROUTE_STATUSES.CANCELLED : ROUTE_STATUSES.REJECTED,
+    }});
     return {
       content: [{ type: "text", text: "Error: failed to start Claude Code safely. No task was executed." }],
       isError: true
@@ -1626,19 +1455,15 @@ async function handleDelegate(params, context = {}) {
 
   const result = await execution.result;
 
-  try {
-  // Release only after the watchdog has actually exited and its process tree is
-  // gone. Cancellation must not open a second writer window prematurely.
-  if (leaseHeartbeat) clearInterval(leaseHeartbeat);
-  if (leaseOwner) releaseWriterLease(workspaceRoot, leaseOwner);
-
-  // Check if cancellation was requested — finalizeJob writes cancelled.
+  // Check if cancellation was requested — settleDelegation's finalizeJob
+  // writes cancelled when the persisted status is cancelling.
   const preFinalize = listJobs(workspaceRoot).find((candidate) => candidate.id === jobId);
   if (preFinalize?.status === "cancelling" || preFinalize?.status === "cancelled") {
-    finalizeJob(workspaceRoot, jobId, "cancelled", {
+    await settleDelegation({ handle, result: null, direct: {
+      status: "cancelled",
       errorMessage: preFinalize.errorMessage || "Cancelled.",
       routeStatus: ROUTE_STATUSES.CANCELLED,
-    });
+    }});
     return {
       content: [{
         type: "text",
@@ -1650,137 +1475,46 @@ async function handleDelegate(params, context = {}) {
 
   // Handle result
   if (result.ok) {
-    updateJob(workspaceRoot, { id: jobId, phase: "verifying" });
-    appendLogLine(workspaceRoot, jobId, "Execution complete, verifying output.");
+    // settleDelegation runs the verify→finalize sequence, collects evidence,
+    // redacts, writes the private artifact, and settles the terminal status.
+    const settlement = await settleDelegation({
+      handle,
+      result,
+      task,
+      routeContext: {
+        requestedModel: storedRequestedModel,
+        requestMode: model ? "explicit" : "inherited",
+        selectorKind,
+        routeSnapshot,
+        cliVersion,
+      },
+      autoCompactAudit,
+      autoCompactBoundaryCursor,
+      provisionalClaudeSessionId,
+      preRunFingerprint,
+    });
+    const {
+      finalizedJob, workspaceChanges, presentation, truncation,
+      modelEvidence, routeStatus, safeResult, postRunFingerprint,
+      observedBoundary, compactTrigger,
+    } = settlement;
 
-    // P0: Post-run workspace fingerprint comparison
-    const postRunFingerprint = captureWorkspaceFingerprint(workspaceRoot);
-    const workspaceChanges = diffWorkspaceFingerprints(preRunFingerprint, postRunFingerprint);
-
-    updateJob(workspaceRoot, { id: jobId, phase: "finalizing" });
-    appendLogLine(workspaceRoot, jobId, `Workspace changes observed: ${workspaceChanges.summary}`);
-
-    // Collect model evidence from transcript (best-effort, non-blocking)
-    const usageModelKeys = result.usageModelKeys || [];
-    let modelEvidence;
-    try {
-      modelEvidence = await collectModelEvidence({
-        sessionId: result.sessionId,
-        usageModelKeys,
-        deadlineMs: 1000
-      });
-    } catch (err) {
-      // Collector failure must not change job success status
-      modelEvidence = {
-        status: "unavailable",
-        executedModels: [],
-        usageModelKeys,
-        usageSource: "claude-result-modelUsage",
-        warnings: ["transcript-not-found"]
+    if (finalizedJob?.status === "cancelled") {
+      appendLogLine(workspaceRoot, jobId, "Cancelled during post-result verification.");
+      cleanupOldJobs(workspaceRoot);
+      return {
+        content: [{
+          type: "text",
+          text: `## 任务已取消\n\n**任务 ID：** ${jobId}${formatTaskScopeIdLine(autoCompactAudit)}\n\nClaude Code 任务在最终验证期间被取消。${terminalResumeSection}${dashboardSection}`,
+        }],
+        isError: true,
       };
     }
 
-    // Compute honest post-execution route status from the route snapshot
-    // and the transcript execution evidence. A configuration claim is
-    // never treated as execution proof; a usage key is never an execution model.
-    const routeStatus = computeRouteStatus({
-      routeSnapshot,
-      jobOk: true,
-      cancelled: false,
-      executedModels: modelEvidence.executedModels,
-      usageModelKeys: modelEvidence.usageModelKeys,
-    });
+    appendLogLine(workspaceRoot, jobId, `Done. Cost: ${formatCost(result.cost)}, Duration: ${formatDuration(result.duration ? result.duration * 1000 : null)}.`);
 
-    // Auto-compact deviation recording (spec 4.4): if auto-compact was
-    // configured, collect the observed boundary from the transcript and
-    // record the deviation. NEVER fabricate — null if not observed.
-    let observedBoundary = null;
-    let compactTrigger = null;
-    if (autoCompactAudit?.settingsInjected === true
-      && result.sessionId
-      && autoCompactBoundaryCursor) {
-      try {
-        const boundary = await collectCompactBoundary({
-          sessionId: result.sessionId,
-          deadlineMs: 500,
-          afterCursor: autoCompactBoundaryCursor,
-        });
-        if (boundary.compacted) {
-          observedBoundary = boundary.observedBoundary;
-          compactTrigger = boundary.trigger;
-        }
-      } catch {
-        // Best-effort — deviation recording must not affect job success
-      }
-    }
-
-    // Store full result as separate artifact
-    // A successful Provider result can quote or repeat the delegated task.
-    // Apply the same task-aware, fail-safe redaction before *any* persistence
-    // or MCP presentation, not only on the failure-diagnostics path.
-    const taskSafeResult = redactText(
-      result.result,
-      Number.POSITIVE_INFINITY,
-      [task],
-      { failSafeShortMarkers: false },
-    );
-    // Task text may legitimately be short in a successful response, but an
-    // opaque credential must always prefer fail-safe redaction. Keep the two
-    // marker classes separate so a chunked short credential cannot evade
-    // the task-friendly success-path policy above.
-    const safeResult = redactText(
-      taskSafeResult,
-      Number.POSITIVE_INFINITY,
-      [task],
-    );
-    const resultArtifactPath = writeResultArtifact(workspaceRoot, jobId, {
-      result: safeResult,
-      sessionId: result.sessionId,
-      cost: result.cost,
-      duration: result.duration,
-      usageModelKeys,
-      exitCode: result.exitCode,
-      requestedModel: storedRequestedModel,
-      requestMode: model ? "explicit" : "inherited",
-      selectorKind,
-      routeSnapshot,
-      routeStatus,
-      modelEvidence
-    });
-
-    // Build truncation metadata
-    const presentation = truncateForPresentation(safeResult);
-    const metadataPresentation = truncateForPresentation(safeResult, MAX_JOB_RESULT_BYTES);
-    const truncation = presentation.truncated
-      ? { originalSize: presentation.originalSize, presentationLimit: MAX_MCP_RESULT_BYTES }
-      : null;
-
-    // Route all terminal status writes through finalizeJob so the per-job
-    // lock prevents the completed-vs-cancelled race. If a cancel arrived
-    // while we were collecting evidence, finalizeJob writes "cancelled"
-    // instead of "completed" (cancelling status takes priority).
-    const finalizedJob = finalizeJob(workspaceRoot, jobId, "completed", {
-      result: metadataPresentation.text,
-      resultArtifact: resultArtifactPath,
-      cost: result.cost,
-      duration: result.duration,
-      modelEvidence,
-      routeStatus,
-      // The requested --session-id/--resume target is authoritative. Preserve
-      // it even if a Provider omits or misreports session_id in its result.
-      claudeSessionId: provisionalClaudeSessionId,
-      touchedFiles: workspaceChanges.totalChanges > 0
-        ? boundedTouchedFiles([...workspaceChanges.added, ...workspaceChanges.modified, ...workspaceChanges.removed])
-        : [],
-      workspaceChanges: workspaceChanges.totalChanges > 0 ? workspaceChanges.summary : null,
-      errorMessage: null,
-      truncation,
-      autoCompact: autoCompactAudit ? {
-        ...autoCompactAudit,
-        observedBoundary,
-        compactTrigger,
-      } : null
-    });
+    // Cleanup old jobs
+    cleanupOldJobs(workspaceRoot);
 
     // Record in-memory evidence for the continuation planner. Best-effort:
     // never affects job success, never persisted to state/artifact/log.
@@ -1802,23 +1536,6 @@ async function handleDelegate(params, context = {}) {
         workspaceFingerprint: postRunFingerprint,
       });
     } catch { /* best effort — evidence is advisory */ }
-
-    if (finalizedJob?.status === "cancelled") {
-      appendLogLine(workspaceRoot, jobId, "Cancelled during post-result verification.");
-      cleanupOldJobs(workspaceRoot);
-      return {
-        content: [{
-          type: "text",
-          text: `## 任务已取消\n\n**任务 ID：** ${jobId}${formatTaskScopeIdLine(autoCompactAudit)}\n\nClaude Code 任务在最终验证期间被取消。${terminalResumeSection}${dashboardSection}`,
-        }],
-        isError: true,
-      };
-    }
-
-    appendLogLine(workspaceRoot, jobId, `Done. Cost: ${formatCost(result.cost)}, Duration: ${formatDuration(result.duration ? result.duration * 1000 : null)}.`);
-
-    // Cleanup old jobs
-    cleanupOldJobs(workspaceRoot);
 
     const responseTouchedFiles = boundedTouchedFiles([
       ...workspaceChanges.added, ...workspaceChanges.modified, ...workspaceChanges.removed
@@ -1877,52 +1594,19 @@ async function handleDelegate(params, context = {}) {
       }]
     };
   } else {
-    // Failure path: compute route status (rejected for non-cancelled failures)
-    // and store diagnostics in the private job artifact only.
-    const failureStage = result.failureStage || FAILURE_STAGES.PROVIDER_RESPONSE;
-    const failedRouteStatus = computeRouteStatus({
-      routeSnapshot,
-      jobOk: false,
-      cancelled: result.cancelled === true,
-      executedModels: [],
-      usageModelKeys: result.usageModelKeys || [],
-    });
-    const safeError = result.cancelled === true
-      ? buildSafeErrorMessage(FAILURE_STAGES.CANCELLED, result.error || "Claude task was cancelled.")
-      : buildSafeErrorMessage(failureStage, result.error || "Claude task failed.");
-
-    // Store diagnostics in the private result artifact (redacted, bounded)
-    const failureArtifactPath = writeResultArtifact(workspaceRoot, jobId, {
-      result: null,
-      sessionId: result.sessionId || null,
-      cost: result.cost ?? null,
-      duration: result.duration ?? null,
-      usageModelKeys: result.usageModelKeys || [],
-      exitCode: result.exitCode,
-      requestedModel: storedRequestedModel,
-      requestMode: model ? "explicit" : "inherited",
-      selectorKind,
-      routeSnapshot,
-      routeStatus: failedRouteStatus,
-      modelEvidence: {
-        status: "unavailable",
-        executedModels: [],
-        usageModelKeys: result.usageModelKeys || [],
-        usageSource: "claude-result-modelUsage",
-        warnings: []
+    const settlement = await settleDelegation({
+      handle,
+      result,
+      task,
+      routeContext: {
+        requestedModel: storedRequestedModel,
+        requestMode: model ? "explicit" : "inherited",
+        selectorKind,
+        routeSnapshot,
+        cliVersion,
       },
-      diagnostics: redactDiagnosticValue(result.diagnostics, [task]),
-      failureStage
     });
-
-    // Route through finalizeJob for the same race protection as the success
-    // path. If a cancel arrived during failure handling, write "cancelled".
-    const finalizedJob = finalizeJob(workspaceRoot, jobId, "failed", {
-      errorMessage: boundedText(safeError, MAX_ERROR_MESSAGE_BYTES),
-      routeStatus: failedRouteStatus,
-      resultArtifact: failureArtifactPath,
-      truncation: null
-    });
+    const { finalizedJob, safeError } = settlement;
 
     if (finalizedJob?.status === "cancelled") {
       appendLogLine(workspaceRoot, jobId, "Cancelled during failure finalization.");
@@ -1947,17 +1631,6 @@ async function handleDelegate(params, context = {}) {
       }],
       isError: true
     };
-  }
-  } finally {
-    // Ensure the handle is removed and the completion promise is resolved
-    // regardless of which result path was taken. cc_cancel and gracefulShutdown
-    // await completionPromise to guarantee no live process or lease remains.
-    activeForegroundRuns.delete(jobId);
-    // Clear the finalizer lock so a future delegation with the same job ID
-    // (theoretically) or a retry can finalize cleanly. By this point the
-    // terminal status is already persisted and cc_cancel has returned.
-    finalizingJobs.delete(jobId);
-    completionResolve?.(result);
   }
 }
 
@@ -2265,7 +1938,7 @@ async function handleCancel(params) {
 
   // Cancelling in progress — await settlement (idempotent duplicate cancel).
   if (job.status === "cancelling") {
-    const handle = activeForegroundRuns.get(job.id);
+    const handle = listActiveDelegations().find((candidate) => candidate.jobId === job.id);
     if (handle) {
       await handle.completionPromise;
       const settled = listJobs(workspaceRoot).find((candidate) => candidate.id === job.id);
@@ -2303,8 +1976,10 @@ async function handleCancel(params) {
     };
   }
 
-  // Must hold the live in-memory controller — never signal via persisted PID.
-  const handle = activeForegroundRuns.get(job.id);
+  // Request cancellation of the live controller — never signal via persisted
+  // PID. cancelDelegation writes the cancelling status, yields so it is
+  // observable on disk, then signals the watchdog once.
+  const handle = await cancelDelegation(workspaceRoot, job.id);
   if (!handle) {
     return {
       content: [{
@@ -2315,45 +1990,7 @@ async function handleCancel(params) {
     };
   }
 
-  // Transition to cancelling (not directly to cancelled). The delegate's result
-  // path will finalize to cancelled via finalizeJob once the process tree dies.
-  appendLogLine(workspaceRoot, job.id, "Cancelled by user.");
-  updateJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelling",
-    phase: "cancelling",
-    errorMessage: "Cancelled by user.",
-  });
-
-  // Yield briefly so the cancelling status is flushed to disk and observable
-  // by external state pollers before we signal the watchdog. Without this,
-  // the process tree can die within the same event-loop turn, overwriting
-  // cancelling→cancelled before any observer sees the intermediate state.
-  // The default delay is bounded (20ms) and negligible compared to
-  // process-tree shutdown time in production.
-  //
-  // Test hook: when CC_TEST_CANCEL_HOLD_FILE is set, replace the fixed yield
-  // with a deterministic rendezvous — hold the cancelling status until that
-  // file exists (bounded 30s fallback). Timing-based windows are unreliable
-  // under CI load: the observer's event loop can be starved for seconds, and
-  // on Windows taskkill /T /F delivers no signal the child could trap to
-  // widen the window itself.
-  const cancelHoldFile = process.env.CC_TEST_CANCEL_HOLD_FILE;
-  if (cancelHoldFile) {
-    const holdDeadline = Date.now() + 30000;
-    while (Date.now() < holdDeadline) {
-      try { if (fs.existsSync(cancelHoldFile)) break; } catch { /* keep waiting */ }
-      await new Promise((r) => setTimeout(r, 25));
-    }
-  } else {
-    await new Promise((r) => setTimeout(r, 20));
-  }
-
-  // Signal the watchdog once. The watchdog terminates the Claude process tree.
-  handle.cancelRequested = true;
-  try { handle.execution?.cancel(); } catch { /* best effort */ }
-
-  // Await process tree death + lease release + finalizeJob. The delegate's
+  // Await process tree death + lease release + terminal settlement. The
   // result path resolves completionPromise only after all cleanup is done.
   await handle.completionPromise;
 
@@ -3201,33 +2838,15 @@ async function handleSetup(params) {
 
         // Collect model evidence from transcript (best-effort, non-blocking).
         // A usage key is never an execution model — transcript evidence is
-        // the only execution proof.
-        const probeUsageModelKeys = probeResult.usageModelKeys || [];
-        let probeModelEvidence;
-        try {
-          probeModelEvidence = await collectModelEvidence({
-            sessionId: probeResult.sessionId,
-            usageModelKeys: probeUsageModelKeys,
-            deadlineMs: 1000
-          });
-        } catch {
-          probeModelEvidence = {
-            status: "unavailable",
-            executedModels: [],
-            usageModelKeys: probeUsageModelKeys,
-            usageSource: "claude-result-modelUsage",
-            warnings: ["transcript-not-found"]
-          };
-        }
-
-        // Compute honest post-execution route status from the route snapshot
-        // and the transcript execution evidence.
-        const probeRouteStatus = computeRouteStatus({
+        // the only execution proof. collectExecutionEvidence applies the same
+        // honest evidence→status computation shared with the delegation
+        // settle path.
+        const { modelEvidence: probeModelEvidence, routeStatus: probeRouteStatus } = await collectExecutionEvidence({
+          sessionId: probeResult.sessionId,
+          usageModelKeys: probeResult.usageModelKeys || [],
           routeSnapshot: probeRoute.snapshot,
           jobOk: probeResult.ok,
           cancelled: probeResult.cancelled === true,
-          executedModels: probeModelEvidence.executedModels,
-          usageModelKeys: probeModelEvidence.usageModelKeys,
         });
 
         // Honest cost: explicit Provider-reported zero is still evidence and
@@ -3257,7 +2876,7 @@ async function handleSetup(params) {
           safeProviderReason,
           cost: honestCost,
           costProvenance,
-          usageModelKeys: probeUsageModelKeys,
+          usageModelKeys: probeResult.usageModelKeys || [],
           // A usage key is never execution proof — only transcript evidence is.
           usageKeyIsNotExecutionProof: true,
           diagnostics: redactDiagnosticValue(
@@ -3618,8 +3237,8 @@ async function gracefulShutdown(signal) {
   shuttingDown = true;
 
   // Snapshot handles before mutating state. Each handle has:
-  //   { execution, leaseOwner, leaseHeartbeat, completionPromise }
-  const handles = [...activeForegroundRuns.values()];
+  //   { jobId, workspaceRoot, execution, cancelRequested, completionPromise }
+  const handles = listActiveDelegations();
 
   // 1. Mark owned running/queued jobs as cancelling (not directly cancelled).
   //    The delegate's result path will finalize to cancelled via finalizeJob.
@@ -3642,11 +3261,11 @@ async function gracefulShutdown(signal) {
 
   // 2. Signal all foreground executions (watchdog terminates Claude process tree).
   for (const handle of handles) {
-    try { handle.execution.cancel(); } catch { /* best effort */ }
+    try { handle.signalCancel(); } catch { /* best effort */ }
   }
 
-  // 3. Await process tree exit (bounded grace period). The delegate's result
-  //    path releases the lease and calls finalizeJob as each execution settles.
+  // 3. Await process tree exit (bounded grace period). Each execution's result
+  //    path settles through settleDelegation (lease release + terminal status).
   const drained = await Promise.race([
     Promise.allSettled(handles.map((h) => h.completionPromise)).then(() => true),
     new Promise((resolve) => setTimeout(() => resolve(false), 5250))
@@ -3668,31 +3287,44 @@ async function gracefulShutdown(signal) {
 
   // 4. Release any writer leases still held (safety net — the delegate's result
   //    path should have already released them, but we must not leave them dangling).
-  for (const workspaceRoot of workspaceRoots) {
-    try { releaseWriterLease(workspaceRoot, WRITER_TOKEN); } catch { /* best effort */ }
+  for (const handle of handles) {
+    try { handle.releaseLease(); } catch { /* best effort */ }
   }
 
-  // 5. Finalize any jobs still in cancelling state (the delegate may not have
-  //    had a chance to run its result path, e.g. force-killed above).
-  for (const workspaceRoot of workspaceRoots) {
+  // 5. Settle any jobs still in cancelling state (the delegate may not have
+  //    had a chance to run its result path, e.g. force-killed above). Only
+  //    jobs with a live handle can be settled — terminal-status writes go
+  //    through settleDelegation's finalizer, never a raw persisted update.
+  for (const handle of handles) {
+    const jobId = handle.jobId;
     try {
-      const jobs = listJobs(workspaceRoot);
-      for (const job of jobs) {
-        if (job.status === "cancelling" && job.ownerServerId === SESSION_ID) {
-          finalizeJob(workspaceRoot, job.id, "cancelled", {
-            errorMessage: job.errorMessage || `Cancelled: server received ${signal}`,
-            routeStatus: ROUTE_STATUSES.CANCELLED,
-          });
-        }
+      const jobs = listJobs(handle.workspaceRoot);
+      const job = jobs.find((candidate) => candidate.id === jobId);
+      if (job?.status === "cancelling" && job.ownerServerId === SESSION_ID) {
+        await settleDelegation({ handle, result: null, direct: {
+          status: "cancelled",
+          errorMessage: job.errorMessage || `Cancelled: server received ${signal}`,
+          routeStatus: ROUTE_STATUSES.CANCELLED,
+        }});
       }
     } catch { /* best effort */ }
   }
 
   // 6. Stop the live dashboard — close SSE clients, delete dashboard.json
   //    metadata files, and close the HTTP server. Best-effort: shutdown must
-  //    not hang if the dashboard failed to start or is mid-cleanup.
+  //    not hang if the dashboard failed to start or is mid-cleanup. Bounded
+  //    race as a final safety net: stop() force-destroys connections today,
+  //    but a future client or route bug must never stall the shutdown path.
+  //    Dropping the promise on timeout is safe — dashboard.json is only
+  //    lightweight metadata for the dashboard process (rewritten on next
+  //    start), and stop()'s "exit" cleanup covers the early-return case.
   if (dashboard) {
-    try { await dashboard.stop(); } catch { /* best effort */ }
+    try {
+      await Promise.race([
+        dashboard.stop(),
+        new Promise((resolve) => setTimeout(resolve, 3000).unref?.()),
+      ]);
+    } catch { /* best effort */ }
     dashboard = null;
     dashboardPromise = null;
   }
