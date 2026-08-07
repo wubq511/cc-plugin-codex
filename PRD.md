@@ -56,7 +56,7 @@ cc-plugin-codex/
 ### 3.2 通信方式
 
 - **MCP Server（stdio）**：Codex 作为 MCP client，启动 `cc-companion.mjs` 作为子进程
-- **Claude CLI 调用**：watchdog 通过 `claude --print --input-format text --output-format json` 非交互调用 Claude Code；任务只经 stdin 传递
+- **Claude CLI 调用**：watchdog 通过 `claude --print --input-format text --output-format stream-json --verbose` 非交互调用 Claude Code；任务只经 stdin 传递
 - **Job 追踪**：schema v8 以原子 per-job 文件持久化到 `${os.tmpdir()}/cc-companion/<workspace-slug-hash>/jobs/`，目录和文件分别限制为 `0700`/`0600`；任务正文不进入 state；v8 增加临时 compact 策略、会话 UUID、compact 证据与 `cancelling` 状态
 
 ### 3.3 Codex 插件清单（plugin.json）
@@ -128,7 +128,7 @@ cc-plugin-codex/
 1. 生成 job ID；新会话预分配 Claude UUID 并在 spawn 前作为 canonical `claudeSessionId` 落盘
 2. 构建 `claude` 命令（任务通过 stdin 传递，不出现在进程命令行中）：
    ```
-   claude --print --input-format text --output-format json \
+   claude --print --input-format text --output-format stream-json --verbose \
      [--dangerously-skip-permissions] \
      [--model <model>] \
      [--effort <effort>] \
@@ -487,7 +487,7 @@ delegation 没有 background 模式（`background` 不是合法参数）。所�
 ```
 用户: "让 Claude Code 实现 auth middleware"
   → Codex 调用 cc_delegate(task="...")
-  → MCP server 以 `claude --print --input-format text --output-format json` 启动 Claude（任务走 stdin；不传 --model 时继承 Provider 配置）
+  → MCP server 以 `claude --print --input-format text --output-format stream-json --verbose` 启动 Claude（任务走 stdin；不传 --model 时继承 Provider 配置）
   → Claude Code 执行任务
   → MCP server 解析输出，返回分层模型证据
   → Codex 展示摘要 + 提示 "Run /claude:review to review"
@@ -526,10 +526,10 @@ Focus: <focus or "general">
 | 维度 | codex-plugin-cc（原插件） | 本插件（反向） |
 |------|--------------------------|----------------|
 | 方向 | Claude Code → Codex | Codex → Claude Code |
-| 通信协议 | codex app-server JSON-RPC | Claude print-mode JSON CLI |
+| 通信协议 | codex app-server JSON-RPC | Claude print-mode streaming CLI |
 | 插件系统 | Claude Code 插件 | Codex 插件 |
 | Hook | SessionStart/End/Stop | 无（Codex 插件无 hook） |
-| 任务执行 | Codex app-server turn | watchdog 监管的 Claude print-mode JSON 子进程 |
+| 任务执行 | Codex app-server turn | watchdog 监管的 Claude print-mode streaming 子进程 |
 | 审查 | Codex 内置 reviewer | Codex 自身审查 diff |
 | Broker | 有（共享 app-server） | 无（直接 spawn） |
 

@@ -29,6 +29,11 @@ Codex ↔ cc-companion.mjs ↔ claude-runner.mjs ↔ watchdog.mjs ↔ Claude Cod
 - `scripts/lib/writer-lease.mjs`: cross-process write exclusivity for one workspace —
   O_EXCL ownership, stale takeover, file mutex. Imports `resolveStateDir` from
   `state.mjs`.
+- `scripts/lib/delegation.mjs`: owns the foreground run → settle → cancel lifecycle
+  of one delegation — the running-delegation registry, the writer lease for
+  write-enabled delegations, and the single terminal-status settlement (finalize)
+  race lock. Handlers signal cancellation and consume results, but never settle a
+  terminal status themselves.
 - `scripts/lib/claude-cli.mjs`: single adapter for synchronous `claude` CLI probes
   (version, `--help`, budget-guard support, availability) — all funnel through one
   shell-free spawnSync helper via `resolveCommandForSpawn`.

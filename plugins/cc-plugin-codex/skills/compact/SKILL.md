@@ -73,7 +73,7 @@ Active or cancelling jobs are **always rejected**, including when the same sessi
 ## Notes
 
 - `cc_compact` is read-only: it runs with `write=false` (Read, Glob, Grep only). No writer lease is needed.
-- The compact invocation uses `claude --print --resume <sessionId> --input-format text --output-format json` with `/compact` as stdin input.
+- The compact invocation uses `claude --print --resume <sessionId> --input-format text --output-format stream-json --verbose` with `/compact` as stdin input.
 - `--session-id` is never used by `cc_compact` — only `--resume` (mutually exclusive with `--session-id`).
 - The compact result is persisted to the job record's `compactResult` field (advisory, non-sensitive).
 - After compacting, you can resume the same session with `cc_delegate` + `resumeSession` or by passing the `continuationPlan` from `cc_plan_continuation`.

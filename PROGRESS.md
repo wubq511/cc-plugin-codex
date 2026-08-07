@@ -559,3 +559,39 @@ audit found and repaired these additional gaps:
 - 防回退：新增 tests/token-budget.test.mjs（tools/list ≤15,500 B、instructions ≤400 B、三工具无 structuredContent、去重全流程断言）；AGENTS.md 新增 text-first 与 cc_check 去重两条契约；CONTEXT.md 新增「常驻上下文成本 / 单次调用成本 / 结果指纹」三术语。
 
 **验证**：`npm test` 585 pass / 0 fail；`npm run verify:ci` 绿；`npm run verify` 绿（缓存与源码一致 + 安装副本测试通过）。注：verify:ci 首跑一个测试偶发失败（`actual: null` 形态，疑似 spawn 时序 flake），`npm test` 单独连跑两次 + verify:ci 重跑均全绿、未能复现，按既有 flake 记录在案；若 CI 复发需单独排查。
+
+## 2026-07-30 — Dashboard 可访问性修复（补录）
+
+**改动**（465e2c3）：对比度、深色模式、响应式问题修复；随 2026-07-31 token 成本轮
+入库。
+
+## 2026-08-04 — README 使用故事重构（补录）
+
+**改动**（59a9936）：README 重写为使用故事 + 浅色 hero 图。
+
+## 2026-08-07 — 架构深化轮（/improve-codebase-architecture 候选 4/5/3 + 收口）
+
+**背景**：架构报告按风险从低到高处理，本轮收口此前未入库的 delegation 提取与
+dashboard 修复，并完成候选 4（CLI 适配器）、候选 5（facade 精简）、候选 3
+（autocompact 变深）。
+
+**改动**：
+- `delegation.mjs` 提取（f20903a）：运行态注册表、writer lease、finalize 竞态锁
+  归入单一生命周期模块；handler 只 signal/consume，不自行落终态。
+- dashboard shutdown 有界化（8a597e9）：SIGTERM 不再挂起 companion。
+- writer-lease 泄漏封堵（bdcd1f2）与拆分（9c14e35）：从 state.mjs 拆出
+  writer-lease.mjs，剪除死导出；AGENTS.md 架构清单同步（2a99517）。
+- claude-cli 适配器（d389a5d）：版本/--help/预算守护探测统一走单一 shell-free
+  spawnSync 入口（resolveCommandForSpawn）；退出码契约收敛到 exit-codes.mjs。
+- model-evidence facade 精简（d201fdb）：barrel 变薄，state/watchdog 直连叶模块。
+- autocompact 变深（6f4b2c0）：跨 job 策略解析（session/task tombstones、
+  inheritance、clear、resume replay）下沉 lib/autocompact.mjs；
+  `resolveDelegateAutoCompact` + `replayStoredAutoCompact` 双公共入口 + 共享私有
+  `resolveStoredPolicy`；jobMatchesClaudeSession 移入 state.mjs。
+- 审查清理（7d3f028）：删除残留孤立 doc comment。
+- 文档同步（本轮）：AGENTS.md 补录 delegation.mjs；README/PRD/skills 的 watchdog
+  命令更新为 `--output-format stream-json --verbose`。
+
+**验证**：`npm test` 631 pass / 0 fail / 0 skipped；`npm run verify:ci` 绿；
+`npm run verify` 在候选 3 收口时绿（缓存与源码一致）；main 最新 CI 6/6 平台节点
+通过（Windows Node 24 一次环境性 flake，重跑绿）。

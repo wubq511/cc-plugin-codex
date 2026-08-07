@@ -174,7 +174,7 @@ Codex ↔ cc-companion.mjs ↔ claude-runner.mjs ↔ watchdog.mjs ↔ Claude Cod
 ```
 
 1. Codex 调用 MCP 工具（stdio 传输），任务经 stdin 传给 watchdog 子进程，不经过任何进程命令行
-2. watchdog 以 `claude --print --input-format text --output-format json` 前台运行 Claude Code，同时把事件流转发给 dashboard
+2. watchdog 以 `claude --print --input-format text --output-format stream-json --verbose` 前台运行 Claude Code，同时把事件流转发给 dashboard
 3. MCP 调用保持 pending，直到 Claude Code 完成、失败或取消——无需轮询
 4. 结果返回 Codex，附带费用、耗时、轮数等证据；你接着用 `cc_review` 审查产出
 

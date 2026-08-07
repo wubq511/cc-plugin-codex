@@ -152,7 +152,7 @@ not break task-scope continuity.
 - A pending foreground call is silent: do not send recurring progress/commentary messages merely to say that Claude Code has not finished. The next model action should occur after `cc_delegate` returns.
 - Delegation is foreground only — there is no background mode. The single pending call waits silently without polling until Claude Code finishes.
 - The task prompt is sent via stdin (never argv) for privacy — it does not appear in any process command line. Be specific about what you want done.
-- Claude Code is invoked with `claude --print --input-format text --output-format json` (print-mode JSON protocol). The task is delivered via stdin.
+- Claude Code is invoked with `claude --print --input-format text --output-format stream-json --verbose` (print-mode streaming protocol). The task is delivered via stdin.
 - Job ID supports prefix matching: "cc-abc" matches "cc-abc123def".
 - When `model` is omitted, no `--model` argument is sent — Claude Code inherits its configured default.
 - When `model` is an alias (Opus/Fable/Sonnet/Haiku), it is normalized to lowercase and passed as `--model <alias>`.

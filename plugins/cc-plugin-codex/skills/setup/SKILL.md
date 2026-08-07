@@ -19,14 +19,14 @@ Verify that Claude Code is installed and the plugin is ready to use. Performs st
    - **Claude Code not installed**: Suggest `npm install -g @anthropic-ai/claude-code`
    - **Node.js not available**: Suggest installing from https://nodejs.org/
    - **Git not found**: Review features need git — suggest installing git
-   - **CLI protocol mismatch**: The installed Claude Code may not support print-mode JSON (`--print --input-format text --output-format json`). Suggest updating Claude Code to 2.1.208+.
+   - **CLI protocol mismatch**: The installed Claude Code may not support print-mode streaming (`--print --input-format text --output-format stream-json --verbose`). Suggest updating Claude Code to 2.1.208+.
    - **Source/cache mismatch**: The installed plugin cache differs from the running source. Reinstall the plugin to align the cache.
    - **Claude Code not authenticated**: Suggest running `claude auth` or setting `ANTHROPIC_API_KEY`
 
 ## What It Checks (Static — Zero Model Calls)
 
 - **Claude Code CLI availability and version**
-- **CLI protocol verification**: confirms `--print`, `--input-format`, and `--output-format` flags are supported (print-mode JSON capability)
+- **CLI protocol verification**: confirms `--print`, `--input-format`, and `--output-format` flags are supported (print-mode streaming capability)
 - **Companion compatibility**: server version, state schema v8, watchdog protocol
 - **Model routing**: the selector classifier (inherited/alias/native) is active. Model selection is inherited from the parent environment or explicitly supplied via `model` selector. The plugin does not read, write, or modify any external routing configuration.
 - **Source/cache compatibility**: performs a real comparison between the running plugin source and the installed cache directory (reports `match`, `differ`, or `not-installed` when running from source). Never prints a green compatibility claim without an actual comparison.
