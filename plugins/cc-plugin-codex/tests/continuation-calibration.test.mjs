@@ -84,6 +84,9 @@ test("dry-run exercises all three MCP strategies with fake Claude and six guarde
         PATH: `${binDir}${path.delimiter}${process.env.PATH || ""}`,
         CLAUDE_CONFIG_DIR: configDir,
         FAKE_CLAUDE_HELP_BUDGET_GUARD: "1",
+        // Headless calibration: never auto-open the dashboard in a real
+        // browser, matching every other test that spawns the companion.
+        CC_COMPANION_DASHBOARD_OPEN: "off",
       },
     });
     assert.equal(result.status, 0, result.stderr || result.stdout);

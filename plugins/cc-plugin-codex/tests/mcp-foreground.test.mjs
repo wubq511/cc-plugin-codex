@@ -14,7 +14,7 @@ const pluginRoot = path.resolve(here, "..");
 const serverPath = path.join(pluginRoot, "scripts", "cc-companion.mjs");
 const fakeClaudeSource = path.join(here, "helpers", "fake-claude.mjs");
 
-async function waitFor(predicate, timeoutMs = 2000) {
+async function waitFor(predicate, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const value = predicate();

@@ -272,9 +272,17 @@ export function createDashboard({ getJobs, openBrowser = defaultOpenBrowser } = 
       try { await unlink(path.join(dir, "dashboard.json")); } catch { /* already gone */ }
     }
     announcedDirs.clear();
-    // Close HTTP server
+    // Close HTTP server. server.close() stops listening but its callback
+    // waits for every existing connection to drain — a browser SSE tab keeps
+    // its keep-alive socket open, and EventSource reconnects after res.end(),
+    // so the callback can wait forever and gracefulShutdown would hang.
+    // closeAllConnections() (Node >=18.2, engine requires >=22) force-destroys
+    // those sockets so the close callback always fires. Unref'd bound as a
+    // final safety net for a client that misbehaves between close and destroy.
     return new Promise((resolve) => {
       server.close(() => resolve());
+      server.closeAllConnections();
+      setTimeout(resolve, 2000).unref?.();
     });
   }
 
