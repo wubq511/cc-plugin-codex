@@ -15,7 +15,8 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { binaryAvailable } from "./process.mjs";
+import { getClaudeAvailability } from "./claude-cli.mjs";
+import { EXIT_TIMEOUT, EXIT_OUTPUT_LIMIT, EXIT_CANCELLED } from "./exit-codes.mjs";
 
 const VALID_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 export const MAX_CAPTURE_BYTES = 8 * 1024 * 1024; // 8 MiB
@@ -131,11 +132,11 @@ export function runClaude(task, options = {}) {
       }
 
       // No valid result from watchdog
-      if (code === 4) {
+      if (code === EXIT_CANCELLED) {
         resolve({ ok: false, cancelled: true, error: "Claude task was cancelled or companion died.", exitCode: code, failureStage: "cancelled" });
-      } else if (code === 2) {
+      } else if (code === EXIT_TIMEOUT) {
         resolve({ ok: false, error: `Claude task timed out after ${timeoutMs}ms.`, exitCode: code, failureStage: "timeout" });
-      } else if (code === 3) {
+      } else if (code === EXIT_OUTPUT_LIMIT) {
         resolve({ ok: false, error: `Claude output exceeded the ${maxCaptureBytes}-byte capture limit.`, exitCode: code, failureStage: "provider_response" });
       } else {
         resolve({
@@ -166,13 +167,6 @@ export function runClaude(task, options = {}) {
     },
     result
   };
-}
-
-/**
- * Check if claude CLI is available.
- */
-export function getClaudeAvailability(cwd) {
-  return binaryAvailable("claude", ["--version"], { cwd });
 }
 
 // Re-export for backward compat (tests may import MAX_CAPTURE_BYTES)

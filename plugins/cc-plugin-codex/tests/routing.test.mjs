@@ -7,7 +7,6 @@
  *   - buildRouteSnapshot (no secrets)
  *   - buildChildEnv (parent pass-through)
  *   - resolveRoute / resolveRouteForDisplay
- *   - getClaudeVersion (best-effort)
  *   - KNOWN_ALIASES
  *
  * Acceptance criteria from design doc:
@@ -26,7 +25,6 @@ import {
   buildChildEnv,
   resolveRoute,
   resolveRouteForDisplay,
-  getClaudeVersion,
 } from "../scripts/lib/routing.mjs";
 
 // ─── §1: Selector classification (no filesystem) ────────────────────────────────
@@ -345,11 +343,4 @@ test("resolveRouteForDisplay result has no secret-bearing fields", () => {
   const json = JSON.stringify(result);
   assert.ok(!json.includes("sk-"), "no secrets in result");
   assert.ok(!json.includes("Bearer"), "no bearer tokens in result");
-});
-
-// ─── §7: getClaudeVersion (best-effort) ──────────────────────────────────────────
-
-test("getClaudeVersion is callable and returns string or null", () => {
-  const version = getClaudeVersion(process.cwd());
-  assert.ok(version === null || typeof version === "string");
 });

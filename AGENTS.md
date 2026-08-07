@@ -29,6 +29,12 @@ Codex ↔ cc-companion.mjs ↔ claude-runner.mjs ↔ watchdog.mjs ↔ Claude Cod
 - `scripts/lib/writer-lease.mjs`: cross-process write exclusivity for one workspace —
   O_EXCL ownership, stale takeover, file mutex. Imports `resolveStateDir` from
   `state.mjs`.
+- `scripts/lib/claude-cli.mjs`: single adapter for synchronous `claude` CLI probes
+  (version, `--help`, budget-guard support, availability) — all funnel through one
+  shell-free spawnSync helper via `resolveCommandForSpawn`.
+- `scripts/lib/exit-codes.mjs`: shared watchdog exit-code contract (0/1/2/3/4). The
+  watchdog is the sole producer and claude-runner the sole consumer; both import this
+  module so the numeric contract exists in exactly one place.
 - `scripts/lib/model-evidence*.mjs`: separates requested model, transcript execution
   evidence, and final usage keys.
 - `scripts/lib/autocompact.mjs` and `compact-boundary.mjs`: temporary auto-compact policy

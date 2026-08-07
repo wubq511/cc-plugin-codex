@@ -13,12 +13,9 @@
  * Claude is spawned with stdin=pipe; the task is written to Claude's stdin
  * and closed. The task never appears in any process argv.
  *
- * Exit codes:
- *   0 = success (result written to stdout)
- *   1 = Claude failed or config error
- *   2 = timeout
- *   3 = output limit exceeded
- *   4 = cancelled (IPC disconnect or explicit cancel)
+ * Exit codes follow the shared contract in `../lib/exit-codes.mjs`:
+ *   0 = success · 1 = Claude failed / config error · 2 = timeout ·
+ *   3 = output limit exceeded · 4 = cancelled (IPC disconnect or cancel)
  */
 
 import { spawn } from "node:child_process";
@@ -35,6 +32,13 @@ import {
   buildSafeErrorMessage,
   FAILURE_STAGES,
 } from "../lib/diagnostics.mjs";
+import {
+  EXIT_SUCCESS,
+  EXIT_FAILURE,
+  EXIT_TIMEOUT,
+  EXIT_OUTPUT_LIMIT,
+  EXIT_CANCELLED,
+} from "../lib/exit-codes.mjs";
 
 const DEFAULT_MAX_CAPTURE = 8 * 1024 * 1024; // 8 MiB
 
@@ -225,7 +229,7 @@ async function main() {
   }
 
   if (!input.trim()) {
-    exitWith(4);
+    exitWith(EXIT_CANCELLED);
     return;
   }
 
@@ -234,7 +238,7 @@ async function main() {
     config = JSON.parse(input);
   } catch {
     process.stderr.write("[watchdog] Invalid config JSON\n");
-    exitWith(1);
+    exitWith(EXIT_FAILURE);
     return;
   }
 
@@ -262,7 +266,7 @@ async function main() {
 
   if (!task) {
     process.stderr.write("[watchdog] Missing task\n");
-    exitWith(1);
+    exitWith(EXIT_FAILURE);
     return;
   }
 
@@ -355,7 +359,7 @@ async function main() {
         taskMarkers: [task],
       }),
     });
-    exitWith(1);
+    exitWith(EXIT_FAILURE);
     return;
   }
 
@@ -399,7 +403,7 @@ async function main() {
         taskMarkers: [task],
       }),
     });
-    exitWith(1);
+    exitWith(EXIT_FAILURE);
   });
 
   // Handle child exit
@@ -455,7 +459,7 @@ async function main() {
       writeResult(failResult(stage, code ?? -1, {
         errorDetail: `Claude output exceeded the ${maxCaptureBytes}-byte capture limit and was terminated.`,
       }));
-      exitWith(3);
+      exitWith(EXIT_OUTPUT_LIMIT);
       return;
     }
 
@@ -464,7 +468,7 @@ async function main() {
       writeResult(failResult(stage, code ?? -1, {
         errorDetail: `Claude task timed out after ${timeoutMs}ms and was terminated.`,
       }));
-      exitWith(2);
+      exitWith(EXIT_TIMEOUT);
       return;
     }
 
@@ -490,7 +494,7 @@ async function main() {
           taskMarkers: [task],
         }),
       });
-      exitWith(4);
+      exitWith(EXIT_CANCELLED);
       return;
     }
 
@@ -537,7 +541,7 @@ async function main() {
           ? (typeof parsedError?.error === "string" ? parsedError.error : typeof parsedError?.result === "string" ? parsedError.result : `claude exited with code ${code}`)
           : (stderr || `claude exited with code ${code}${signal ? ` (${signal})` : ""}`),
       }));
-      exitWith(1);
+      exitWith(EXIT_FAILURE);
       return;
     }
 
@@ -566,7 +570,7 @@ async function main() {
           usageKey: usageKeys.length > 0 ? usageKeys[0] : null,
           errorDetail: typeof errorMsg === "string" ? errorMsg : JSON.stringify(errorMsg),
         }));
-        exitWith(1);
+        exitWith(EXIT_FAILURE);
         return;
       }
 
@@ -589,7 +593,7 @@ async function main() {
           usageKey: usageKeys.length > 0 ? usageKeys[0] : null,
           errorDetail: typeof errorMsg === "string" ? errorMsg : JSON.stringify(errorMsg),
         }));
-        exitWith(1);
+        exitWith(EXIT_FAILURE);
         return;
       }
 
@@ -611,7 +615,7 @@ async function main() {
           usageKey: usageKeys.length > 0 ? usageKeys[0] : null,
           errorDetail: typeof parsed.result.error === "string" ? parsed.result.error : JSON.stringify(parsed.result.error),
         }));
-        exitWith(1);
+        exitWith(EXIT_FAILURE);
         return;
       }
 
@@ -643,13 +647,13 @@ async function main() {
         contextWindow,
         exitCode: 0
       });
-      exitWith(0);
+      exitWith(EXIT_SUCCESS);
     } catch (parseError) {
       const stage = FAILURE_STAGES.JSON_PROTOCOL;
       writeResult(failResult(stage, 0, {
         errorDetail: `Claude output was not valid JSON: ${parseError.message}`,
       }));
-      exitWith(1);
+      exitWith(EXIT_FAILURE);
     }
   });
 
@@ -680,10 +684,10 @@ function handleSignal() {
           failureStage: FAILURE_STAGES.CANCELLED,
         });
       }
-      exitWith(4);
+      exitWith(EXIT_CANCELLED);
     }, 200).unref?.();
   } else {
-    exitWith(4);
+    exitWith(EXIT_CANCELLED);
   }
 }
 

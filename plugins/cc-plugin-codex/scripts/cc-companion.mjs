@@ -27,7 +27,8 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
-import { runClaude, getClaudeAvailability } from "./lib/claude-runner.mjs";
+import { readClaudeHelp, checkBudgetGuardSupported, getClaudeVersion, getClaudeAvailability } from "./lib/claude-cli.mjs";
+import { runClaude } from "./lib/claude-runner.mjs";
 import { createDashboard } from "./lib/dashboard.mjs";
 import {
   generateJobId, upsertJob, listJobs,
@@ -39,7 +40,7 @@ import {
   startDelegation, cancelDelegation, listActiveDelegations,
   settleDelegation, collectExecutionEvidence, TERMINAL_STATUSES
 } from "./lib/delegation.mjs";
-import { binaryAvailable, resolveCommandForSpawn, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
   appendLogLine, appendLogBlock, createJobLogFile, readLogTail,
@@ -55,8 +56,7 @@ import {
   normalizeModelIdForStorage
 } from "./lib/model-evidence.mjs";
 import {
-  resolveRoute, resolveRouteForDisplay,
-  getClaudeVersion, AmbiguousSelectorError
+  resolveRoute, resolveRouteForDisplay, AmbiguousSelectorError
 } from "./lib/routing.mjs";
 import {
   buildSafeErrorMessage, buildSafeErrorSummary, FAILURE_STAGES, buildFailureEnvelope,
@@ -101,36 +101,6 @@ const continuationPlanner = createPlanner();
  * Read `claude --help` once through the same cross-platform command resolution
  * used by execution. A non-zero exit is never accepted as capability evidence.
  */
-function readClaudeHelp(cwd) {
-  try {
-    const resolved = resolveCommandForSpawn("claude", ["--help"]);
-    const helpResult = spawnSync(resolved.command, resolved.args, {
-      cwd,
-      encoding: "utf8",
-      timeout: 10000,
-      stdio: "pipe",
-      shell: resolved.shell,
-      windowsHide: true,
-    });
-    return {
-      ok: helpResult.status === 0,
-      text: `${helpResult.stdout || ""}\n${helpResult.stderr || ""}`,
-    };
-  } catch {
-    return { ok: false, text: "" };
-  }
-}
-
-/**
- * Check whether the Claude CLI supports --max-budget-usd by inspecting --help.
- * Zero model calls. Returns true only when a successful help invocation
- * explicitly recognizes the flag.
- */
-function checkBudgetGuardSupported(cwd) {
-  const help = readClaudeHelp(cwd);
-  return help.ok && /--max-budget-usd\b/.test(help.text);
-}
-
 /**
  * Validate an optional maxBudgetUsd parameter and enforce the budget guard.
  * Returns { ok: true, value: number|null } or { ok: false, error: string }.

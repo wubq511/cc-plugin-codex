@@ -1,6 +1,8 @@
 /**
  * Model routing — selector classification, route snapshots, and child-env
- * construction. No filesystem dependency or external configuration resolution.
+ * construction. No filesystem dependency, no external configuration
+ * resolution, and no child-process spawning — `claude --version` probing
+ * lives in claude-cli.mjs.
  *
  * The plugin supervises a native Claude Code CLI child process. Claude Code
  * owns its configuration; the plugin does not read, write, or modify any
@@ -16,8 +18,6 @@
  * Actual model identity is determined only from Claude's post-run execution
  * evidence. A requested selector is never execution proof.
  */
-
-import { spawnSync } from "node:child_process";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -70,30 +70,6 @@ export class AmbiguousSelectorError extends Error {
     this.name = "AmbiguousSelectorError";
     this.selector = selector;
   }
-}
-
-// ─── CLI Version ─────────────────────────────────────────────────────────────
-
-/**
- * Get the Claude CLI version string (best-effort, zero model calls).
- * @returns {string|null}
- */
-export function getClaudeVersion(cwd, { command = "claude" } = {}) {
-  try {
-    const result = spawnSync(command, ["--version"], {
-      cwd: cwd || process.cwd(),
-      encoding: "utf8",
-      timeout: 5000,
-      stdio: "pipe",
-    });
-    if (result.status === 0) {
-      const version = (result.stdout || "").trim();
-      if (version) return version;
-    }
-  } catch {
-    // best effort
-  }
-  return null;
 }
 
 // ─── Selector Classification ─────────────────────────────────────────────────
