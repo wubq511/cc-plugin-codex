@@ -9,9 +9,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   resolveStateDir, resolveJobsDir, listJobs, upsertJob, generateJobId,
-  acquireWriterLease, refreshWriterLease, releaseWriterLease, getWriterLeaseOwner, reconcileOrphans,
-  resetMigrationFlag, writeResultArtifact, readResultArtifact, cleanupOldJobs
+  writeResultArtifact, readResultArtifact, cleanupOldJobs
 } from "../scripts/lib/state.mjs";
+import {
+  acquireWriterLease, refreshWriterLease, releaseWriterLease, getWriterLeaseOwner
+} from "../scripts/lib/writer-lease.mjs";
 import { resolveReviewTarget, collectReviewContext, isSensitivePath } from "../scripts/lib/git.mjs";
 import { readLog } from "../scripts/lib/job-log.mjs";
 
@@ -276,9 +278,8 @@ test("non-terminal jobs from foreign servers become orphaned on startup", async 
       taskRef: "sha256:orphan0001"
     });
 
-    const orphanCount = reconcileOrphans(workspace);
-    assert.equal(orphanCount, 1);
-
+    // Orphan reconciliation runs lazily on first listJobs access to the
+    // workspace (the startup path), not via a public reconcileOrphans export.
     const jobs = listJobs(workspace);
     const job = jobs.find((j) => j.id === "cc-orphan-test");
     assert.equal(job.status, "orphaned");
@@ -330,9 +331,9 @@ test("writer lease acquisition is atomic across racing processes", async (t) => 
     await safeRmDir(workspace);
   });
 
-  const stateUrl = pathToFileURL(path.join(pluginRoot, "scripts", "lib", "state.mjs")).href;
+  const leaseUrl = pathToFileURL(path.join(pluginRoot, "scripts", "lib", "writer-lease.mjs")).href;
   const source = `
-    import { acquireWriterLease } from ${JSON.stringify(stateUrl)};
+    import { acquireWriterLease } from ${JSON.stringify(leaseUrl)};
     const result = acquireWriterLease(process.argv[1], process.argv[2]);
     process.stdout.write(JSON.stringify(result));
   `;
@@ -987,9 +988,8 @@ test("corrupt legacy state is quarantined, not silently reset", async () => {
     // Write corrupt legacy state
     fs.writeFileSync(path.join(stateDir, "state.json"), "{invalid json!!!", "utf8");
 
-    // Reset migration flag so migration runs for this workspace
-    resetMigrationFlag();
-    // Trigger migration by calling listJobs
+    // Trigger migration by calling listJobs (fresh mkdtemp workspace never
+    // hits the in-process migratedWorkspaces cache)
     const jobs = listJobs(workspace);
 
     // Should have quarantined the corrupt file

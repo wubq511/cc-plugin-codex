@@ -20,7 +20,8 @@
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 
-import { upsertJob, listJobs, acquireWriterLease, updateWriterLeaseJobId, refreshWriterLease, releaseWriterLease, writeResultArtifact } from "./state.mjs";
+import { upsertJob, listJobs, writeResultArtifact } from "./state.mjs";
+import { acquireWriterLease, updateWriterLeaseJobId, refreshWriterLease, releaseWriterLease } from "./writer-lease.mjs";
 import { appendLogLine, isValidTransition } from "./job-log.mjs";
 import { collectModelEvidence } from "./model-evidence.mjs";
 import { computeRouteStatus, ROUTE_STATUSES } from "./route-status.mjs";

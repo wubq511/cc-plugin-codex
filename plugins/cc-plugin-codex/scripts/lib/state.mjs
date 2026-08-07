@@ -2,8 +2,8 @@
  * Job state management — schema v8, atomic per-job persistence.
  *
  * Each job lives in its own JSON file under <stateDir>/jobs/.
- * All writes use tmp+rename for atomicity. Configuration metadata is separate
- * from job records. V2 state is migrated once under a migration lock; corrupt
+ * All writes use tmp+rename for atomicity. The write-exclusivity lease lives in
+ * writer-lease.mjs. V2 state is migrated once under a migration lock; corrupt
  * state is quarantined instead of silently reset.
  */
 
@@ -16,16 +16,12 @@ import { resolveWorkspaceRoot } from "./workspace.mjs";
 import { migrateV3ModelFields } from "./model-evidence.mjs";
 
 export const STATE_VERSION = 8;
-const CONFIG_FILE_NAME = "config.json";
-const LEASE_FILE_NAME = "lease.lock";
 const JOBS_DIR_NAME = "jobs";
 const LEGACY_STATE_FILE = "state.json";
 const MAX_JOBS = 50;
 const MAX_JOB_AGE_DAYS = 30;
 const MAX_TOTAL_ARTIFACTS_BYTES = 100 * 1024 * 1024;
 const MAX_JOB_METADATA_BYTES = 64 * 1024;
-const LEASE_STALE_MS = 5 * 60 * 1000;
-const LEASE_MUTEX_STALE_MS = 5 * 1000;
 
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -107,16 +103,8 @@ function resolveJobFile(cwd, jobId) {
   return path.join(resolveJobsDir(cwd), `${jobId}.json`);
 }
 
-function resolveConfigFile(cwd) {
-  return path.join(resolveStateDir(cwd), CONFIG_FILE_NAME);
-}
-
-export function resolveStateFile(cwd) {
+function resolveStateFile(cwd) {
   return path.join(resolveStateDir(cwd), LEGACY_STATE_FILE);
-}
-
-function resolveLeaseFile(cwd) {
-  return path.join(resolveStateDir(cwd), LEASE_FILE_NAME);
 }
 
 function resolveResultFile(cwd, jobId) {
@@ -178,10 +166,6 @@ function tryParseJsonFile(filePath) {
 // ─── V2 → V3 Migration ──────────────────────────────────────────────────────
 
 const migratedWorkspaces = new Set();
-
-export function resetMigrationFlag() {
-  migratedWorkspaces.clear();
-}
 
 function migrateV2State(cwd) {
   const stateDir = resolveStateDir(cwd);
@@ -334,7 +318,8 @@ export function readResultArtifact(cwd, jobId) {
 
 // ─── Orphan Reconciliation ───────────────────────────────────────────────────
 
-export function reconcileOrphans(cwd) {
+// Runs lazily via listJobs on first access to a workspace.
+function reconcileOrphans(cwd) {
   migrateV2State(cwd);
   ensureStateDir(cwd);
 
@@ -542,10 +527,6 @@ export function listJobs(cwd) {
   return jobs.sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
 }
 
-export function listJobsBySession(cwd, sessionId) {
-  return listJobs(cwd).filter((j) => j.ownerServerId === sessionId);
-}
-
 // ─── Job Lookup ──────────────────────────────────────────────────────────────
 
 export function findJob(jobs, idOrPrefix) {
@@ -574,143 +555,6 @@ export function findLatestActiveJob(jobs) {
 
 export function findLatestCompletedJob(jobs) {
   return findLatestJob(jobs, (j) => j.status === "completed");
-}
-
-// ─── Writer Lease ────────────────────────────────────────────────────────────
-
-function withLeaseMutex(cwd, operation) {
-  ensureStateDir(cwd);
-  const mutexDir = `${resolveLeaseFile(cwd)}.mutex`;
-  const waitArray = new Int32Array(new SharedArrayBuffer(4));
-
-  for (let attempt = 0; attempt < 100; attempt++) {
-    try {
-      fs.mkdirSync(mutexDir, { mode: DIR_MODE });
-      try {
-        return operation();
-      } finally {
-        try { fs.rmdirSync(mutexDir); } catch { /* stale recovery handles crash residue */ }
-      }
-    } catch (err) {
-      if (err.code !== "EEXIST") throw err;
-      try {
-        const stat = fs.statSync(mutexDir);
-        if (Date.now() - stat.mtimeMs >= LEASE_MUTEX_STALE_MS) {
-          fs.rmSync(mutexDir, { recursive: true, force: true });
-          continue;
-        }
-      } catch { continue; }
-      Atomics.wait(waitArray, 0, 0, 2);
-    }
-  }
-  throw new Error("Writer lease mutex is busy");
-}
-
-export function acquireWriterLease(cwd, ownerToken) {
-  return withLeaseMutex(cwd, () => {
-    const leaseFile = resolveLeaseFile(cwd);
-
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const now = Date.now();
-      const leaseData = { owner: ownerToken, ts: now, jobId: null };
-      let fd;
-      try {
-        // O_EXCL is the actual cross-process ownership decision. Atomic rename is
-        // appropriate for updates, but it cannot safely acquire a missing lock.
-        fd = fs.openSync(leaseFile, "wx", FILE_MODE);
-        fs.writeFileSync(fd, JSON.stringify(leaseData), "utf8");
-        fs.fsyncSync(fd);
-        return { acquired: true, owner: ownerToken };
-      } catch (err) {
-        if (err.code !== "EEXIST") throw err;
-      } finally {
-        if (fd !== undefined) fs.closeSync(fd);
-      }
-
-      const existing = tryParseJsonFile(leaseFile);
-      if (existing) {
-        const age = now - (existing.ts || 0);
-        if (age < LEASE_STALE_MS) {
-          if (existing.owner !== ownerToken) {
-            return { acquired: false, owner: existing.owner, jobId: existing.jobId };
-          }
-          existing.ts = now;
-          writeFileAtomic(leaseFile, JSON.stringify(existing));
-          return { acquired: true, owner: ownerToken };
-        }
-      }
-
-      const stalePath = `${leaseFile}.stale-${process.pid}-${randomBytes(4).toString("hex")}`;
-      try {
-        fs.renameSync(leaseFile, stalePath);
-        removeFileIfExists(stalePath);
-      } catch (err) {
-        if (err.code !== "ENOENT") continue;
-      }
-    }
-
-    const owner = tryParseJsonFile(leaseFile);
-    return { acquired: false, owner: owner?.owner, jobId: owner?.jobId };
-  });
-}
-
-export function updateWriterLeaseJobId(cwd, ownerToken, jobId) {
-  return withLeaseMutex(cwd, () => {
-    const leaseFile = resolveLeaseFile(cwd);
-    const existing = tryParseJsonFile(leaseFile);
-    if (!existing || existing.owner !== ownerToken) return false;
-    existing.jobId = jobId;
-    existing.ts = Date.now();
-    writeFileAtomic(leaseFile, JSON.stringify(existing));
-    return true;
-  });
-}
-
-export function refreshWriterLease(cwd, ownerToken) {
-  return withLeaseMutex(cwd, () => {
-    const leaseFile = resolveLeaseFile(cwd);
-    const existing = tryParseJsonFile(leaseFile);
-    if (!existing || existing.owner !== ownerToken) return false;
-    existing.ts = Date.now();
-    writeFileAtomic(leaseFile, JSON.stringify(existing));
-    return true;
-  });
-}
-
-export function isWriterLeaseOwner(cwd, ownerToken) {
-  const leaseFile = resolveLeaseFile(cwd);
-  const existing = tryParseJsonFile(leaseFile);
-  return existing?.owner === ownerToken;
-}
-
-export function releaseWriterLease(cwd, ownerToken) {
-  return withLeaseMutex(cwd, () => {
-    const leaseFile = resolveLeaseFile(cwd);
-    const existing = tryParseJsonFile(leaseFile);
-    if (!existing || existing.owner !== ownerToken) return false;
-    removeFileIfExists(leaseFile);
-    return true;
-  });
-}
-
-export function getWriterLeaseOwner(cwd) {
-  const leaseFile = resolveLeaseFile(cwd);
-  const existing = tryParseJsonFile(leaseFile);
-  if (!existing) return null;
-  const age = Date.now() - (existing.ts || 0);
-  if (age >= LEASE_STALE_MS) return null;
-  return existing;
-}
-
-// ─── Config ──────────────────────────────────────────────────────────────────
-
-export function loadConfig(cwd) {
-  return tryParseJsonFile(resolveConfigFile(cwd)) || {};
-}
-
-export function saveConfig(cwd, config) {
-  ensureStateDir(cwd);
-  writeFileAtomic(resolveConfigFile(cwd), JSON.stringify(config, null, 2));
 }
 
 // ─── Retention & Cleanup ─────────────────────────────────────────────────────
@@ -833,21 +677,4 @@ function pruneStandaloneProbeArtifacts(jobsDir, now, maxAgeMs) {
   for (const probe of listStandaloneProbeArtifacts(jobsDir)) {
     if ((now - probe.mtimeMs) > maxAgeMs) removeFileIfExists(probe.path);
   }
-}
-
-// ─── Backward Compat (used by existing tests) ───────────────────────────────
-
-export function resolveJobFile_export(cwd, jobId) {
-  return resolveJobFile(cwd, jobId);
-}
-
-export function readJobFile(filePath) {
-  return JSON.parse(fs.readFileSync(filePath, "utf8"));
-}
-
-export function writeJobFileDirect(cwd, jobId, payload) {
-  // Compatibility helper used by tests must obey the same privacy choke point
-  // as production writers.
-  writeJobFile(cwd, jobId, payload);
-  return resolveJobFile(cwd, jobId);
 }
