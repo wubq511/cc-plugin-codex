@@ -1,8 +1,8 @@
 /**
  * Model evidence — shared constants and utilities.
  *
- * Used by collector, formatter, and migration modules.
- * No filesystem I/O — pure functions and constants only.
+ * Used by collector, formatter, migration, watchdog, and the continuation
+ * planner. No filesystem I/O — pure functions and constants only.
  */
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -162,4 +162,119 @@ export function sanitizeModelId(modelId) {
   const normalized = normalizeModelIdForStorage(modelId);
   if (!normalized) return null;
   return escapeModelIdForMarkdown(normalized);
+}
+
+// ─── Usage Extraction ────────────────────────────────────────────────────────
+
+/**
+ * Normalize usageModelKeys: sanitize, dedup, limit to 16.
+ */
+export function normalizeUsageKeys(keys) {
+  if (!Array.isArray(keys)) return [];
+  const seen = new Set();
+  const result = [];
+  for (const key of keys) {
+    if (typeof key !== "string" || !key) continue;
+    const sanitized = normalizeModelIdForStorage(key);
+    if (!sanitized || seen.has(sanitized)) continue;
+    seen.add(sanitized);
+    result.push(sanitized);
+    if (result.length >= MAX_UNIQUE_MODELS) break;
+  }
+  return result;
+}
+
+/**
+ * Extract usageModelKeys from Claude final JSON modelUsage object.
+ * Returns all keys (not just first), sanitized and bounded.
+ */
+export function extractUsageModelKeys(modelUsage) {
+  if (!modelUsage || typeof modelUsage !== "object" || Array.isArray(modelUsage)) {
+    return [];
+  }
+  try {
+    return normalizeUsageKeys(Object.keys(modelUsage));
+  } catch {
+    return [];
+  }
+}
+
+const USAGE_TOKEN_KEYS = {
+  input: ["input_tokens", "inputTokens"],
+  cacheCreation: ["cache_creation_input_tokens", "cacheCreationInputTokens"],
+  cacheRead: ["cache_read_input_tokens", "cacheReadInputTokens"],
+  output: ["output_tokens", "outputTokens"],
+};
+
+function pickFiniteUsageValue(obj, keys) {
+  for (const key of keys) {
+    if (Number.isFinite(obj?.[key]) && obj[key] >= 0) return obj[key];
+  }
+  return null;
+}
+
+function normalizeUsageTokens(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const result = Object.fromEntries(
+    Object.entries(USAGE_TOKEN_KEYS).map(([field, keys]) => [
+      field,
+      pickFiniteUsageValue(value, keys),
+    ]),
+  );
+  return Object.values(result).some((tokenCount) => tokenCount !== null)
+    ? result
+    : null;
+}
+
+/**
+ * Extract the most recent API response's token usage from a Claude Code result.
+ *
+ * The result-level `usage` and every `modelUsage` entry are cumulative across
+ * the whole agent run, so they must never drive context-pressure decisions.
+ * Current Claude Code exposes per-request records in `usage.iterations`; use
+ * the last usable iteration. A result explicitly reporting one turn is also
+ * safe because its aggregate equals that single request. Otherwise return null
+ * so the planner marks the evidence partial rather than guessing.
+ *
+ * @returns {{input:number|null, cacheCreation:number|null, cacheRead:number|null, output:number|null}|null}
+ */
+export function extractUsageTokens(parsed) {
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+
+  const iterations = Array.isArray(parsed.usage?.iterations)
+    ? parsed.usage.iterations
+    : [];
+  for (let index = iterations.length - 1; index >= 0; index -= 1) {
+    const current = normalizeUsageTokens(iterations[index]);
+    if (current) return current;
+  }
+
+  const turnCount = parsed.num_turns ?? parsed.numTurns;
+  if (turnCount === 1) {
+    return normalizeUsageTokens(parsed.usage);
+  }
+  return null;
+}
+
+/**
+ * Return a trustworthy context-window size from result-level modelUsage.
+ *
+ * A single value is safe. When multiple models ran, accept the value only when
+ * every reported positive context window agrees; otherwise the final request's
+ * model cannot be identified from aggregate usage alone and pressure must fail
+ * closed.
+ */
+export function extractContextWindow(parsed) {
+  const modelUsage = parsed?.modelUsage;
+  if (!modelUsage || typeof modelUsage !== "object" || Array.isArray(modelUsage)) {
+    return null;
+  }
+  const windows = new Set();
+  for (const value of Object.values(modelUsage)) {
+    const contextWindow = value?.contextWindow ?? value?.context_window;
+    if (Number.isFinite(contextWindow) && contextWindow > 0) {
+      windows.add(contextWindow);
+    }
+  }
+  return windows.size === 1 ? [...windows][0] : null;
 }

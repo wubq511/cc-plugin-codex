@@ -13,7 +13,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { resolveWorkspaceRoot } from "./workspace.mjs";
-import { migrateV3ModelFields } from "./model-evidence.mjs";
+import { migrateV3ModelFields } from "./model-evidence-migration.mjs";
 
 export const STATE_VERSION = 8;
 const JOBS_DIR_NAME = "jobs";

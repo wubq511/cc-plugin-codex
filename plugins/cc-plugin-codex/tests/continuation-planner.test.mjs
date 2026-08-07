@@ -5,14 +5,16 @@ import {
   createPlanner,
   computePressure,
   classifyEvidenceState,
-  extractContextWindow,
-  extractUsageTokens,
   PlannerError,
   PRESSURE_THRESHOLD,
   PLAN_TTL_MS,
   PLAN_MAX_ENTRIES,
   ACTIONS,
 } from "../scripts/lib/continuation-planner.mjs";
+import {
+  extractContextWindow,
+  extractUsageTokens,
+} from "../scripts/lib/model-evidence-shared.mjs";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 

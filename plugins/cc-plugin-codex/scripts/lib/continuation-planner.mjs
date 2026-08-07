@@ -22,13 +22,6 @@
 
 import { randomUUID } from "node:crypto";
 
-// Re-export the canonical usage-token extractor (defined in the model-evidence
-// collector) so tests and callers can import it from the planner module.
-export {
-  extractContextWindow,
-  extractUsageTokens,
-} from "./model-evidence-collector.mjs";
-
 // ─── Named, testable provisional constants ───────────────────────────────────
 
 /** Context-pressure ratio at which compaction is considered. */

@@ -24,7 +24,7 @@ import {
   extractContextWindow,
   extractUsageModelKeys,
   extractUsageTokens,
-} from "../lib/model-evidence.mjs";
+} from "../lib/model-evidence-shared.mjs";
 import { resolveCommandForSpawn, terminateProcessTree } from "../lib/process.mjs";
 import {
   buildFailureEnvelope,
