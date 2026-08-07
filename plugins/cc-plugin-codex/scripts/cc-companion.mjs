@@ -99,10 +99,6 @@ const continuationPlanner = createPlanner();
 // ─── Budget Guard ─────────────────────────────────────────────────────────────
 
 /**
- * Read `claude --help` once through the same cross-platform command resolution
- * used by execution. A non-zero exit is never accepted as capability evidence.
- */
-/**
  * Validate an optional maxBudgetUsd parameter and enforce the budget guard.
  * Returns { ok: true, value: number|null } or { ok: false, error: string }.
  */
