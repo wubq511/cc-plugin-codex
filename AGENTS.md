@@ -24,8 +24,11 @@ Codex ↔ cc-companion.mjs ↔ claude-runner.mjs ↔ watchdog.mjs ↔ Claude Cod
 - `scripts/cc-companion.mjs`: MCP entrypoint and tool handlers.
 - `scripts/lib/watchdog.mjs`: bounded Claude process-tree owner; task text goes through
   stdin and never argv.
-- `scripts/lib/state.mjs`: schema-v8 atomic job state, writer leases, and bounded private
-  evidence retention.
+- `scripts/lib/state.mjs`: schema-v8 atomic job state and bounded private evidence
+  retention.
+- `scripts/lib/writer-lease.mjs`: cross-process write exclusivity for one workspace —
+  O_EXCL ownership, stale takeover, file mutex. Imports `resolveStateDir` from
+  `state.mjs`.
 - `scripts/lib/model-evidence*.mjs`: separates requested model, transcript execution
   evidence, and final usage keys.
 - `scripts/lib/autocompact.mjs` and `compact-boundary.mjs`: temporary auto-compact policy
