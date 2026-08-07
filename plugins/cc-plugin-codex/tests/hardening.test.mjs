@@ -1549,6 +1549,11 @@ test("SIGKILL on companion kills watchdog and Claude (hard crash, no graceful cl
     }
   });
 
+  // Drain the first-access orphan reconciliation while the workspace is empty
+  // (same rationale as startServer): the test process's own listJobs() must
+  // not mark the server's live job orphaned once it is running.
+  listJobs(workspace);
+
   const child = spawn(process.execPath, [serverPath], {
     cwd: workspace,
     env: {
@@ -1628,6 +1633,11 @@ test("cc_cancel terminates actual watchdog/Claude processes, not just job state"
   fs.chmodSync(fakeClaude, 0o755);
 
   const pidFile = path.join(workspace, "claude.pid");
+
+  // Drain the first-access orphan reconciliation while the workspace is empty
+  // (same rationale as startServer): the test process's own listJobs() must
+  // not mark the server's live job orphaned once it is running.
+  listJobs(workspace);
 
   const child = spawn(process.execPath, [serverPath], {
     cwd: workspace,

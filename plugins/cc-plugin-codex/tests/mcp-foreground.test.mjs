@@ -329,6 +329,33 @@ test("shutdown never cancels a running job owned by another MCP server session",
   assert.notEqual(job.ownerServerId, server.sessionId);
 });
 
+test("listJobs never orphan-reconciles a workspace it has already drained", async (t) => {
+  const target = fs.mkdtempSync(path.join(os.tmpdir(), "cc-companion-drain-"));
+  t.after(async () => {
+    await safeRmDir(resolveStateDir(target));
+    await safeRmDir(target);
+  });
+
+  // First access consumes the per-process, per-workspace orphan reconciliation
+  // while the directory is still empty. This is the "drain" that bare-spawned
+  // servers rely on: after it, this process's listJobs() can never mark a live
+  // job orphaned, no matter when that job is written.
+  assert.equal(listJobs(target).length, 0);
+
+  upsertJob(target, {
+    id: "cc-drained-session",
+    status: "running",
+    phase: "executing",
+    ownerServerId: "some-server",
+    pid: 12345,
+    task: "must survive later listJobs"
+  });
+
+  const job = listJobs(target).find((candidate) => candidate.id === "cc-drained-session");
+  assert.equal(job.status, "running");
+  assert.equal(job.phase, "executing");
+});
+
 // ─── Provider-agnostic model tests ─────────────────────────────────────────
 
 test("delegate accepts an arbitrary custom model identifier and passes it through", async (t) => {

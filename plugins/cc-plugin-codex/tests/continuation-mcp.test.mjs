@@ -615,6 +615,11 @@ test("cc_plan_continuation from a git subdirectory binds to workspace root for d
   fs.mkdirSync(binDir, { recursive: true });
   installFakeClaude(binDir);
 
+  // Drain the first-access orphan reconciliation while the workspace is empty
+  // (same rationale as startServer): the test process's own listJobs() must
+  // not mark a server-created live job orphaned.
+  listJobs(workspace);
+
   const child = spawn(process.execPath, [serverPath], {
     cwd: workspace,
     env: {
